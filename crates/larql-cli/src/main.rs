@@ -7,6 +7,7 @@ mod formatting;
 mod query_cmd;
 mod stats_cmd;
 mod validate_cmd;
+mod residuals_cmd;
 mod vector_extract_cmd;
 mod vector_load_cmd;
 mod weight_walk_cmd;
@@ -50,6 +51,9 @@ enum Commands {
 
     /// Load extracted vectors into SurrealDB with HNSW indexes.
     VectorLoad(vector_load_cmd::VectorLoadArgs),
+
+    /// Capture residual stream vectors for entities.
+    Residuals(residuals_cmd::ResidualsArgs),
 }
 
 fn main() {
@@ -65,6 +69,7 @@ fn main() {
         Commands::AttentionWalk(args) => attention_walk_cmd::run(args),
         Commands::VectorExtract(args) => vector_extract_cmd::run(args),
         Commands::VectorLoad(args) => vector_load_cmd::run(args),
+        Commands::Residuals(args) => residuals_cmd::run(args),
     };
 
     if let Err(e) = result {

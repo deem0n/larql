@@ -133,6 +133,61 @@ larql vector-load vectors/ --ns larql --db gemma3_4b
 larql vector-load vectors/ --ns larql --db gemma3_4b --layers 25,26,33 --batch-size 1000
 ```
 
+### `larql residuals capture`
+
+Capture residual stream vectors for entities via forward passes. The residuals are the hidden state at a specific layer — the signal that the next layer's features actually see during inference.
+
+```
+larql residuals capture <MODEL> --entities <ENTITIES> --output <OUTPUT> [OPTIONS]
+```
+
+| Flag | Description |
+|---|---|
+| `<MODEL>` | Model path or HuggingFace model ID |
+| `-e, --entities <ENTITIES>` | Comma-separated entities, or path to a text file (one per line) |
+| `-l, --layer <LAYER>` | Layer(s) to capture at. Can specify multiple times. [default: 25] |
+| `--all-layers` | Capture at every layer |
+| `-o, --output <OUTPUT>` | Output NDJSON file |
+| `--template <TEMPLATE>` | Prompt template. `{entity}` is replaced. Default: bare entity name |
+
+**How it works:** Tokenizes each entity, runs a full forward pass through the transformer up to the target layer(s), and saves the last-token hidden state as a vector in NDJSON format. The output is compatible with `vector-load` for SurrealDB ingestion.
+
+**Use case:** Seed SurrealDB with real residuals for a small set of entities (50–100). Then use SurrealDB vector similarity queries against gate vectors to discover factual edges for thousands of entities without additional forward passes.
+
+**Examples:**
+
+```bash
+# L25 residuals for seed entities
+larql residuals capture google/gemma-3-4b-it \
+    --entities "France,Germany,Japan,Mozart,Einstein" \
+    --layer 25 -o residuals-L25.vectors.ndjson
+
+# Multiple layers
+larql residuals capture google/gemma-3-4b-it \
+    --entities entities.txt \
+    --layer 25 --layer 26 --layer 29 \
+    -o residuals.vectors.ndjson
+
+# Full trajectory (all layers)
+larql residuals capture google/gemma-3-4b-it \
+    --entities "France" --all-layers \
+    -o residuals-full.vectors.ndjson
+
+# With prompt template
+larql residuals capture google/gemma-3-4b-it \
+    --entities "France,Germany" \
+    --layer 25 \
+    --template "The capital of {entity} is" \
+    -o residuals-capital.vectors.ndjson
+```
+
+**Output format:** Same NDJSON as `vector-extract`, loadable by `vector-load`:
+
+```json
+{"_header": true, "component": "residuals", "model": "google/gemma-3-4b-it", "dimension": 2560}
+{"id": "France_L25", "layer": 25, "feature": 0, "vector": [...], "top_token": "Paris", "c_score": 12.4, ...}
+```
+
 ### `larql bfs`
 
 BFS extraction from a running model endpoint.

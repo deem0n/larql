@@ -8,11 +8,16 @@ use ndarray::Array2;
 /// A loaded model's weight tensors and config.
 pub struct ModelWeights {
     pub tensors: HashMap<String, Array2<f32>>,
+    pub vectors: HashMap<String, Vec<f32>>,
     pub embed: Array2<f32>,
     pub num_layers: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub vocab_size: usize,
+    pub head_dim: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub rope_base: f64,
 }
 
 /// Load all safetensors files from a model directory.
@@ -40,6 +45,7 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, WalkerErro
 
     // Load all tensors
     let mut tensors: HashMap<String, Array2<f32>> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
 
     for st_path in &st_files {
         let file = std::fs::File::open(st_path)?;
@@ -48,16 +54,21 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, WalkerErro
             .map_err(|e| WalkerError::Parse(e.to_string()))?;
 
         for (name, view) in st.tensors() {
-            let shape = view.shape();
-            if shape.len() != 2 {
-                continue; // skip non-2D tensors (norms, etc.)
-            }
-
             let key = normalize_key(&name);
+            let shape = view.shape();
             let data = tensor_to_f32(&view)?;
-            let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
-                .map_err(|e| WalkerError::Parse(e.to_string()))?;
-            tensors.insert(key, arr);
+
+            match shape.len() {
+                2 => {
+                    let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
+                        .map_err(|e| WalkerError::Parse(e.to_string()))?;
+                    tensors.insert(key, arr);
+                }
+                1 => {
+                    vectors.insert(key, data);
+                }
+                _ => {} // skip 3D+ tensors
+            }
         }
     }
 
@@ -75,6 +86,10 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, WalkerErro
     let num_layers = text_config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
     let hidden_size = text_config["hidden_size"].as_u64().unwrap_or(2048) as usize;
     let intermediate_size = text_config["intermediate_size"].as_u64().unwrap_or(8192) as usize;
+    let head_dim = text_config["head_dim"].as_u64().unwrap_or(256) as usize;
+    let num_q_heads = text_config["num_attention_heads"].as_u64().unwrap_or(8) as usize;
+    let num_kv_heads = text_config["num_key_value_heads"].as_u64().unwrap_or(4) as usize;
+    let rope_base = text_config["rope_theta"].as_f64().unwrap_or(10000.0);
 
     // Find embedding matrix
     let embed = tensors
@@ -86,11 +101,16 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, WalkerErro
 
     Ok(ModelWeights {
         tensors,
+        vectors,
         embed,
         num_layers,
         hidden_size,
         intermediate_size,
         vocab_size,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        rope_base,
     })
 }
 

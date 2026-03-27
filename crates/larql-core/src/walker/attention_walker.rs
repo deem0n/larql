@@ -209,6 +209,9 @@ impl AttentionWalker {
         let mut max_sel = 0.0f64;
         let mut self_loops = 0usize;
 
+        let mut conf_thresholds = super::weight_walker::ThresholdCounts::default();
+        let mut sel_thresholds = super::weight_walker::ThresholdCounts::default();
+
         let mut subj_counts: std::collections::HashMap<String, (usize, f64)> =
             std::collections::HashMap::new();
         let mut obj_counts: std::collections::HashMap<String, (usize, f64)> =
@@ -227,6 +230,9 @@ impl AttentionWalker {
             if confidence < min_conf { min_conf = confidence; }
             if selectivity > max_sel { max_sel = selectivity; }
             if raw.subject == raw.object { self_loops += 1; }
+
+            count_threshold(&mut conf_thresholds, confidence);
+            count_threshold(&mut sel_thresholds, selectivity);
 
             let se = subj_counts.entry(raw.subject.clone()).or_insert((0, 0.0));
             se.0 += 1; se.1 += confidence;
@@ -262,6 +268,8 @@ impl AttentionWalker {
                 self_loop_pct: if n > 0 { (self_loops as f64 / n as f64) * 100.0 } else { 0.0 },
                 top_subjects,
                 top_objects,
+                threshold_counts: conf_thresholds,
+                selectivity_threshold_counts: sel_thresholds,
             }
         } else {
             LayerStats::default()
@@ -286,6 +294,16 @@ impl AttentionWalker {
             stats,
         })
     }
+}
+
+fn count_threshold(t: &mut super::weight_walker::ThresholdCounts, v: f64) {
+    if v >= 0.01 { t.t_01 += 1; }
+    if v >= 0.05 { t.t_05 += 1; }
+    if v >= 0.10 { t.t_10 += 1; }
+    if v >= 0.25 { t.t_25 += 1; }
+    if v >= 0.50 { t.t_50 += 1; }
+    if v >= 0.75 { t.t_75 += 1; }
+    if v >= 0.90 { t.t_90 += 1; }
 }
 
 fn top_entities(

@@ -269,6 +269,8 @@ pub fn run(args: WeightWalkArgs) -> Result<(), Box<dyn std::error::Error>> {
                         serde_json::json!({"entity": name, "count": count, "avg_confidence": round4(*avg_c)})
                     })
                     .collect();
+                let ct = &s.threshold_counts;
+                let st = &s.selectivity_threshold_counts;
                 serde_json::json!({
                     "layer": r.layer,
                     "features_scanned": r.features_scanned,
@@ -282,6 +284,18 @@ pub fn run(args: WeightWalkArgs) -> Result<(), Box<dyn std::error::Error>> {
                     "mean_c_out": round4(s.mean_c_out),
                     "self_loop_count": s.self_loop_count,
                     "self_loop_pct": round4(s.self_loop_pct),
+                    "confidence_thresholds": {
+                        "c>=0.01": ct.t_01, "c>=0.05": ct.t_05,
+                        "c>=0.10": ct.t_10, "c>=0.25": ct.t_25,
+                        "c>=0.50": ct.t_50, "c>=0.75": ct.t_75,
+                        "c>=0.90": ct.t_90,
+                    },
+                    "selectivity_thresholds": {
+                        "s>=0.01": st.t_01, "s>=0.05": st.t_05,
+                        "s>=0.10": st.t_10, "s>=0.25": st.t_25,
+                        "s>=0.50": st.t_50, "s>=0.75": st.t_75,
+                        "s>=0.90": st.t_90,
+                    },
                     "top_subjects": top_subj,
                     "top_objects": top_obj,
                 })

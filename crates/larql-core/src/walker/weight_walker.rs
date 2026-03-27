@@ -37,8 +37,24 @@ pub struct LayerStats {
     pub max_selectivity: f64,
     pub self_loop_count: usize,
     pub self_loop_pct: f64,
-    pub top_subjects: Vec<(String, usize, f64)>,  // (entity, count, avg_confidence)
+    pub top_subjects: Vec<(String, usize, f64)>,
     pub top_objects: Vec<(String, usize, f64)>,
+    /// Edges surviving at each confidence threshold.
+    pub threshold_counts: ThresholdCounts,
+    /// Edges surviving at each selectivity threshold.
+    pub selectivity_threshold_counts: ThresholdCounts,
+}
+
+/// Edge counts at standard thresholds.
+#[derive(Debug, Clone, Default)]
+pub struct ThresholdCounts {
+    pub t_01: usize,
+    pub t_05: usize,
+    pub t_10: usize,
+    pub t_25: usize,
+    pub t_50: usize,
+    pub t_75: usize,
+    pub t_90: usize,
 }
 
 /// Configuration for the weight walker.
@@ -254,7 +270,9 @@ impl WeightWalker {
         let mut max_sel = 0.0f64;
         let mut self_loops = 0usize;
 
-        // Entity tracking for top-N stats
+        let mut conf_thresholds = ThresholdCounts::default();
+        let mut sel_thresholds = ThresholdCounts::default();
+
         let mut subj_counts: std::collections::HashMap<String, (usize, f64)> =
             std::collections::HashMap::new();
         let mut obj_counts: std::collections::HashMap<String, (usize, f64)> =
@@ -282,6 +300,9 @@ impl WeightWalker {
             if raw.subject == raw.object {
                 self_loops += 1;
             }
+
+            count_threshold(&mut conf_thresholds, confidence);
+            count_threshold(&mut sel_thresholds, selectivity);
 
             // Track entity frequencies
             let se = subj_counts
@@ -339,6 +360,8 @@ impl WeightWalker {
                 },
                 top_subjects,
                 top_objects,
+                threshold_counts: conf_thresholds,
+                selectivity_threshold_counts: sel_thresholds,
             }
         } else {
             LayerStats::default()
@@ -358,7 +381,16 @@ impl WeightWalker {
     }
 }
 
-/// Extract top-N entities by count, with average confidence.
+fn count_threshold(t: &mut ThresholdCounts, v: f64) {
+    if v >= 0.01 { t.t_01 += 1; }
+    if v >= 0.05 { t.t_05 += 1; }
+    if v >= 0.10 { t.t_10 += 1; }
+    if v >= 0.25 { t.t_25 += 1; }
+    if v >= 0.50 { t.t_50 += 1; }
+    if v >= 0.75 { t.t_75 += 1; }
+    if v >= 0.90 { t.t_90 += 1; }
+}
+
 fn top_entities(
     counts: &std::collections::HashMap<String, (usize, f64)>,
     n: usize,

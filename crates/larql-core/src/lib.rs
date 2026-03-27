@@ -35,3 +35,5 @@ pub use walker::weight_walker::{
 pub use walker::attention_walker::{AttentionWalker, AttentionLayerResult};
 #[cfg(feature = "walker")]
 pub use walker::vector_extractor::{VectorExtractor, ExtractConfig, ExtractCallbacks, ExtractSummary};
+#[cfg(feature = "walker")]
+pub use walker::residuals::{ResidualCapturer, ResidualConfig, ResidualCallbacks};

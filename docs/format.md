@@ -150,6 +150,56 @@ Edges from `attention-walk` include OV circuit metadata:
 | `head` | int | Attention head index |
 | `circuit` | string | Circuit type (currently always `"OV"`) |
 
+## Vector NDJSON format
+
+Used by `vector-extract` and `residuals capture`. One JSON object per line. First line is a header.
+
+### Header
+
+```json
+{"_header": true, "component": "ffn_down", "model": "google/gemma-3-4b-it", "dimension": 2560, "extraction_date": "2026-03-27"}
+```
+
+### Vector record
+
+```json
+{"id": "L26_F9298", "layer": 26, "feature": 9298, "dim": 2560, "vector": [0.012, -0.003, ...], "top_token": "Paris", "top_token_id": 4196, "c_score": 12.4, "top_k": [{"token": "Paris", "token_id": 4196, "logit": 12.4}, ...]}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Unique identifier (e.g. `L26_F9298`, `France_L25`, `T4196`) |
+| `layer` | int | Source layer (0 for embeddings) |
+| `feature` | int | Feature/head/token index |
+| `dim` | int | Vector dimensionality |
+| `vector` | float[] | The raw weight or residual vector |
+| `top_token` | string | Highest-scoring token from vocab projection |
+| `top_token_id` | int | Token ID of top token |
+| `c_score` | float | Score of top token (logit magnitude or norm) |
+| `top_k` | object[] | Top-k tokens with scores |
+
+### Residual records
+
+From `residuals capture`, the `id` encodes entity + layer:
+
+```json
+{"id": "France_L25", "layer": 25, "feature": 0, "vector": [...], "top_token": "Paris", ...}
+```
+
+The `top_token` is derived by projecting the residual onto the embedding matrix — it shows what the model's hidden state "points at" in vocabulary space at that layer.
+
+### File naming
+
+| Component | File | Description |
+|---|---|---|
+| `ffn_down` | `ffn_down.vectors.jsonl` | FFN output directions |
+| `ffn_gate` | `ffn_gate.vectors.jsonl` | FFN input selectivity |
+| `ffn_up` | `ffn_up.vectors.jsonl` | FFN up projection |
+| `attn_ov` | `attn_ov.vectors.jsonl` | Attention OV circuit |
+| `attn_qk` | `attn_qk.vectors.jsonl` | Attention Q/K heads |
+| `embeddings` | `embeddings.vectors.jsonl` | Token embeddings |
+| residuals | user-specified | Entity residual streams |
+
 ## Serialization formats
 
 | Extension | Format | Notes |

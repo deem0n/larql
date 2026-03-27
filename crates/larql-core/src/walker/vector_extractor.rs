@@ -402,6 +402,287 @@ impl VectorExtractor {
         Ok(count)
     }
 
+    /// Extract FFN up vectors for a single layer.
+    /// Same pattern as gate — `up_proj.weight` row per feature.
+    pub fn extract_ffn_up(
+        &self,
+        layer: usize,
+        config: &ExtractConfig,
+        writer: &mut VectorWriter,
+        callbacks: &mut dyn ExtractCallbacks,
+    ) -> Result<usize, WalkerError> {
+        let prefix = format!("layers.{layer}.mlp.");
+        let w_up = self
+            .weights
+            .tensors
+            .get(&format!("{prefix}up_proj.weight"))
+            .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}up_proj.weight")))?;
+
+        let n_features = w_up.shape()[0];
+        callbacks.on_layer_start(COMPONENT_FFN_UP, layer, n_features);
+
+        let logits = self.weights.embed.dot(&w_up.t());
+        let progress_interval = (n_features / 20).max(1);
+        let mut count = 0;
+
+        for feat_idx in 0..n_features {
+            if feat_idx % progress_interval == 0 {
+                callbacks.on_progress(COMPONENT_FFN_UP, layer, feat_idx, n_features);
+            }
+
+            let vector: Vec<f32> = w_up.row(feat_idx).to_vec();
+            let top_k_pairs = partial_top_k_column(&logits, feat_idx, config.top_k);
+            let top_k: Vec<TopKEntry> = top_k_pairs
+                .iter()
+                .filter_map(|&(idx, logit)| {
+                    decode_token(&self.tokenizer, idx as u32).map(|token| TopKEntry {
+                        token,
+                        token_id: idx as u32,
+                        logit,
+                    })
+                })
+                .collect();
+
+            let (top_token, top_token_id, c_score) = if let Some(first) = top_k.first() {
+                (first.token.clone(), first.token_id, first.logit)
+            } else {
+                (String::new(), 0, 0.0)
+            };
+
+            writer.write_record(&VectorRecord {
+                id: format!("L{layer}_F{feat_idx}"),
+                layer,
+                feature: feat_idx,
+                dim: vector.len(),
+                vector,
+                top_token,
+                top_token_id,
+                c_score,
+                top_k,
+            })?;
+            count += 1;
+        }
+
+        writer.flush()?;
+        Ok(count)
+    }
+
+    /// Extract attention OV circuit vectors for a single layer.
+    ///
+    /// For each KV head, computes OV = O_h @ V_h and stores the mean output
+    /// direction (hidden-dim) — the average column of the OV matrix, which
+    /// represents the head's typical write direction. Same dimensionality as
+    /// FFN vectors, so HNSW indexes work uniformly.
+    pub fn extract_attn_ov(
+        &self,
+        layer: usize,
+        config: &ExtractConfig,
+        writer: &mut VectorWriter,
+        callbacks: &mut dyn ExtractCallbacks,
+    ) -> Result<usize, WalkerError> {
+        let prefix = format!("layers.{layer}.self_attn.");
+        let w_v = self
+            .weights
+            .tensors
+            .get(&format!("{prefix}v_proj.weight"))
+            .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}v_proj.weight")))?;
+        let w_o = self
+            .weights
+            .tensors
+            .get(&format!("{prefix}o_proj.weight"))
+            .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}o_proj.weight")))?;
+
+        let head_dim = self.weights.head_dim;
+        let hidden = self.weights.hidden_size;
+        let num_kv_heads = w_v.shape()[0] / head_dim;
+        callbacks.on_layer_start(COMPONENT_ATTN_OV, layer, num_kv_heads);
+
+        let mut count = 0;
+
+        for h in 0..num_kv_heads {
+            callbacks.on_progress(COMPONENT_ATTN_OV, layer, h, num_kv_heads);
+
+            let v_h = w_v.slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..]);
+            let o_h = w_o.slice(ndarray::s![.., h * head_dim..(h + 1) * head_dim]);
+
+            // OV circuit: O_h @ V_h → (hidden, hidden)
+            let ov = o_h.dot(&v_h);
+
+            // Mean output direction: average column of OV → (hidden,)
+            let mut vector = vec![0.0f32; hidden];
+            for col in 0..hidden {
+                let mut sum = 0.0f32;
+                for row in 0..hidden {
+                    sum += ov[[row, col]];
+                }
+                vector[col] = sum / hidden as f32;
+            }
+
+            // Top-k: project vocab through OV, find most amplified
+            let transformed = self.weights.embed.dot(&ov.t());
+            let norms: Vec<f32> = (0..self.weights.vocab_size)
+                .map(|i| {
+                    let row = transformed.row(i);
+                    row.iter().map(|x| x * x).sum::<f32>().sqrt()
+                })
+                .collect();
+
+            let top_k_pairs = partial_top_k_slice(&norms, config.top_k);
+            let top_k: Vec<TopKEntry> = top_k_pairs
+                .iter()
+                .filter_map(|&(idx, logit)| {
+                    decode_token(&self.tokenizer, idx as u32).map(|token| TopKEntry {
+                        token,
+                        token_id: idx as u32,
+                        logit,
+                    })
+                })
+                .collect();
+
+            let (top_token, top_token_id, c_score) = if let Some(first) = top_k.first() {
+                (first.token.clone(), first.token_id, first.logit)
+            } else {
+                (String::new(), 0, 0.0)
+            };
+
+            writer.write_record(&VectorRecord {
+                id: format!("L{layer}_H{h}"),
+                layer,
+                feature: h,
+                dim: vector.len(),
+                vector,
+                top_token,
+                top_token_id,
+                c_score,
+                top_k,
+            })?;
+            count += 1;
+        }
+
+        writer.flush()?;
+        Ok(count)
+    }
+
+    /// Extract attention Q/K projection vectors per head for a single layer.
+    pub fn extract_attn_qk(
+        &self,
+        layer: usize,
+        _config: &ExtractConfig,
+        writer: &mut VectorWriter,
+        callbacks: &mut dyn ExtractCallbacks,
+    ) -> Result<usize, WalkerError> {
+        let prefix = format!("layers.{layer}.self_attn.");
+        let w_q = self
+            .weights
+            .tensors
+            .get(&format!("{prefix}q_proj.weight"))
+            .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}q_proj.weight")))?;
+        let w_k = self
+            .weights
+            .tensors
+            .get(&format!("{prefix}k_proj.weight"))
+            .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}k_proj.weight")))?;
+
+        let head_dim = self.weights.head_dim;
+        let num_q_heads = w_q.shape()[0] / head_dim;
+        let num_kv_heads = w_k.shape()[0] / head_dim;
+        let total = num_q_heads + num_kv_heads;
+        callbacks.on_layer_start(COMPONENT_ATTN_QK, layer, total);
+
+        let mut count = 0;
+
+        // Q heads
+        for h in 0..num_q_heads {
+            callbacks.on_progress(COMPONENT_ATTN_QK, layer, h, total);
+            let vector: Vec<f32> = w_q
+                .slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..])
+                .iter()
+                .copied()
+                .collect();
+
+            writer.write_record(&VectorRecord {
+                id: format!("L{layer}_Q{h}"),
+                layer,
+                feature: h,
+                dim: vector.len(),
+                vector,
+                top_token: String::new(),
+                top_token_id: 0,
+                c_score: 0.0,
+                top_k: vec![],
+            })?;
+            count += 1;
+        }
+
+        // K heads
+        for h in 0..num_kv_heads {
+            callbacks.on_progress(COMPONENT_ATTN_QK, layer, num_q_heads + h, total);
+            let vector: Vec<f32> = w_k
+                .slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..])
+                .iter()
+                .copied()
+                .collect();
+
+            writer.write_record(&VectorRecord {
+                id: format!("L{layer}_K{h}"),
+                layer,
+                feature: h,
+                dim: vector.len(),
+                vector,
+                top_token: String::new(),
+                top_token_id: 0,
+                c_score: 0.0,
+                top_k: vec![],
+            })?;
+            count += 1;
+        }
+
+        writer.flush()?;
+        Ok(count)
+    }
+
+    /// Extract embedding vectors — one per vocab token.
+    pub fn extract_embeddings(
+        &self,
+        _config: &ExtractConfig,
+        writer: &mut VectorWriter,
+        callbacks: &mut dyn ExtractCallbacks,
+    ) -> Result<usize, WalkerError> {
+        let vocab_size = self.weights.vocab_size;
+        callbacks.on_layer_start(COMPONENT_EMBEDDINGS, 0, vocab_size);
+
+        let progress_interval = (vocab_size / 20).max(1);
+        let mut count = 0;
+
+        for tok_id in 0..vocab_size {
+            if tok_id % progress_interval == 0 {
+                callbacks.on_progress(COMPONENT_EMBEDDINGS, 0, tok_id, vocab_size);
+            }
+
+            let vector: Vec<f32> = self.weights.embed.row(tok_id).to_vec();
+            let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+            let token = decode_token(&self.tokenizer, tok_id as u32)
+                .unwrap_or_default();
+
+            writer.write_record(&VectorRecord {
+                id: format!("T{tok_id}"),
+                layer: 0,
+                feature: tok_id,
+                dim: vector.len(),
+                vector,
+                top_token: token,
+                top_token_id: tok_id as u32,
+                c_score: norm,
+                top_k: vec![],
+            })?;
+            count += 1;
+        }
+
+        writer.flush()?;
+        Ok(count)
+    }
+
     /// Orchestrate extraction of all requested components across requested layers.
     ///
     /// Returns `None` for unimplemented components so the caller can decide
@@ -423,16 +704,37 @@ impl VectorExtractor {
         };
 
         for component in &config.components {
-            // Skip unimplemented components
-            if !matches!(
-                component.as_str(),
-                COMPONENT_FFN_DOWN | COMPONENT_FFN_GATE
-            ) {
+            // Embeddings are layer-independent — handle separately
+            if component == COMPONENT_EMBEDDINGS {
+                let file_path = output_dir.join(format!("{component}.vectors.jsonl"));
+                if resume && file_path.exists() {
+                    summaries.push(ComponentSummary {
+                        component: component.clone(),
+                        vectors_written: 0,
+                        output_path: file_path,
+                        elapsed_secs: 0.0,
+                    });
+                    continue;
+                }
+                let comp_start = std::time::Instant::now();
+                callbacks.on_component_start(component, 1);
+                let mut w = VectorWriter::create(&file_path)?;
+                w.write_header(&VectorFileHeader {
+                    _header: true,
+                    component: component.clone(),
+                    model: self.model_name.clone(),
+                    dimension: self.weights.hidden_size,
+                    extraction_date: current_date(),
+                })?;
+                let count = self.extract_embeddings(&config, &mut w, callbacks)?;
+                let elapsed_ms = comp_start.elapsed().as_secs_f64() * 1000.0;
+                callbacks.on_layer_done(component, 0, count, elapsed_ms);
+                callbacks.on_component_done(component, count);
                 summaries.push(ComponentSummary {
                     component: component.clone(),
-                    vectors_written: 0,
-                    output_path: output_dir.join(format!("{component}.vectors.jsonl")),
-                    elapsed_secs: 0.0,
+                    vectors_written: count,
+                    output_path: file_path,
+                    elapsed_secs: comp_start.elapsed().as_secs_f64(),
                 });
                 continue;
             }
@@ -491,6 +793,15 @@ impl VectorExtractor {
                     }
                     COMPONENT_FFN_GATE => {
                         self.extract_ffn_gate(layer, config, &mut writer, callbacks)?
+                    }
+                    COMPONENT_FFN_UP => {
+                        self.extract_ffn_up(layer, config, &mut writer, callbacks)?
+                    }
+                    COMPONENT_ATTN_OV => {
+                        self.extract_attn_ov(layer, config, &mut writer, callbacks)?
+                    }
+                    COMPONENT_ATTN_QK => {
+                        self.extract_attn_qk(layer, config, &mut writer, callbacks)?
                     }
                     _ => 0,
                 };
@@ -551,6 +862,19 @@ fn partial_top_k_column(
         return indexed;
     }
 
+    indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed.truncate(k);
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed
+}
+
+/// Top-k from a flat slice (for attn_ov norms).
+fn partial_top_k_slice(data: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let mut indexed: Vec<(usize, f32)> = data.iter().copied().enumerate().collect();
+    let k = k.min(indexed.len());
+    if k == 0 {
+        return vec![];
+    }
     indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
     indexed.truncate(k);
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
