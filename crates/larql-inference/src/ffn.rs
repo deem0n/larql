@@ -2,6 +2,7 @@
 
 use ndarray::Array2;
 
+use crate::forward::{add_bias, dot_f64};
 use crate::model::ModelWeights;
 
 // ── Trait ──
@@ -32,18 +33,65 @@ pub struct WeightFfn<'a> {
 impl<'a> FfnBackend for WeightFfn<'a> {
     fn forward(&self, layer: usize, x: &Array2<f32>) -> Array2<f32> {
         let arch = &*self.weights.arch;
-        let w_gate = self.weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
         let w_up = self.weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
         let w_down = self.weights.tensors.get(&arch.ffn_down_key(layer)).unwrap();
-        ffn_forward_dense(x, w_gate, w_up, w_down)
+
+        let activation = if arch.ffn_type() == larql_models::FfnType::Gated {
+            let w_gate = self.weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
+            let gate = dot_f64(x, w_gate);
+            let up = dot_f64(x, w_up);
+            match arch.activation() {
+                larql_models::Activation::GeluTanh => gelu_tanh_gate_up(&gate, &up),
+                _ => silu_gate_up(&gate, &up),
+            }
+        } else {
+            // Standard (non-gated) FFN: activation(x @ up.T + bias)
+            let mut projected = dot_f64(x, w_up);
+            if let Some(bias) = arch.ffn_up_bias_key(layer).and_then(|k| self.weights.vectors.get(&k)) {
+                add_bias(&mut projected, bias);
+            }
+            match arch.activation() {
+                larql_models::Activation::GeluTanh => projected.mapv(gelu_tanh),
+                larql_models::Activation::Gelu => projected.mapv(gelu_tanh),
+                _ => projected.mapv(|v| v * sigmoid(v)),
+            }
+        };
+        let mut out = dot_f64(&activation, w_down);
+        if let Some(bias) = arch.ffn_down_bias_key(layer).and_then(|k| self.weights.vectors.get(&k)) {
+            add_bias(&mut out, bias);
+        }
+        out
     }
 
     fn forward_with_activation(&self, layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         let arch = &*self.weights.arch;
-        let w_gate = self.weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
         let w_up = self.weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
         let w_down = self.weights.tensors.get(&arch.ffn_down_key(layer)).unwrap();
-        ffn_forward_dense_with_activation(x, w_gate, w_up, w_down)
+
+        let activation = if arch.ffn_type() == larql_models::FfnType::Gated {
+            let w_gate = self.weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
+            let gate = dot_f64(x, w_gate);
+            let up = dot_f64(x, w_up);
+            match arch.activation() {
+                larql_models::Activation::GeluTanh => gelu_tanh_gate_up(&gate, &up),
+                _ => silu_gate_up(&gate, &up),
+            }
+        } else {
+            let mut projected = dot_f64(x, w_up);
+            if let Some(bias) = arch.ffn_up_bias_key(layer).and_then(|k| self.weights.vectors.get(&k)) {
+                add_bias(&mut projected, bias);
+            }
+            match arch.activation() {
+                larql_models::Activation::GeluTanh => projected.mapv(gelu_tanh),
+                larql_models::Activation::Gelu => projected.mapv(gelu_tanh),
+                _ => projected.mapv(|v| v * sigmoid(v)),
+            }
+        };
+        let mut out = dot_f64(&activation, w_down);
+        if let Some(bias) = arch.ffn_down_bias_key(layer).and_then(|k| self.weights.vectors.get(&k)) {
+            add_bias(&mut out, bias);
+        }
+        (out, activation)
     }
 
     fn name(&self) -> &str {
@@ -120,6 +168,30 @@ impl<'a> LayerFfnRouter<'a> {
         } else {
             self.backends[self.num_layers - 1]
         }
+    }
+}
+
+// ── Highway backend (skip FFN, return zeros) ──
+
+/// Highway FFN: returns zeros. For layers where the residual stream barely
+/// turns (angular displacement < 0.04 rad), the FFN contribution is negligible.
+/// Attention still runs — this only skips the feed-forward computation.
+pub struct HighwayFfn;
+
+impl FfnBackend for HighwayFfn {
+    fn forward(&self, _layer: usize, x: &Array2<f32>) -> Array2<f32> {
+        Array2::<f32>::zeros((x.shape()[0], x.shape()[1]))
+    }
+
+    fn forward_with_activation(&self, _layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
+        (
+            Array2::<f32>::zeros((x.shape()[0], x.shape()[1])),
+            Array2::<f32>::zeros((x.shape()[0], 1)),
+        )
+    }
+
+    fn name(&self) -> &str {
+        "highway"
     }
 }
 
@@ -252,6 +324,18 @@ fn ffn_forward_sparse_with_activation(
 pub fn silu_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
     let activated = gate.mapv(|v| v * sigmoid(v));
     &activated * up
+}
+
+/// Gated FFN with GELU tanh approximation: GELU_tanh(gate) * up.
+pub fn gelu_tanh_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
+    let activated = gate.mapv(gelu_tanh);
+    &activated * up
+}
+
+/// GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+fn gelu_tanh(x: f32) -> f32 {
+    let c = 0.7978845608f32; // sqrt(2/pi)
+    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
 }
 
 /// Backward-compatible alias for dense FFN forward.

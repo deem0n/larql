@@ -14,6 +14,9 @@ pub struct ModelWeights {
     pub tensors: HashMap<String, Array2<f32>>,
     pub vectors: HashMap<String, Vec<f32>>,
     pub embed: Array2<f32>,
+    /// Output projection matrix. Same as embed if tie_word_embeddings=true,
+    /// separate lm_head.weight otherwise.
+    pub lm_head: Array2<f32>,
     pub arch: Box<dyn ModelArchitecture>,
     // Cached from arch.config() for convenience — these are hot-path values.
     pub num_layers: usize,
@@ -89,7 +92,14 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, InferenceE
         .ok_or_else(|| InferenceError::MissingTensor(embed_key.into()))?
         .clone();
 
-    let vocab_size = embed.shape()[0];
+    // Use separate lm_head if available (tie_word_embeddings=false),
+    // otherwise reuse embed_tokens for output projection.
+    let lm_head = tensors
+        .get("lm_head.weight")
+        .cloned()
+        .unwrap_or_else(|| embed.clone());
+
+    let vocab_size = lm_head.shape()[0];
 
     // Cache config values
     let cfg = arch.config();
@@ -105,6 +115,7 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, InferenceE
         tensors,
         vectors,
         embed,
+        lm_head,
         arch,
         num_layers,
         hidden_size,

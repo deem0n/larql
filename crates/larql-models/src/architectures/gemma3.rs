@@ -2,13 +2,15 @@
 //!
 //! Key differences from standard Llama:
 //! - Embedding scaled by sqrt(hidden_size)
-//! - RMSNorm has +1 weight offset: out = (x / rms) * (1 + weight)
 //! - QK normalization per-head (q_norm, k_norm weights)
 //! - 4 norms per layer (pre/post attention, pre/post FFN)
 //! - Sliding window attention on most layers (every Nth layer is full)
 //! - rope_theta defaults to 1,000,000 (not in config.json, HF class default)
+//!
+//! Note: HuggingFace saves Gemma norm weights with the +1 offset already baked in,
+//! so norm_weight_offset is 0.0 (the saved weight IS the final multiplier).
 
-use crate::config::{ModelArchitecture, ModelConfig};
+use crate::config::{Activation, ModelArchitecture, ModelConfig};
 
 /// Gemma 3 sliding window pattern: every 6th layer (0-indexed: 5, 11, 17, ...)
 /// uses full attention, the rest use sliding window.
@@ -51,8 +53,13 @@ impl ModelArchitecture for Gemma3Arch {
 
     // ── Gemma-specific behavior ──
 
+    // All Gemma norms (layer + QK) use 1.0 + learned_weight at runtime.
     fn norm_weight_offset(&self) -> f32 {
         1.0
+    }
+
+    fn activation(&self) -> Activation {
+        Activation::GeluTanh
     }
 
     fn embed_scale(&self) -> f32 {
@@ -67,5 +74,15 @@ impl ModelArchitecture for Gemma3Arch {
         // Full attention on every Nth layer, sliding window on the rest.
         // Layer indices 5, 11, 17, 23, 29 are full attention (0-indexed).
         !(layer + 1).is_multiple_of(GEMMA3_SLIDING_WINDOW_PATTERN)
+    }
+
+    fn rope_base_for_layer(&self, layer: usize) -> f64 {
+        if self.is_sliding_window_layer(layer) {
+            // Local layers use a lower RoPE base
+            self.config.rope_local_base.unwrap_or(10_000.0)
+        } else {
+            // Global layers use the full rope_theta
+            self.config.rope_base
+        }
     }
 }

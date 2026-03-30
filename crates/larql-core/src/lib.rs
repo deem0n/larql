@@ -20,8 +20,10 @@ pub use io::json::{load_json, save_json};
 pub use io::{from_bytes, load, load_with_format, save, save_with_format, to_bytes};
 
 pub use algo::diff::{diff, ChangedEdge, GraphDiff};
+pub use algo::filter::{filter_graph, FilterConfig};
 pub use algo::merge::{merge_graphs, merge_graphs_with_strategy};
 pub use algo::pagerank::{pagerank, PageRankResult};
 pub use algo::shortest_path::{astar, shortest_path, shortest_path_with_weight, PathResult};
 pub use algo::traversal::{bfs as bfs_traversal, dfs, TraversalResult};
 pub use io::csv::{load_csv, save_csv};
+pub use io::packed::{from_packed_bytes, load_packed, save_packed, to_packed_bytes};

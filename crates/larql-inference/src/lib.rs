@@ -24,13 +24,15 @@ pub use capture::{
     CaptureCallbacks, CaptureConfig, InferenceModel, TopKEntry, VectorFileHeader, VectorRecord,
 };
 pub use error::InferenceError;
-pub use ffn::{FfnBackend, LayerFfnRouter, SparseFfn, WeightFfn};
+pub use ffn::{FfnBackend, HighwayFfn, LayerFfnRouter, SparseFfn, WeightFfn};
 pub use attention::AttentionWeights;
 pub use forward::{
-    capture_residuals, predict, predict_with_ffn, predict_with_router, trace_forward,
-    trace_forward_full, trace_forward_with_ffn, LayerAttentionCapture, PredictResult, TraceResult,
+    calibrate_scalar_gains, capture_residuals, forward_to_layer, predict, predict_from_hidden,
+    predict_from_hidden_with_ffn, predict_with_ffn, predict_with_router, predict_with_strategy,
+    trace_forward, trace_forward_full, trace_forward_with_ffn, LayerAttentionCapture, LayerMode,
+    PredictResult, TraceResult,
 };
-pub use graph_ffn::{GateIndex, GraphFfn, IndexBuildCallbacks, SilentIndexCallbacks};
+pub use graph_ffn::{CachedFfn, ClusteredFfn, ClusteredGateIndex, DownClusteredFfn, DownClusteredIndex, EntityRoutedFfn, FeatureListFfn, GateIndex, GraphFfn, IndexBuildCallbacks, SilentIndexCallbacks};
 pub use route_ffn::{RouteFfn, RouteGuidedFfn, RouteTable};
 pub use vector_index::{
     load_feature_labels, load_model_weights_from_vindex, load_vindex_config,

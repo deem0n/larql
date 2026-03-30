@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 larql-core = { path = "../larql-core" }
 larql-inference = { path = "../larql-inference" }
+larql-lql = { path = "../larql-lql" }
 larql-surreal = { path = "../larql-surreal" }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"

@@ -2,8 +2,9 @@ use std::time::Instant;
 
 use clap::Args;
 use larql_inference::{
-    predict, predict_with_ffn, predict_with_router, FfnBackend, GateIndex, GraphFfn,
-    InferenceModel, LayerFfnRouter, RouteFfn, RouteGuidedFfn, RouteTable, SparseFfn, WeightFfn,
+    calibrate_scalar_gains, predict, predict_with_ffn, predict_with_router, predict_with_strategy,
+    FfnBackend, GateIndex, GraphFfn, InferenceModel, LayerFfnRouter, LayerMode, RouteFfn,
+    RouteGuidedFfn, RouteTable, SparseFfn, WeightFfn,
 };
 
 #[derive(Args)]
@@ -55,6 +56,12 @@ pub struct PredictArgs {
     /// Compare all backends side by side.
     #[arg(long)]
     compare: bool,
+
+    /// Layer strategy with scalar bypass: "dense:0-8,scalar:9-14,dense:15-33".
+    /// Scalar gains are auto-calibrated from a forward pass on the same prompt.
+    /// Supports: dense, sparse<K>, scalar, walk.
+    #[arg(long)]
+    mode: Option<String>,
 }
 
 pub fn run(args: PredictArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -94,6 +101,12 @@ fn run_single(
     args: &PredictArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let weights = model.weights();
+
+    // --mode takes precedence: supports scalar bypass
+    if let Some(ref mode_spec) = args.mode {
+        return run_with_mode(model, token_ids, top_k, mode_spec);
+    }
+
     let ffn_spec = args.ffn.as_str();
 
     // Parse FFN spec
@@ -303,6 +316,168 @@ fn run_with_layer_spec(
     let result = predict_with_router(weights, model.tokenizer(), token_ids, top_k, &router);
     eprintln!("  Forward pass: {:.1}s", start.elapsed().as_secs_f64());
     print_predictions(spec, &result.predictions);
+
+    Ok(())
+}
+
+fn run_with_mode(
+    model: &InferenceModel,
+    token_ids: &[u32],
+    top_k: usize,
+    spec: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let weights = model.weights();
+    let num_layers = weights.num_layers;
+
+    // Parse mode spec: "dense:0-8,scalar:9-14,dense:15-33"
+    #[derive(Debug, Clone)]
+    enum BackendKind {
+        Dense,
+        Sparse(usize),
+        Scalar,
+    }
+
+    let mut layer_kinds = vec![BackendKind::Dense; num_layers];
+    for part in spec.split(',') {
+        let (name, range) = part
+            .split_once(':')
+            .ok_or_else(|| format!("invalid mode spec: {part}"))?;
+        let (start, end) = if range.contains('-') {
+            let (a, b) = range.split_once('-').unwrap();
+            (a.parse::<usize>()?, b.parse::<usize>()?)
+        } else {
+            let l = range.parse::<usize>()?;
+            (l, l)
+        };
+
+        let kind = if name == "dense" {
+            BackendKind::Dense
+        } else if name == "scalar" {
+            BackendKind::Scalar
+        } else if let Some(k_str) = name.strip_prefix("sparse") {
+            let k: usize = if k_str.is_empty() { 100 } else { k_str.parse()? };
+            BackendKind::Sparse(k)
+        } else {
+            return Err(format!("unknown mode: {name}. Use dense, scalar, sparse<K>").into());
+        };
+
+        for l in start..=end.min(num_layers - 1) {
+            layer_kinds[l] = kind.clone();
+        }
+    }
+
+    // Check if any scalar layers
+    let has_scalar = layer_kinds.iter().any(|k| matches!(k, BackendKind::Scalar));
+
+    if has_scalar {
+        // Calibrate scalar gains from a full forward pass
+        eprintln!("Calibrating scalar gains...");
+        let cal_start = Instant::now();
+        let gains = calibrate_scalar_gains(weights, token_ids);
+        eprintln!(
+            "  Calibrated {} layers in {:.1}s",
+            gains.len(),
+            cal_start.elapsed().as_secs_f64()
+        );
+
+        // Print the gain schedule
+        let scalar_layers: Vec<usize> = layer_kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(l, k)| if matches!(k, BackendKind::Scalar) { Some(l) } else { None })
+            .collect();
+        eprintln!("  Scalar layers: {:?}", scalar_layers);
+        for &l in &scalar_layers {
+            eprintln!("    L{l}: gain={:.4}", gains[l]);
+        }
+
+        // Build FFN backends for non-scalar layers
+        let weight_ffn = WeightFfn { weights };
+        let sparse_backends: Vec<SparseFfn> = layer_kinds
+            .iter()
+            .filter_map(|k| {
+                if let BackendKind::Sparse(top_k) = k {
+                    Some(SparseFfn { weights, top_k: *top_k })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Build strategy
+        let mut strategy: Vec<LayerMode> = Vec::with_capacity(num_layers);
+        let mut sparse_idx = 0;
+        for (l, kind) in layer_kinds.iter().enumerate() {
+            match kind {
+                BackendKind::Dense => {
+                    strategy.push(LayerMode::Compute(&weight_ffn));
+                }
+                BackendKind::Sparse(_) => {
+                    strategy.push(LayerMode::Compute(&sparse_backends[sparse_idx]));
+                    sparse_idx += 1;
+                }
+                BackendKind::Scalar => {
+                    strategy.push(LayerMode::ScalarGain(gains[l]));
+                }
+            }
+        }
+
+        eprintln!("\nMode: {spec}");
+        let start = Instant::now();
+        let result = predict_with_strategy(weights, model.tokenizer(), token_ids, top_k, &strategy);
+        let elapsed = start.elapsed();
+
+        let compute_layers = layer_kinds
+            .iter()
+            .filter(|k| !matches!(k, BackendKind::Scalar))
+            .count();
+        eprintln!(
+            "  Forward pass: {:.1}s ({} compute layers, {} scalar bypass)",
+            elapsed.as_secs_f64(),
+            compute_layers,
+            num_layers - compute_layers,
+        );
+        print_predictions(spec, &result.predictions);
+
+        // Also run dense baseline for comparison
+        eprintln!("\nBaseline (dense all layers):");
+        let start = Instant::now();
+        let baseline = predict(weights, model.tokenizer(), token_ids, top_k);
+        eprintln!("  Forward pass: {:.1}s", start.elapsed().as_secs_f64());
+        print_predictions("dense (baseline)", &baseline.predictions);
+    } else {
+        // No scalar — fall back to router
+        let weight_ffn = WeightFfn { weights };
+        let sparse_backends: Vec<SparseFfn> = layer_kinds
+            .iter()
+            .filter_map(|k| {
+                if let BackendKind::Sparse(top_k) = k {
+                    Some(SparseFfn { weights, top_k: *top_k })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut backends: Vec<&dyn FfnBackend> = vec![&weight_ffn; num_layers];
+        let mut sparse_idx = 0;
+        for (l, kind) in layer_kinds.iter().enumerate() {
+            match kind {
+                BackendKind::Dense => {}
+                BackendKind::Sparse(_) => {
+                    backends[l] = &sparse_backends[sparse_idx];
+                    sparse_idx += 1;
+                }
+                BackendKind::Scalar => unreachable!(),
+            }
+        }
+        let router = LayerFfnRouter::per_layer(backends);
+        eprintln!("Mode: {spec}");
+        let start = Instant::now();
+        let result = predict_with_router(weights, model.tokenizer(), token_ids, top_k, &router);
+        eprintln!("  Forward pass: {:.1}s", start.elapsed().as_secs_f64());
+        print_predictions(spec, &result.predictions);
+    }
 
     Ok(())
 }

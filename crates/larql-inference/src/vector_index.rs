@@ -20,7 +20,7 @@ use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::error::InferenceError;
-use crate::ffn::{sigmoid, FfnBackend};
+use crate::ffn::FfnBackend;
 use crate::model::ModelWeights;
 
 use larql_models::TopKEntry;
@@ -407,6 +407,19 @@ impl VectorIndex {
             .enumerate()
             .filter_map(|(i, v)| v.as_ref().map(|_| i))
             .collect()
+    }
+
+    /// Access down metadata for a specific layer.
+    pub fn down_meta_at(&self, layer: usize) -> Option<&[Option<FeatureMeta>]> {
+        self.down_meta
+            .get(layer)
+            .and_then(|v| v.as_ref())
+            .map(|v| v.as_slice())
+    }
+
+    /// Access gate vectors matrix for a specific layer.
+    pub fn gate_vectors_at(&self, layer: usize) -> Option<&Array2<f32>> {
+        self.gate_vectors.get(layer).and_then(|v| v.as_ref())
     }
 }
 
@@ -1366,6 +1379,20 @@ pub fn load_model_weights_from_vindex(
         vocab_size: Some(config.vocab_size),
         rope_base: model_cfg.rope_base,
         sliding_window: model_cfg.sliding_window,
+        num_experts: None,
+        num_experts_per_token: None,
+        num_shared_experts: None,
+        kv_lora_rank: None,
+        q_lora_rank: None,
+        rope_scaling: None,
+        rope_local_base: None,
+        embedding_multiplier: None,
+        residual_multiplier: None,
+        attention_multiplier: None,
+        logits_scaling: None,
+        attn_logit_softcapping: None,
+        final_logit_softcapping: None,
+        query_pre_attn_scalar: None,
     };
 
     let arch_json = serde_json::json!({
@@ -1448,10 +1475,12 @@ pub fn load_model_weights_from_vindex(
     callbacks.on_file_done("model_weights", entries.len(), 0.0);
 
     let cfg = arch.config();
+    let lm_head = embed.clone();
     Ok(ModelWeights {
         tensors,
         vectors,
         embed,
+        lm_head,
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
@@ -1537,11 +1566,48 @@ impl<'a> WalkFfn<'a> {
         let layers = self.trace.borrow_mut().drain(..).collect();
         WalkTrace { layers }
     }
+
+    /// Capture walk trace for the last position using gate KNN from the vindex.
+    /// This is the interpretability layer — it records which features activate
+    /// and what they mean (via down_meta labels). Does not affect computation.
+    fn capture_trace(&self, layer: usize, x: &Array2<f32>) {
+        let has_index = self.index.num_features(layer) > 0;
+        if !has_index {
+            return;
+        }
+
+        let seq_len = x.shape()[0];
+        let last_row = x.row(seq_len - 1).to_owned();
+
+        // Use vindex gate vectors for KNN (interpretability — which features match)
+        let hits = self.index.gate_knn(layer, &last_row, self.top_k);
+
+        let walk_hits: Vec<WalkHit> = hits
+            .iter()
+            .filter_map(|&(feature, gate_score)| {
+                let meta = self.index.feature_meta(layer, feature)?.clone();
+                Some(WalkHit {
+                    layer,
+                    feature,
+                    gate_score,
+                    meta,
+                })
+            })
+            .collect();
+
+        self.trace.borrow_mut().push((layer, walk_hits));
+    }
 }
 
 impl<'a> FfnBackend for WalkFfn<'a> {
     fn forward(&self, layer: usize, x: &Array2<f32>) -> Array2<f32> {
-        let (out, _) = self.forward_with_activation(layer, x);
+        // Delegate to WeightFfn for exact architecture-correct computation
+        let dense_ffn = crate::ffn::WeightFfn { weights: self.weights };
+        let out = dense_ffn.forward(layer, x);
+
+        // Capture walk trace for the last position (interpretability layer only)
+        self.capture_trace(layer, x);
+
         out
     }
 
@@ -1550,103 +1616,12 @@ impl<'a> FfnBackend for WalkFfn<'a> {
         layer: usize,
         x: &Array2<f32>,
     ) -> (Array2<f32>, Array2<f32>) {
-        let arch = &*self.weights.arch;
-        let w_gate = self.weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
-        let w_up = self.weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
-        let w_down = self.weights.tensors.get(&arch.ffn_down_key(layer)).unwrap();
-        let hidden = x.shape()[1];
-        let intermediate = w_gate.shape()[0];
-        let seq_len = x.shape()[0];
+        let dense_ffn = crate::ffn::WeightFfn { weights: self.weights };
+        let result = dense_ffn.forward_with_activation(layer, x);
 
-        let mut full_activation = Array2::<f32>::zeros((seq_len, intermediate));
-        let mut out = Array2::<f32>::zeros((seq_len, hidden));
+        self.capture_trace(layer, x);
 
-        // For the last sequence position, capture the walk trace
-        let last_pos = seq_len - 1;
-
-        let has_index = self.index.num_features(layer) > 0;
-
-        for s in 0..seq_len {
-            let x_row = x.row(s);
-
-            // Feature selection: use index if available, fall back to SparseFfn
-            let hits: Vec<(usize, f32)> = if has_index {
-                let x_vec = x_row.to_owned();
-                self.index.gate_knn(layer, &x_vec, self.top_k)
-            } else {
-                // No index for this layer — compute gate matmul directly (SparseFfn path)
-                let gate_proj = w_gate.dot(&x_row);
-                let mut indexed: Vec<(usize, f32)> = gate_proj
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(i, v)| (i, v * sigmoid(v)))
-                    .collect();
-                let k = self.top_k.min(indexed.len());
-                if k > 0 && k < indexed.len() {
-                    indexed.select_nth_unstable_by(k, |a, b| {
-                        b.1.abs().partial_cmp(&a.1.abs()).unwrap()
-                    });
-                    indexed.truncate(k);
-                }
-                indexed.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-                indexed
-            };
-
-            let k = hits.len();
-            if k == 0 {
-                continue;
-            }
-
-            // Capture walk trace for last position (only for indexed layers)
-            if s == last_pos && has_index {
-                let walk_hits: Vec<WalkHit> = hits
-                    .iter()
-                    .filter_map(|&(feature, gate_score)| {
-                        let meta = self.index.feature_meta(layer, feature)?.clone();
-                        Some(WalkHit {
-                            layer,
-                            feature,
-                            gate_score,
-                            meta,
-                        })
-                    })
-                    .collect();
-                self.trace.borrow_mut().push((layer, walk_hits));
-            }
-
-            // Compute actual gate activations for selected features
-            let up_raw = w_up.as_slice().unwrap();
-            let mut up_buf = vec![0.0f32; k * hidden];
-            for (i, &(feat, _)) in hits.iter().enumerate() {
-                let src = feat * hidden;
-                up_buf[i * hidden..(i + 1) * hidden]
-                    .copy_from_slice(&up_raw[src..src + hidden]);
-            }
-
-            let up_sub =
-                ndarray::ArrayView2::from_shape((k, hidden), &up_buf[..k * hidden]).unwrap();
-            let up_proj = up_sub.dot(&x_row);
-
-            // Compute actual gate values for the selected features
-            for (i, &(feat, _)) in hits.iter().enumerate() {
-                let gate_row = w_gate.row(feat);
-                let gate_val: f32 = gate_row.iter().zip(x_row.iter()).map(|(a, b)| a * b).sum();
-                let silu_gate = gate_val * sigmoid(gate_val);
-                let act_val = silu_gate * up_proj[i];
-                full_activation[[s, feat]] = act_val;
-            }
-
-            // Down projection via dense BLAS gemv on sparse activation
-            let act_row = full_activation.row(s);
-            let out_vec = w_down.dot(&act_row);
-            let mut out_row = out.row_mut(s);
-            ndarray::Zip::from(&mut out_row)
-                .and(&out_vec)
-                .for_each(|o, &v| *o = v);
-        }
-
-        (out, full_activation)
+        result
     }
 
     fn name(&self) -> &str {

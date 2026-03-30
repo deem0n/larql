@@ -42,15 +42,29 @@ fn main() {
         msgpack_bytes.len() as f64 / 1024.0
     );
     println!(
-        "Savings:  {:.0}% smaller\n",
+        "  vs JSON: {:.0}% smaller",
         (1.0 - msgpack_bytes.len() as f64 / json_bytes.len() as f64) * 100.0
+    );
+
+    // ── Packed binary ──
+    let packed_bytes = to_bytes(&graph, Format::Packed).unwrap();
+    println!(
+        "Packed:   {} bytes ({:.1} KB)",
+        packed_bytes.len(),
+        packed_bytes.len() as f64 / 1024.0
+    );
+    println!(
+        "  vs JSON: {:.0}% smaller\n",
+        (1.0 - packed_bytes.len() as f64 / json_bytes.len() as f64) * 100.0
     );
 
     // ── Roundtrip bytes ──
     let from_json = from_bytes(&json_bytes, Format::Json).unwrap();
     let from_msgpack = from_bytes(&msgpack_bytes, Format::MessagePack).unwrap();
+    let from_packed = from_bytes(&packed_bytes, Format::Packed).unwrap();
     println!("Roundtrip JSON:    {} edges", from_json.edge_count());
     println!("Roundtrip MsgPack: {} edges", from_msgpack.edge_count());
+    println!("Roundtrip Packed:  {} edges", from_packed.edge_count());
 
     // ── File format detection ──
     println!("\nFormat detection:");
@@ -60,6 +74,8 @@ fn main() {
         "graph.larql.bin",
         "graph.bin",
         "graph.msgpack",
+        "graph.larql.pak",
+        "graph.pak",
     ] {
         let fmt = Format::from_path(path);
         println!("  {path:25} → {fmt:?}");

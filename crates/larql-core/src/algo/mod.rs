@@ -1,5 +1,6 @@
 pub mod components;
 pub mod diff;
+pub mod filter;
 pub mod merge;
 pub mod pagerank;
 pub mod shortest_path;

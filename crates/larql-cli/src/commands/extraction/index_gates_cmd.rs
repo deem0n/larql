@@ -71,31 +71,25 @@ pub fn run(args: IndexGatesArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let build_start = Instant::now();
-    let index = GateIndex::build(
+
+    // Stream directly to disk — never holds more than one layer in memory.
+    eprintln!("Streaming to {}...", args.output.display());
+    GateIndex::build_streaming(
         model.weights(),
         &layers,
         args.features_per_token,
         args.top_tokens,
+        &args.output,
         &mut callbacks,
-    );
+    )?;
     let build_elapsed = build_start.elapsed();
 
-    eprintln!(
-        "\nIndex built in {:.1}s ({} layers, {} total entries)",
-        build_elapsed.as_secs_f64(),
-        index.num_layers(),
-        index.total_entries(),
-    );
-
-    // Save
-    eprintln!("Saving to {}...", args.output.display());
-    let save_start = Instant::now();
-    index.save(&args.output)?;
     let size = std::fs::metadata(&args.output)?.len();
     eprintln!(
-        "  {:.1} MB ({:.1}s)",
+        "\nIndex built in {:.1}s ({} layers, {:.1} MB)",
+        build_elapsed.as_secs_f64(),
+        layers.len(),
         size as f64 / 1024.0 / 1024.0,
-        save_start.elapsed().as_secs_f64()
     );
 
     eprintln!("\nDone. Total: {:.1}s", start.elapsed().as_secs_f64());

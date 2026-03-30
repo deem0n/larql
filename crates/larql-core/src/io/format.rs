@@ -8,6 +8,8 @@ pub enum Format {
     /// MessagePack binary (.larql.bin)
     #[cfg(feature = "msgpack")]
     MessagePack,
+    /// Packed binary with string interning (.larql.pak)
+    Packed,
 }
 
 impl Format {
@@ -26,6 +28,10 @@ impl Format {
             return Some(Self::MessagePack);
         }
 
+        if name.ends_with(".larql.pak") || name.ends_with(".pak") {
+            return Some(Self::Packed);
+        }
+
         None
     }
 
@@ -34,6 +40,7 @@ impl Format {
             Self::Json => ".larql.json",
             #[cfg(feature = "msgpack")]
             Self::MessagePack => ".larql.bin",
+            Self::Packed => ".larql.pak",
         }
     }
 }
@@ -44,6 +51,7 @@ impl std::fmt::Display for Format {
             Self::Json => write!(f, "json"),
             #[cfg(feature = "msgpack")]
             Self::MessagePack => write!(f, "msgpack"),
+            Self::Packed => write!(f, "packed"),
         }
     }
 }

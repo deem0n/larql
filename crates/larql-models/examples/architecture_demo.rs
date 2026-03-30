@@ -28,20 +28,43 @@ fn main() {
     let gemma = detect_from_json(&gemma_config);
     print_architecture(&*gemma);
 
-    // ── Llama-style (generic) ──
+    // ── Llama 3 ──
     let llama_config = serde_json::json!({
         "model_type": "llama",
         "hidden_size": 4096,
         "num_hidden_layers": 32,
-        "intermediate_size": 11008,
-        "head_dim": 128,
+        "intermediate_size": 14336,
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
-        "rope_theta": 500000.0
+        "vocab_size": 128256,
+        "rope_theta": 500000.0,
+        "rope_scaling": {
+            "rope_type": "llama3",
+            "factor": 8.0
+        }
     });
 
     let llama = detect_from_json(&llama_config);
     print_architecture(&*llama);
+
+    // ── DeepSeek v2 (MoE + MLA) ──
+    let deepseek_config = serde_json::json!({
+        "model_type": "deepseek_v2",
+        "hidden_size": 5120,
+        "intermediate_size": 12288,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "n_routed_experts": 160,
+        "num_experts_per_tok": 6,
+        "n_shared_experts": 2,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "rope_scaling": { "type": "yarn", "factor": 40.0 }
+    });
+
+    let deepseek = detect_from_json(&deepseek_config);
+    print_architecture(&*deepseek);
 
     // ── Tensor key comparison ──
     println!("=== Tensor Key Comparison (Layer 5) ===\n");
@@ -121,5 +144,27 @@ fn print_architecture(arch: &dyn ModelArchitecture) {
     println!("  Has QK norm:     {}", arch.attn_q_norm_key(0).is_some());
     println!("  Embed key:       {}", arch.embed_key());
     println!("  Final norm key:  {}", arch.final_norm_key());
+
+    // MoE info
+    if arch.is_moe() {
+        println!("  MoE:             {} routed experts, {} per token, {} shared",
+            arch.num_experts(), arch.num_experts_per_token(), arch.num_shared_experts());
+        println!("  Router key:      {}", arch.moe_router_key(0).unwrap_or_default());
+        println!("  Expert[0] gate:  {}", arch.expert_ffn_gate_key(0, 0).unwrap_or_default());
+        println!("  Shared gate:     {}", arch.shared_expert_gate_key(0).unwrap_or_default());
+    }
+
+    // MLA info
+    if arch.uses_mla() {
+        println!("  MLA:             KV rank={}, Q rank={}",
+            arch.kv_lora_rank(), arch.q_lora_rank());
+        println!("  KV-A key:        {}", arch.mla_kv_a_key(0).unwrap_or_default());
+    }
+
+    // RoPE scaling
+    if let Some(scaling) = arch.rope_scaling_type() {
+        println!("  RoPE scaling:    {} (factor={:.1})", scaling, arch.rope_scaling_factor());
+    }
+
     println!();
 }

@@ -35,6 +35,13 @@ pub enum FfnType {
     Standard,
 }
 
+/// RoPE scaling configuration (YaRN, linear, dynamic).
+#[derive(Debug, Clone)]
+pub struct RopeScaling {
+    pub scaling_type: String,
+    pub factor: f64,
+}
+
 /// Model dimensions and architecture parameters, parsed from config.json.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -47,7 +54,28 @@ pub struct ModelConfig {
     pub num_kv_heads: usize,
     pub vocab_size: Option<usize>,
     pub rope_base: f64,
+    /// RoPE base for local/sliding window layers (Gemma3: 10,000).
+    pub rope_local_base: Option<f64>,
     pub sliding_window: Option<usize>,
+    // MoE fields
+    pub num_experts: Option<usize>,
+    pub num_experts_per_token: Option<usize>,
+    pub num_shared_experts: Option<usize>,
+    // MLA fields
+    pub kv_lora_rank: Option<usize>,
+    pub q_lora_rank: Option<usize>,
+    // RoPE scaling
+    pub rope_scaling: Option<RopeScaling>,
+    // Softcapping (Gemma2)
+    pub attn_logit_softcapping: Option<f64>,
+    pub final_logit_softcapping: Option<f64>,
+    /// Override attention scale denominator (Gemma: query_pre_attn_scalar).
+    pub query_pre_attn_scalar: Option<f64>,
+    // Granite-style scaling multipliers
+    pub embedding_multiplier: Option<f64>,
+    pub residual_multiplier: Option<f64>,
+    pub attention_multiplier: Option<f64>,
+    pub logits_scaling: Option<f64>,
 }
 
 /// Architecture-specific behavior. Describes how a model is structured
@@ -96,6 +124,23 @@ pub trait ModelArchitecture: Send + Sync {
         format!("{}self_attn.o_proj.weight", self.layer_prefix(layer))
     }
 
+    /// Attention bias keys (None if model doesn't use attention bias).
+    fn attn_o_bias_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+    fn attn_q_bias_key(&self, layer: usize) -> Option<String> {
+        let _ = layer;
+        None
+    }
+    fn attn_k_bias_key(&self, layer: usize) -> Option<String> {
+        let _ = layer;
+        None
+    }
+    fn attn_v_bias_key(&self, layer: usize) -> Option<String> {
+        let _ = layer;
+        None
+    }
+
     /// QK norm weight keys (None if model doesn't use QK norm).
     fn attn_q_norm_key(&self, layer: usize) -> Option<String> {
         let _ = layer;
@@ -103,6 +148,14 @@ pub trait ModelArchitecture: Send + Sync {
     }
     fn attn_k_norm_key(&self, layer: usize) -> Option<String> {
         let _ = layer;
+        None
+    }
+
+    /// FFN bias keys (None if model doesn't use FFN bias).
+    fn ffn_up_bias_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+    fn ffn_down_bias_key(&self, _layer: usize) -> Option<String> {
         None
     }
 
@@ -147,16 +200,25 @@ pub trait ModelArchitecture: Send + Sync {
         NormType::RmsNorm
     }
 
-    /// Weight offset added during normalization.
-    /// Gemma: 1.0 (weight = 1 + learned_weight), Llama: 0.0 (weight = learned_weight).
+    /// Weight offset added during layer normalization.
+    /// Default 0.0 — saved weights are the final multiplier.
     fn norm_weight_offset(&self) -> f32 {
         0.0
     }
 
+    /// Weight offset added during QK normalization (per-head Q/K norms).
+    /// Gemma: 1.0 (weight = 1 + learned_weight at runtime), others: 0.0.
+    fn qk_norm_weight_offset(&self) -> f32 {
+        0.0
+    }
+
     /// Embedding scaling factor applied after lookup.
-    /// Gemma: sqrt(hidden_size), Llama: 1.0.
+    /// Gemma: sqrt(hidden_size), Granite: embedding_multiplier, Llama: 1.0.
     fn embed_scale(&self) -> f32 {
-        1.0
+        self.config()
+            .embedding_multiplier
+            .map(|v| v as f32)
+            .unwrap_or(1.0)
     }
 
     /// Activation function for the FFN.
@@ -183,5 +245,173 @@ pub trait ModelArchitecture: Send + Sync {
     /// Sliding window size (None = full attention).
     fn sliding_window_size(&self) -> Option<usize> {
         self.config().sliding_window
+    }
+
+    /// RoPE base frequency for a given layer.
+    /// Gemma3 uses different bases for sliding vs global attention layers.
+    fn rope_base_for_layer(&self, layer: usize) -> f64 {
+        let _ = layer;
+        self.config().rope_base
+    }
+
+    /// Attention scale: 1/sqrt(query_pre_attn_scalar) or 1/sqrt(head_dim).
+    fn attention_scale(&self) -> f64 {
+        let scalar = self
+            .config()
+            .query_pre_attn_scalar
+            .unwrap_or(self.config().head_dim as f64);
+        scalar.powf(-0.5)
+    }
+
+    // ── Softcapping (Gemma2) ──
+
+    /// Attention logit softcapping value (None = disabled).
+    /// Applied before softmax: scores = tanh(scores / cap) * cap
+    fn attn_logit_softcapping(&self) -> Option<f32> {
+        self.config().attn_logit_softcapping.map(|v| v as f32)
+    }
+
+    /// Final logit softcapping value (None = disabled).
+    /// Applied to output logits: logits = tanh(logits / cap) * cap
+    fn final_logit_softcapping(&self) -> Option<f32> {
+        self.config().final_logit_softcapping.map(|v| v as f32)
+    }
+
+    // ── Scaling multipliers (Granite-style) ──
+
+    /// Residual stream scaling factor applied after attention and FFN additions.
+    fn residual_multiplier(&self) -> f32 {
+        self.config()
+            .residual_multiplier
+            .map(|v| v as f32)
+            .unwrap_or(1.0)
+    }
+
+    /// Attention score scaling factor (applied on top of 1/sqrt(head_dim)).
+    fn attention_multiplier(&self) -> f32 {
+        self.config()
+            .attention_multiplier
+            .map(|v| v as f32)
+            .unwrap_or(1.0)
+    }
+
+    /// Logits scaling factor applied to final logits before softmax.
+    fn logits_scaling(&self) -> f32 {
+        self.config()
+            .logits_scaling
+            .map(|v| v as f32)
+            .unwrap_or(1.0)
+    }
+
+    // ── MoE (Mixture of Experts) ──
+
+    /// Whether this model uses Mixture of Experts.
+    fn is_moe(&self) -> bool {
+        false
+    }
+
+    /// Number of routed experts per layer.
+    fn num_experts(&self) -> usize {
+        0
+    }
+
+    /// Number of experts activated per token.
+    fn num_experts_per_token(&self) -> usize {
+        0
+    }
+
+    /// Number of shared (always-active) experts.
+    fn num_shared_experts(&self) -> usize {
+        0
+    }
+
+    /// Router weight key for expert selection.
+    fn moe_router_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Expert FFN gate weight key.
+    fn expert_ffn_gate_key(&self, _layer: usize, _expert_id: usize) -> Option<String> {
+        None
+    }
+
+    /// Expert FFN up-projection weight key.
+    fn expert_ffn_up_key(&self, _layer: usize, _expert_id: usize) -> Option<String> {
+        None
+    }
+
+    /// Expert FFN down-projection weight key.
+    fn expert_ffn_down_key(&self, _layer: usize, _expert_id: usize) -> Option<String> {
+        None
+    }
+
+    /// Shared expert FFN gate weight key.
+    fn shared_expert_gate_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Shared expert FFN up-projection weight key.
+    fn shared_expert_up_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Shared expert FFN down-projection weight key.
+    fn shared_expert_down_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    // ── MLA (Multi-head Latent Attention) ──
+
+    /// Whether this model uses MLA instead of standard GQA.
+    fn uses_mla(&self) -> bool {
+        false
+    }
+
+    /// MLA compressed KV dimension.
+    fn kv_lora_rank(&self) -> usize {
+        0
+    }
+
+    /// MLA Q compression rank.
+    fn q_lora_rank(&self) -> usize {
+        0
+    }
+
+    /// MLA KV down-projection key (compress).
+    fn mla_kv_a_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// MLA KV up-projection key (decompress).
+    fn mla_kv_b_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// MLA Q down-projection key (compress).
+    fn mla_q_a_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// MLA Q up-projection key (decompress).
+    fn mla_q_b_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    // ── RoPE scaling ──
+
+    /// RoPE scaling type (None, "linear", "yarn", "dynamic", "llama3").
+    fn rope_scaling_type(&self) -> Option<&str> {
+        self.config()
+            .rope_scaling
+            .as_ref()
+            .map(|s| s.scaling_type.as_str())
+    }
+
+    /// RoPE scaling factor.
+    fn rope_scaling_factor(&self) -> f64 {
+        self.config()
+            .rope_scaling
+            .as_ref()
+            .map_or(1.0, |s| s.factor)
     }
 }

@@ -3,6 +3,7 @@ pub mod csv;
 pub mod format;
 pub mod json;
 pub mod msgpack;
+pub mod packed;
 
 use std::path::Path;
 
@@ -24,6 +25,7 @@ pub fn load_with_format(path: impl AsRef<Path>, fmt: Format) -> Result<Graph, Gr
         Format::Json => json::load_json(path),
         #[cfg(feature = "msgpack")]
         Format::MessagePack => msgpack::load_msgpack(path),
+        Format::Packed => packed::load_packed(path),
     }
 }
 
@@ -46,6 +48,7 @@ pub fn save_with_format(
         Format::Json => json::save_json(graph, path),
         #[cfg(feature = "msgpack")]
         Format::MessagePack => msgpack::save_msgpack(graph, path),
+        Format::Packed => packed::save_packed(graph, path),
     }
 }
 
@@ -55,6 +58,7 @@ pub fn to_bytes(graph: &Graph, fmt: Format) -> Result<Vec<u8>, GraphError> {
         Format::Json => json::to_json_bytes(graph),
         #[cfg(feature = "msgpack")]
         Format::MessagePack => msgpack::to_msgpack_bytes(graph),
+        Format::Packed => packed::to_packed_bytes(graph),
     }
 }
 
@@ -64,5 +68,6 @@ pub fn from_bytes(bytes: &[u8], fmt: Format) -> Result<Graph, GraphError> {
         Format::Json => json::from_json_bytes(bytes),
         #[cfg(feature = "msgpack")]
         Format::MessagePack => msgpack::from_msgpack_bytes(bytes),
+        Format::Packed => packed::from_packed_bytes(bytes),
     }
 }
