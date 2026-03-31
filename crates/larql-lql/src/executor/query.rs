@@ -221,7 +221,7 @@ impl Session {
         _relations_only: bool,
         verbose: bool,
     ) -> Result<Vec<String>, LqlError> {
-        let (path, _config, index) = self.require_vindex()?;
+        let (path, config, index) = self.require_vindex()?;
 
         let (embed, embed_scale) = larql_vindex::load_vindex_embeddings(path)
             .map_err(|e| LqlError::Execution(format!("failed to load embeddings: {e}")))?;
@@ -251,21 +251,37 @@ impl Session {
             avg
         };
 
+        // Use layer_bands from config, or look up by family, or scan all layers
+        let last = config.num_layers.saturating_sub(1);
+        let bands = config.layer_bands.clone()
+            .or_else(|| larql_vindex::LayerBands::for_family(&config.family, config.num_layers))
+            .unwrap_or(larql_vindex::LayerBands {
+                syntax: (0, last),
+                knowledge: (0, last),
+                output: (0, last),
+            });
+
         let all_layers = index.loaded_layers();
 
-        // Apply band + layer filter
+        // Apply band + layer filter using config-driven boundaries
         let scan_layers: Vec<usize> = if let Some(l) = layer {
             vec![l as usize]
         } else {
             match band {
                 Some(crate::ast::LayerBand::Syntax) => {
-                    all_layers.iter().copied().filter(|l| *l <= 13).collect()
+                    all_layers.iter().copied()
+                        .filter(|l| *l >= bands.syntax.0 && *l <= bands.syntax.1)
+                        .collect()
                 }
                 Some(crate::ast::LayerBand::Knowledge) => {
-                    all_layers.iter().copied().filter(|l| *l >= 14 && *l <= 27).collect()
+                    all_layers.iter().copied()
+                        .filter(|l| *l >= bands.knowledge.0 && *l <= bands.knowledge.1)
+                        .collect()
                 }
                 Some(crate::ast::LayerBand::Output) => {
-                    all_layers.iter().copied().filter(|l| *l >= 28).collect()
+                    all_layers.iter().copied()
+                        .filter(|l| *l >= bands.output.0 && *l <= bands.output.1)
+                        .collect()
                 }
                 Some(crate::ast::LayerBand::All) | None => all_layers,
             }
@@ -405,12 +421,15 @@ impl Session {
 
         for edge in &formatted {
             let primary = edge.primary_layer;
-            if primary <= 13 {
+            if primary >= bands.syntax.0 && primary <= bands.syntax.1 {
                 syntax.push(edge);
-            } else if primary <= 27 {
+            } else if primary >= bands.knowledge.0 && primary <= bands.knowledge.1 {
                 knowledge.push(edge);
-            } else {
+            } else if primary >= bands.output.0 && primary <= bands.output.1 {
                 output_band.push(edge);
+            } else {
+                // Layer outside any band — put in knowledge as fallback
+                knowledge.push(edge);
             }
         }
 
@@ -476,19 +495,19 @@ impl Session {
         };
 
         if !syntax.is_empty() {
-            out.push("  Syntax (L0-13):".into());
+            out.push(format!("  Syntax (L{}-{}):", bands.syntax.0, bands.syntax.1));
             for edge in syntax.iter().take(max_edges) {
                 out.push(format_edge(edge));
             }
         }
         if !knowledge.is_empty() {
-            out.push("  Edges (L14-27):".into());
+            out.push(format!("  Edges (L{}-{}):", bands.knowledge.0, bands.knowledge.1));
             for edge in knowledge.iter().take(max_edges) {
                 out.push(format_edge(edge));
             }
         }
         if !output_band.is_empty() {
-            out.push("  Output (L28-33):".into());
+            out.push(format!("  Output (L{}-{}):", bands.output.0, bands.output.1));
             for edge in output_band.iter().take(if verbose { max_edges } else { 5 }) {
                 out.push(format_edge(edge));
             }

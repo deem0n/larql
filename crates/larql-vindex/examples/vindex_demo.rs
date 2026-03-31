@@ -1,6 +1,7 @@
-//! Vindex Demo — create, query, mutate, and save a vindex in memory.
+//! Vindex Demo — full v2 feature showcase.
 //!
-//! Demonstrates the core larql-vindex API without needing a real model.
+//! Demonstrates: build, KNN, walk, mutate, layer bands, MoE layout,
+//! binary down_meta, source provenance, checksum verification.
 //!
 //! Run: cargo run -p larql-vindex --example vindex_demo
 
@@ -9,186 +10,195 @@ use larql_vindex::{FeatureMeta, VectorIndex, VindexConfig};
 use ndarray::{Array1, Array2};
 
 fn main() {
-    println!("=== Vindex Demo ===\n");
+    println!("=== Vindex Demo (v2 — full feature showcase) ===\n");
 
-    // ── 1. Build an index in memory ──
+    // ── 1. Build ──
     section("Build in-memory index");
+    let index = build_demo_index();
+    println!("  {} layers, {} features, {} with metadata",
+        index.num_layers, index.total_gate_vectors(), index.total_down_meta());
 
-    let hidden = 4;
-    let num_features = 5;
-    let num_layers = 2;
-
-    // Create gate vectors: each feature responds to a different direction
-    let mut gate0 = Array2::<f32>::zeros((num_features, hidden));
-    gate0[[0, 0]] = 10.0; // "France" feature
-    gate0[[1, 1]] = 10.0; // "Germany" feature
-    gate0[[2, 2]] = 10.0; // "Japan" feature
-    gate0[[3, 0]] = 5.0;
-    gate0[[3, 1]] = 5.0;  // "European" feature (France + Germany)
-    // feature 4 is empty (free slot)
-
-    let gate1 = Array2::<f32>::zeros((num_features, hidden));
-
-    let gate_vectors = vec![Some(gate0), Some(gate1)];
-
-    // Create metadata: what each feature outputs
-    let meta0 = vec![
-        Some(meta("Paris", 100, 0.95, &["France", "french"])),
-        Some(meta("Berlin", 101, 0.92, &["Germany", "german"])),
-        Some(meta("Tokyo", 102, 0.88, &["Japan", "japanese"])),
-        Some(meta("European", 103, 0.70, &["Europe", "EU"])),
-        None, // free slot
+    // ── 2. Layer bands ──
+    section("Layer bands (per-family, exact boundaries)");
+    let families = [
+        ("gpt2", 12), ("gemma2", 26), ("llama", 32),
+        ("gemma3", 34), ("qwen2", 40), ("llama", 80),
+        ("mixtral", 32), ("unknown", 3),
     ];
-    let meta1 = vec![None; num_features];
-
-    let down_meta = vec![Some(meta0), Some(meta1)];
-
-    let index = VectorIndex::new(gate_vectors, down_meta, num_layers, hidden);
-
-    println!("  Created: {} layers, {} features/layer, {} hidden",
-        index.num_layers, num_features, hidden);
-    println!("  Total features: {}", index.total_gate_vectors());
-    println!("  With metadata:  {}", index.total_down_meta());
-    println!("  Loaded layers:  {:?}", index.loaded_layers());
-
-    // ── 2. Gate KNN ──
-    section("Gate KNN — find features for a query");
-
-    // Query "France" (dim 0)
-    let query = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
-    println!("  Query: [1, 0, 0, 0] (\"France\" direction)");
-    let hits = index.gate_knn(0, &query, 3);
-    for (feat, score) in &hits {
-        let label = index.feature_meta(0, *feat)
-            .map(|m| m.top_token.as_str())
-            .unwrap_or("(none)");
-        println!("    F{}: {} (score={:.1})", feat, label, score);
+    for &(family, layers) in &families {
+        match larql_vindex::LayerBands::for_family(family, layers) {
+            Some(b) => println!("  {:<8} {:>2}L  syntax={:>2}-{:<2}  knowledge={:>2}-{:<2}  output={:>2}-{:<2}",
+                family, layers, b.syntax.0, b.syntax.1, b.knowledge.0, b.knowledge.1, b.output.0, b.output.1),
+            None => println!("  {:<8} {:>2}L  (too few layers)", family, layers),
+        }
     }
 
-    // Query "European" (dim 0 + dim 1)
-    println!();
-    let query2 = Array1::from_vec(vec![0.7, 0.7, 0.0, 0.0]);
-    println!("  Query: [0.7, 0.7, 0, 0] (\"European\" direction)");
-    let hits2 = index.gate_knn(0, &query2, 3);
-    for (feat, score) in &hits2 {
-        let label = index.feature_meta(0, *feat)
-            .map(|m| m.top_token.as_str())
-            .unwrap_or("(none)");
-        println!("    F{}: {} (score={:.1})", feat, label, score);
+    // ── 3. Gate KNN ──
+    section("Gate KNN");
+    let q = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
+    println!("  Query [1,0,0,0]:");
+    for (feat, score) in index.gate_knn(0, &q, 3) {
+        let tok = index.feature_meta(0, feat).map(|m| m.top_token.as_str()).unwrap_or("-");
+        println!("    F{}: {} ({:.1})", feat, tok, score);
     }
 
-    // ── 3. Walk ──
-    section("Walk — multi-layer feature scan");
-
-    let query3 = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
-    let trace = index.walk(&query3, &[0, 1], 3);
+    // ── 4. Walk ──
+    section("Walk (multi-layer)");
+    let trace = index.walk(&q, &[0, 1], 2);
     for (layer, hits) in &trace.layers {
-        if hits.is_empty() {
-            println!("  L{}: (no hits)", layer);
-        }
-        for hit in hits {
-            println!("  L{}: F{} → {} (gate={:.1})",
-                layer, hit.feature, hit.meta.top_token, hit.gate_score);
-        }
+        if hits.is_empty() { println!("  L{}: (none)", layer); continue; }
+        for h in hits { println!("  L{}: F{} → {} ({:.1})", layer, h.feature, h.meta.top_token, h.gate_score); }
     }
 
-    // ── 4. Mutate ──
-    section("Mutate — insert an edge");
-
-    let mut index = index; // make mutable
-
-    // Find free slot
-    let free = index.find_free_feature(0);
-    println!("  Free slot at layer 0: {:?}", free);
-
-    if let Some(slot) = free {
-        // Set gate vector for "Australia"
-        let gate_vec = Array1::from_vec(vec![0.0, 0.0, 0.0, 10.0]);
-        index.set_gate_vector(0, slot, &gate_vec);
-        index.set_feature_meta(0, slot, meta("Canberra", 104, 0.85, &["Australia"]));
-        println!("  Inserted: F{} → Canberra (Australia direction)", slot);
+    // ── 5. MoE layout ──
+    section("MoE layout (2 experts × 3 features)");
+    let moe_index = build_moe_index();
+    println!("  Total features at L0: {} (2 experts × 3)", moe_index.num_features(0));
+    let q_dim0 = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
+    let q_dim3 = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
+    println!("  Query [1,0,0,0] (Expert 0 territory):");
+    for (f, s) in moe_index.gate_knn(0, &q_dim0, 2) {
+        let e = if f < 3 { 0 } else { 1 };
+        let tok = moe_index.feature_meta(0, f).map(|m| m.top_token.as_str()).unwrap_or("-");
+        println!("    E{}:F{} → {} ({:.1})", e, f % 3, tok, s);
+    }
+    println!("  Query [0,0,0,1] (Expert 1 territory):");
+    for (f, s) in moe_index.gate_knn(0, &q_dim3, 2) {
+        let e = if f < 3 { 0 } else { 1 };
+        let tok = moe_index.feature_meta(0, f).map(|m| m.top_token.as_str()).unwrap_or("-");
+        println!("    E{}:F{} → {} ({:.1})", e, f % 3, tok, s);
     }
 
-    // Verify it works
-    let query4 = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
-    let hits4 = index.gate_knn(0, &query4, 1);
-    let (feat, score) = hits4[0];
-    let label = index.feature_meta(0, feat).unwrap();
-    println!("  Query [0,0,0,1] → F{}: {} (score={:.1})", feat, label.top_token, score);
-
-    // ── 5. Delete ──
-    section("Delete — remove an edge");
-
-    println!("  Before: F2 = {:?}", index.feature_meta(0, 2).map(|m| &m.top_token));
+    // ── 6. Mutate ──
+    section("Mutate (insert + delete)");
+    let mut index = build_demo_index();
+    let slot = index.find_free_feature(0).unwrap();
+    index.set_gate_vector(0, slot, &Array1::from_vec(vec![0.0, 0.0, 0.0, 10.0]));
+    index.set_feature_meta(0, slot, meta("Canberra", 104, 0.85));
+    println!("  Inserted F{} → Canberra", slot);
     index.delete_feature_meta(0, 2);
-    println!("  After:  F2 = {:?}", index.feature_meta(0, 2).map(|m| &m.top_token));
-    println!("  Free slots: {:?}", index.find_free_feature(0));
+    println!("  Deleted F2 (was Tokyo)");
 
-    // ── 6. Save round-trip ──
-    section("Save + Load round-trip");
-
-    let dir = std::env::temp_dir().join("larql_vindex_demo");
+    // ── 7. Save with binary down_meta + checksums ──
+    section("Save (binary down_meta + checksums + verification)");
+    let dir = std::env::temp_dir().join("larql_vindex_demo_v2_full");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     let layer_infos = index.save_gate_vectors(&dir).unwrap();
-    let down_count = index.save_down_meta(&dir).unwrap();
+    let dm_count = index.save_down_meta(&dir).unwrap();
+
+    let bin_size = std::fs::metadata(dir.join("down_meta.bin")).unwrap().len();
+    let jsonl_size = std::fs::metadata(dir.join("down_meta.jsonl")).unwrap().len();
+    println!("  down_meta.bin:   {} bytes", bin_size);
+    println!("  down_meta.jsonl: {} bytes", jsonl_size);
+    println!("  Compression:     {:.0}% smaller", (1.0 - bin_size as f64 / jsonl_size as f64) * 100.0);
+    println!("  Features saved:  {}", dm_count);
 
     let config = VindexConfig {
-        version: 1,
-        model: "demo-model".into(),
+        version: 2,
+        model: "demo-model/v2".into(),
         family: "demo".into(),
-        num_layers,
-        hidden_size: hidden,
-        intermediate_size: num_features,
+        source: Some(larql_vindex::VindexSource {
+            huggingface_repo: Some("demo/demo-model".into()),
+            huggingface_revision: Some("main".into()),
+            safetensors_sha256: None,
+            extracted_at: "2026-04-01T12:00:00Z".into(),
+            larql_version: env!("CARGO_PKG_VERSION").into(),
+        }),
+        checksums: larql_vindex::checksums::compute_checksums(&dir).ok(),
+        num_layers: 2,
+        hidden_size: 4,
+        intermediate_size: 5,
         vocab_size: 200,
         embed_scale: 1.0,
+        extract_level: larql_vindex::ExtractLevel::Browse,
+        layer_bands: Some(larql_vindex::LayerBands {
+            syntax: (0, 0),
+            knowledge: (0, 1),
+            output: (1, 1),
+        }),
         layers: layer_infos,
-        down_top_k: 2,
+        down_top_k: 1,
         has_model_weights: false,
         model_config: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
-    println!("  Saved to: {}", dir.display());
-    println!("  Down meta records: {}", down_count);
+    // Verify checksums
+    if let Some(ref stored) = config.checksums {
+        let results = larql_vindex::checksums::verify_checksums(&dir, stored).unwrap();
+        println!("  Checksums:");
+        for (file, ok) in &results {
+            println!("    {}: {}", file, if *ok { "OK" } else { "MISMATCH" });
+        }
+    }
 
-    // Reload
+    // ── 8. Reload and verify ──
+    section("Reload and verify round-trip");
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let loaded = VectorIndex::load_vindex(&dir, &mut cb).unwrap();
-    println!("  Reloaded: {} layers, {} features", loaded.num_layers, loaded.total_gate_vectors());
+    let loaded_config = larql_vindex::load_vindex_config(&dir).unwrap();
 
-    // Verify
-    let hits5 = loaded.gate_knn(0, &Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]), 1);
-    let m = loaded.feature_meta(0, hits5[0].0).unwrap();
-    println!("  Query [1,0,0,0] → {} (round-trip verified)", m.top_token);
+    println!("  Version:       {}", loaded_config.version);
+    println!("  Extract level: {}", loaded_config.extract_level);
+    println!("  Features:      {}", loaded.total_gate_vectors());
+    println!("  With meta:     {}", loaded.total_down_meta());
+
+    if let Some(ref src) = loaded_config.source {
+        println!("  Source:        {}", src.huggingface_repo.as_deref().unwrap_or("?"));
+    }
+
+    let hits = loaded.gate_knn(0, &Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]), 1);
+    let m = loaded.feature_meta(0, hits[0].0).unwrap();
+    println!("  KNN [1,0,0,0]:  F{} → {} (round-trip OK)", hits[0].0, m.top_token);
 
     let _ = std::fs::remove_dir_all(&dir);
-
     println!("\n=== Done ===");
 }
 
-fn section(name: &str) {
-    println!("\n── {} ──\n", name);
-}
+fn section(name: &str) { println!("\n── {} ──\n", name); }
 
-fn meta(token: &str, id: u32, score: f32, also: &[&str]) -> FeatureMeta {
-    let mut top_k = vec![TopKEntry {
-        token: token.to_string(),
-        token_id: id,
-        logit: score,
-    }];
-    for (i, t) in also.iter().enumerate() {
-        top_k.push(TopKEntry {
-            token: t.to_string(),
-            token_id: id + 1000 + i as u32,
-            logit: score * 0.5,
-        });
-    }
+fn meta(token: &str, id: u32, score: f32) -> FeatureMeta {
     FeatureMeta {
-        top_token: token.to_string(),
+        top_token: token.into(),
         top_token_id: id,
         c_score: score,
-        top_k,
+        top_k: vec![TopKEntry { token: token.into(), token_id: id, logit: score }],
     }
+}
+
+fn build_demo_index() -> VectorIndex {
+    let h = 4;
+    let mut g0 = Array2::<f32>::zeros((5, h));
+    g0[[0, 0]] = 10.0;
+    g0[[1, 1]] = 10.0;
+    g0[[2, 2]] = 10.0;
+    g0[[3, 0]] = 5.0; g0[[3, 1]] = 5.0;
+    let g1 = Array2::<f32>::zeros((5, h));
+    let m0 = vec![
+        Some(meta("Paris", 100, 0.95)),
+        Some(meta("Berlin", 101, 0.92)),
+        Some(meta("Tokyo", 102, 0.88)),
+        Some(meta("European", 103, 0.70)),
+        None,
+    ];
+    let m1 = vec![None; 5];
+    VectorIndex::new(vec![Some(g0), Some(g1)], vec![Some(m0), Some(m1)], 2, h)
+}
+
+fn build_moe_index() -> VectorIndex {
+    let h = 4;
+    let mut g = Array2::<f32>::zeros((6, h));
+    g[[0, 0]] = 10.0; g[[1, 1]] = 10.0; g[[2, 2]] = 10.0; // Expert 0
+    g[[3, 3]] = 10.0; g[[4, 0]] = 5.0; g[[4, 3]] = 5.0; g[[5, 1]] = 3.0; // Expert 1
+    let m = vec![
+        Some(meta("Paris", 100, 0.95)),
+        Some(meta("Berlin", 101, 0.92)),
+        Some(meta("Tokyo", 102, 0.88)),
+        Some(meta("London", 103, 0.90)),
+        Some(meta("Rome", 104, 0.85)),
+        Some(meta("Madrid", 105, 0.80)),
+    ];
+    VectorIndex::new(vec![Some(g)], vec![Some(m)], 1, h)
 }

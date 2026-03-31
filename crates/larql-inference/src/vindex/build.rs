@@ -10,6 +10,27 @@ use crate::model::ModelWeights;
 
 use larql_models::TopKEntry;
 
+/// Simple ISO 8601 timestamp without chrono dependency.
+fn chrono_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    // Rough UTC timestamp — good enough for provenance
+    let days = secs / 86400;
+    let years_approx = 1970 + days / 365;
+    let remainder_days = days % 365;
+    let months = remainder_days / 30 + 1;
+    let day = remainder_days % 30 + 1;
+    let hour = (secs % 86400) / 3600;
+    let min = (secs % 3600) / 60;
+    let sec = secs % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        years_approx, months.min(12), day.min(31), hour, min, sec
+    )
+}
+
 /// Collected data for relation clustering.
 struct ClusterData {
     directions: Vec<f32>,
@@ -277,6 +298,7 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
         model_name: &str,
         output_dir: &Path,
         down_top_k: usize,
+        extract_level: larql_vindex::ExtractLevel,
         callbacks: &mut dyn IndexBuildCallbacks,
     ) -> Result<(), InferenceError> {
         std::fs::create_dir_all(output_dir)?;
@@ -288,37 +310,106 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
         let embed_scale = weights.arch.embed_scale();
 
         // ── 1. Write gate vectors (binary f32) ──
+        // For dense models: one gate matrix per layer (intermediate_size × hidden_size).
+        // For MoE models: concatenate all experts' gate matrices per layer
+        //   (num_experts × intermediate_size × hidden_size).
+        // Gate KNN then naturally selects features across all experts.
         callbacks.on_stage("gate_vectors");
         let gate_path = output_dir.join("gate_vectors.bin");
         let mut gate_file = BufWriter::new(std::fs::File::create(&gate_path)?);
         let mut layer_infos: Vec<VindexLayerInfo> = Vec::new();
         let mut offset: u64 = 0;
+        let is_moe = weights.arch.is_moe();
+        let n_experts = weights.arch.num_experts();
 
         for layer in 0..num_layers {
             callbacks.on_layer_start("gate", layer, num_layers);
             let start = std::time::Instant::now();
 
-            let gate_key = weights.arch.ffn_gate_key(layer);
-            let w_gate = match weights.tensors.get(&gate_key) {
-                Some(w) => w,
-                None => continue,
-            };
+            if is_moe && n_experts > 0 {
+                // MoE: write each expert's gate matrix contiguously
+                let mut total_features = 0usize;
+                let mut layer_bytes = 0u64;
+                let mut features_per_expert = 0usize;
 
-            let num_features = w_gate.shape()[0];
-            let data = w_gate.as_slice().unwrap();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
-            gate_file.write_all(bytes)?;
+                for expert in 0..n_experts {
+                    let gate_key = match weights.arch.expert_ffn_gate_key(layer, expert) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    let w_gate = match weights.tensors.get(&gate_key) {
+                        Some(w) => w,
+                        None => continue,
+                    };
+                    features_per_expert = w_gate.shape()[0];
+                    total_features += features_per_expert;
+                    let data = w_gate.as_slice().unwrap();
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            data.as_ptr() as *const u8,
+                            data.len() * 4,
+                        )
+                    };
+                    gate_file.write_all(bytes)?;
+                    layer_bytes += bytes.len() as u64;
+                }
 
-            let length = bytes.len() as u64;
-            layer_infos.push(VindexLayerInfo {
-                layer,
-                num_features,
-                offset,
-                length,
-            });
-            offset += length;
+                // Also include shared expert if present
+                if let Some(shared_key) = weights.arch.shared_expert_gate_key(layer) {
+                    if let Some(w_gate) = weights.tensors.get(&shared_key) {
+                        let n = w_gate.shape()[0];
+                        total_features += n;
+                        let data = w_gate.as_slice().unwrap();
+                        let bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                data.as_ptr() as *const u8,
+                                data.len() * 4,
+                            )
+                        };
+                        gate_file.write_all(bytes)?;
+                        layer_bytes += bytes.len() as u64;
+                    }
+                }
+
+                if total_features > 0 {
+                    layer_infos.push(VindexLayerInfo {
+                        layer,
+                        num_features: total_features,
+                        offset,
+                        length: layer_bytes,
+                        num_experts: Some(n_experts),
+                        num_features_per_expert: Some(features_per_expert),
+                    });
+                    offset += layer_bytes;
+                }
+            } else {
+                // Dense: single gate matrix per layer
+                let gate_key = weights.arch.ffn_gate_key(layer);
+                let w_gate = match weights.tensors.get(&gate_key) {
+                    Some(w) => w,
+                    None => continue,
+                };
+                let num_features = w_gate.shape()[0];
+                let data = w_gate.as_slice().unwrap();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        data.as_ptr() as *const u8,
+                        data.len() * 4,
+                    )
+                };
+                gate_file.write_all(bytes)?;
+
+                let length = bytes.len() as u64;
+                layer_infos.push(VindexLayerInfo {
+                    layer,
+                    num_features,
+                    offset,
+                    length,
+                    num_experts: None,
+                    num_features_per_expert: None,
+                });
+                offset += length;
+            }
 
             callbacks.on_layer_done("gate", layer, start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -356,19 +447,46 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
             callbacks.on_layer_start("down", layer, num_layers);
             let start = std::time::Instant::now();
 
-            let down_key = weights.arch.ffn_down_key(layer);
-            let w_down = match weights.tensors.get(&down_key) {
-                Some(w) => w,
-                None => continue,
+            // Collect all down matrices for this layer (dense: 1, MoE: num_experts)
+            let down_matrices: Vec<(&Array2<f32>, usize)> = if is_moe && n_experts > 0 {
+                let mut mats = Vec::new();
+                for expert in 0..n_experts {
+                    if let Some(key) = weights.arch.expert_ffn_down_key(layer, expert) {
+                        if let Some(w) = weights.tensors.get(&key) {
+                            mats.push((w, expert));
+                        }
+                    }
+                }
+                // Include shared expert if present
+                if let Some(key) = weights.arch.shared_expert_down_key(layer) {
+                    if let Some(w) = weights.tensors.get(&key) {
+                        mats.push((w, n_experts)); // shared expert gets ID = n_experts
+                    }
+                }
+                mats
+            } else {
+                let down_key = weights.arch.ffn_down_key(layer);
+                match weights.tensors.get(&down_key) {
+                    Some(w) => vec![(w, 0)],
+                    None => { callbacks.on_layer_done("down", layer, 0.0); continue; }
+                }
             };
 
-            // w_down is (hidden_size, intermediate_size)
-            let num_features = w_down.shape()[1];
+            if down_matrices.is_empty() {
+                callbacks.on_layer_done("down", layer, 0.0);
+                continue;
+            }
+
+            // Total features across all experts (for progress reporting)
+            let total_features_this_layer: usize = down_matrices.iter()
+                .map(|(w, _)| w.shape()[1])
+                .sum();
             let is_knowledge_layer = layer >= cluster_layer_min && layer < cluster_layer_max;
 
-            // For knowledge layers: find each feature's gate input token via
-            // For knowledge layers: find what entity each gate responds to.
-            let gate_top_tokens: Vec<String> = if is_knowledge_layer {
+            // For dense models: compute gate top tokens for clustering
+            // (For MoE, skip clustering for now — too many features)
+            let gate_top_tokens: Vec<String> = if is_knowledge_layer && !is_moe {
+                let num_features = down_matrices[0].0.shape()[1];
                 compute_gate_top_tokens(
                     weights, tokenizer, layer, num_features,
                     &ww_ids_shared, &ww_embed_shared,
@@ -377,12 +495,17 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
                 vec![]
             };
 
-            // Batch features: embed @ w_down_chunk → (vocab, chunk_size)
-            let batch_size = 1024;
+            // Process each expert's down matrix (dense: just one)
+            let mut feature_offset = 0usize;
+            for (w_down, _expert_id) in &down_matrices {
+                let num_features = w_down.shape()[1];
+                let batch_size = 1024;
 
             for batch_start in (0..num_features).step_by(batch_size) {
                 let batch_end = (batch_start + batch_size).min(num_features);
-                callbacks.on_feature_progress("down", layer, batch_start, num_features);
+                callbacks.on_feature_progress(
+                    "down", layer, feature_offset + batch_start, total_features_this_layer,
+                );
 
                 // Extract columns [batch_start..batch_end] from w_down
                 let w_chunk = w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
@@ -446,7 +569,7 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
 
                 let record = DownMetaRecord {
                     layer,
-                    feature: feat,
+                    feature: feature_offset + feat,
                     top_token,
                     top_token_id,
                     c_score,
@@ -465,6 +588,9 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
                 down_file.write_all(b"\n")?;
             }
             } // end batch
+
+                feature_offset += num_features;
+            } // end expert loop
 
             callbacks.on_layer_done("down", layer, start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -496,10 +622,11 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
         callbacks.on_stage_done("tokenizer", 0.0);
 
         // ── 5. Write index.json ──
-        let config = VindexConfig {
-            version: 1,
+        let family = weights.arch.family().to_string();
+        let mut config = VindexConfig {
+            version: 2,
             model: model_name.to_string(),
-            family: weights.arch.family().to_string(),
+            family: family.clone(),
             num_layers,
             hidden_size,
             intermediate_size,
@@ -508,6 +635,10 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
             layers: layer_infos,
             down_top_k,
             has_model_weights: false,
+            source: None,
+            checksums: None,
+            extract_level,
+            layer_bands: larql_vindex::LayerBands::for_family(&family, num_layers),
             model_config: Some(VindexModelConfig {
                 model_type: weights.arch.config().model_type.clone(),
                 head_dim: weights.head_dim,
@@ -515,8 +646,37 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
                 num_kv_heads: weights.num_kv_heads,
                 rope_base: weights.rope_base,
                 sliding_window: weights.arch.config().sliding_window,
+                moe: if is_moe {
+                    Some(larql_vindex::MoeConfig {
+                        num_experts: n_experts,
+                        top_k: weights.arch.num_experts_per_token(),
+                        shared_expert: weights.arch.num_shared_experts() > 0,
+                        router_type: "top_k_softmax".to_string(),
+                    })
+                } else {
+                    None
+                },
             }),
         };
+
+        // Write model weights if extract level requires them
+        if extract_level != larql_vindex::ExtractLevel::Browse {
+            callbacks.on_stage("model_weights");
+            let start = std::time::Instant::now();
+            super::weights::write_model_weights(weights, output_dir, callbacks)?;
+            config.has_model_weights = true;
+            callbacks.on_stage_done("model_weights", start.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // Add provenance and checksums
+        config.source = Some(larql_vindex::VindexSource {
+            huggingface_repo: Some(model_name.to_string()),
+            huggingface_revision: None,
+            safetensors_sha256: None,
+            extracted_at: chrono_now(),
+            larql_version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+        config.checksums = larql_vindex::checksums::compute_checksums(output_dir).ok();
 
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| InferenceError::Parse(e.to_string()))?;
@@ -552,6 +712,8 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
                 num_features: intermediate_size,
                 offset: layer as u64 * bytes_per_layer,
                 length: bytes_per_layer,
+                num_experts: None,
+                num_features_per_expert: None,
             });
         }
         eprintln!("  Reconstructed {} layer infos from gate_vectors.bin ({:.1} GB)",
@@ -664,10 +826,11 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
 
         // index.json
         let down_top_k = 10; // default
-        let config = VindexConfig {
-            version: 1,
+        let family = weights.arch.family().to_string();
+        let mut config = VindexConfig {
+            version: 2,
             model: model_name.to_string(),
-            family: weights.arch.family().to_string(),
+            family: family.clone(),
             num_layers,
             hidden_size,
             intermediate_size,
@@ -676,6 +839,16 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
             layers: layer_infos,
             down_top_k,
             has_model_weights: output_dir.join("model_weights.bin").exists(),
+            source: Some(larql_vindex::VindexSource {
+                huggingface_repo: Some(model_name.to_string()),
+                huggingface_revision: None,
+                safetensors_sha256: None,
+                extracted_at: chrono_now(),
+                larql_version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
+            checksums: None,
+            extract_level: larql_vindex::ExtractLevel::Browse,
+            layer_bands: larql_vindex::LayerBands::for_family(&family, num_layers),
             model_config: Some(VindexModelConfig {
                 model_type: weights.arch.config().model_type.clone(),
                 head_dim: weights.head_dim,
@@ -683,8 +856,12 @@ impl IndexBuildCallbacks for SilentBuildCallbacks {}
                 num_kv_heads: weights.num_kv_heads,
                 rope_base: weights.rope_base,
                 sliding_window: weights.arch.config().sliding_window,
+                moe: None,
             }),
         };
+
+        config.checksums = larql_vindex::checksums::compute_checksums(output_dir).ok();
+
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| InferenceError::Parse(e.to_string()))?;
         std::fs::write(output_dir.join("index.json"), config_json)?;

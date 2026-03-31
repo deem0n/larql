@@ -258,6 +258,13 @@ impl Session {
         std::fs::create_dir_all(&output_dir)
             .map_err(|e| LqlError::Execution(format!("failed to create output dir: {e}")))?;
 
+        // Map AST ExtractLevel to vindex ExtractLevel
+        let vindex_level = match _extract_level {
+            ExtractLevel::Browse => larql_vindex::ExtractLevel::Browse,
+            ExtractLevel::Inference => larql_vindex::ExtractLevel::Inference,
+            ExtractLevel::All => larql_vindex::ExtractLevel::All,
+        };
+
         let mut callbacks = LqlBuildCallbacks::new();
         larql_inference::vindex::build_vindex(
             inference_model.weights(),
@@ -265,6 +272,7 @@ impl Session {
             model,
             &output_dir,
             10,
+            vindex_level,
             &mut callbacks,
         )
         .map_err(|e| LqlError::Execution(format!("extraction failed: {e}")))?;

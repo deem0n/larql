@@ -166,12 +166,18 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             } else {
                 eprintln!("  Resume: missing core files — full rebuild");
+                let level = if args.include_weights {
+                    larql_vindex::ExtractLevel::All
+                } else {
+                    larql_vindex::ExtractLevel::Browse
+                };
                 larql_inference::vindex::build_vindex(
                     model.weights(),
                     model.tokenizer(),
                     model_name,
                     output,
                     args.down_top_k,
+                    level,
                     &mut callbacks,
                 )?;
             }
@@ -182,12 +188,18 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  Resuming: model_weights.bin exists — skipping");
             }
         } else {
+            let level = if args.include_weights {
+                larql_vindex::ExtractLevel::All
+            } else {
+                larql_vindex::ExtractLevel::Browse
+            };
             larql_inference::vindex::build_vindex(
                 model.weights(),
                 model.tokenizer(),
                 model_name,
                 output,
                 args.down_top_k,
+                level,
                 &mut callbacks,
             )?;
 

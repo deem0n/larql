@@ -105,12 +105,25 @@ impl VectorIndex {
         results
     }
 
-    /// Write down_meta.jsonl back to disk. Overwrites the existing file.
+    /// Write down_meta to disk in both binary and JSONL formats.
+    /// Binary (down_meta.bin) is the primary format for fast loading.
+    /// JSONL (down_meta.jsonl) is kept for backward compat and human readability.
     pub fn save_down_meta(&self, dir: &Path) -> Result<usize, VindexError> {
+        // Determine max top_k across all features
+        let max_top_k = self.down_meta.iter()
+            .filter_map(|l| l.as_ref())
+            .flat_map(|metas| metas.iter().filter_map(|m| m.as_ref()))
+            .map(|m| m.top_k.len())
+            .max()
+            .unwrap_or(10);
+
+        // Write binary format
+        let count = crate::down_meta::write_binary(dir, &self.down_meta, max_top_k)?;
+
+        // Also write JSONL for backward compat
         let path = dir.join("down_meta.jsonl");
         let file = std::fs::File::create(&path)?;
         let mut writer = BufWriter::new(file);
-        let mut count = 0;
 
         for (layer, layer_meta) in self.down_meta.iter().enumerate() {
             if let Some(ref metas) = layer_meta {
@@ -135,13 +148,12 @@ impl VectorIndex {
                         serde_json::to_writer(&mut writer, &record)
                             .map_err(|e| VindexError::Parse(e.to_string()))?;
                         writer.write_all(b"\n")?;
-                        count += 1;
                     }
                 }
             }
         }
-
         writer.flush()?;
+
         Ok(count)
     }
 
@@ -175,6 +187,8 @@ impl VectorIndex {
                     num_features: matrix.shape()[0],
                     offset,
                     length,
+                    num_experts: None,
+                    num_features_per_expert: None,
                 });
                 offset += length;
             }

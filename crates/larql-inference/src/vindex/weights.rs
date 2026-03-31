@@ -1,4 +1,12 @@
 //! Model weights serialization to/from .vindex directories.
+//!
+//! Split format (v2): separate files per component, no duplication.
+//!   attn_weights.bin  — Q, K, V, O per layer
+//!   ffn_weights.bin   — up + down per layer (gate is in gate_vectors.bin)
+//!   norms.bin         — all LayerNorm vectors
+//!   lm_head.bin       — output projection
+//!
+//! Legacy format (v1): single model_weights.bin with weight_manifest.json.
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
@@ -14,11 +22,21 @@ use super::build::IndexBuildCallbacks;
 use larql_vindex::config::{VindexConfig, VindexModelConfig};
 use larql_vindex::{IndexLoadCallbacks, load_vindex_config};
 
-/// Write all model weights (attention + FFN + norms) to a vindex directory.
+#[derive(Serialize, Deserialize)]
+struct WeightEntry {
+    key: String,
+    kind: String,
+    shape: Vec<usize>,
+    offset: u64,
+    length: u64,
+    #[serde(default)]
+    file: String,
+}
+
+/// Write model weights to split component files (v2 format).
 ///
-/// Creates `model_weights.bin` containing all 2D tensors and 1D vectors
-/// serialized contiguously, with a `weight_manifest.json` mapping keys to offsets.
-/// Updates `index.json` to mark the vindex as inference-capable.
+/// Creates separate files for attention, FFN (up+down only), norms, and lm_head.
+/// Gate weights are NOT written — they're already in gate_vectors.bin.
 pub fn write_model_weights(
     weights: &ModelWeights,
     dir: &Path,
@@ -27,103 +45,155 @@ pub fn write_model_weights(
     callbacks.on_stage("model_weights");
     let start = std::time::Instant::now();
 
-    let bin_path = dir.join("model_weights.bin");
-    let mut bin_file = BufWriter::new(std::fs::File::create(&bin_path)?);
-
-    #[derive(Serialize)]
-    struct WeightEntry {
-        key: String,
-        kind: String, // "tensor" (2D) or "vector" (1D)
-        shape: Vec<usize>,
-        offset: u64,
-        length: u64,
-    }
-
-    let mut entries: Vec<WeightEntry> = Vec::new();
-    let mut offset: u64 = 0;
-
-    // Write 2D tensors (attention Q/K/V/O, FFN up/down — gate already in gate_vectors.bin)
     let arch = &*weights.arch;
     let num_layers = weights.num_layers;
+    let mut entries: Vec<WeightEntry> = Vec::new();
+
+    // ── Attention weights ──
+    let attn_path = dir.join("attn_weights.bin");
+    let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
+    let mut attn_offset: u64 = 0;
 
     for layer in 0..num_layers {
-        callbacks.on_layer_start("weights", layer, num_layers);
-
-        // Attention weights
-        for (suffix, key_fn) in &[
-            ("q", arch.attn_q_key(layer)),
-            ("k", arch.attn_k_key(layer)),
-            ("v", arch.attn_v_key(layer)),
-            ("o", arch.attn_o_key(layer)),
-        ] {
-            if let Some(tensor) = weights.tensors.get(key_fn) {
-                let data = tensor.as_slice().unwrap();
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-                };
-                bin_file.write_all(bytes)?;
-                entries.push(WeightEntry {
-                    key: key_fn.clone(),
-                    kind: "tensor".into(),
-                    shape: vec![tensor.shape()[0], tensor.shape()[1]],
-                    offset,
-                    length: bytes.len() as u64,
-                });
-                offset += bytes.len() as u64;
-            }
-            let _ = suffix;
-        }
-
-        // FFN up and down (gate is in gate_vectors.bin, but we need it here too for WalkFfn)
+        callbacks.on_layer_start("attn_weights", layer, num_layers);
         for key in &[
-            arch.ffn_gate_key(layer),
-            arch.ffn_up_key(layer),
-            arch.ffn_down_key(layer),
+            arch.attn_q_key(layer),
+            arch.attn_k_key(layer),
+            arch.attn_v_key(layer),
+            arch.attn_o_key(layer),
         ] {
             if let Some(tensor) = weights.tensors.get(key) {
-                let data = tensor.as_slice().unwrap();
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-                };
-                bin_file.write_all(bytes)?;
+                let len = write_tensor(&mut attn_file, tensor)?;
                 entries.push(WeightEntry {
                     key: key.clone(),
                     kind: "tensor".into(),
                     shape: vec![tensor.shape()[0], tensor.shape()[1]],
-                    offset,
-                    length: bytes.len() as u64,
+                    offset: attn_offset,
+                    length: len,
+                    file: "attn_weights.bin".into(),
                 });
-                offset += bytes.len() as u64;
+                attn_offset += len;
+            }
+        }
+        callbacks.on_layer_done("attn_weights", layer, 0.0);
+    }
+    attn_file.flush()?;
+
+    // ── FFN weights (up + down only — gate is in gate_vectors.bin) ──
+    let ffn_path = dir.join("ffn_weights.bin");
+    let mut ffn_file = BufWriter::new(std::fs::File::create(&ffn_path)?);
+    let mut ffn_offset: u64 = 0;
+
+    for layer in 0..num_layers {
+        callbacks.on_layer_start("ffn_weights", layer, num_layers);
+
+        if arch.is_moe() {
+            // MoE: write per-expert up + down
+            for expert in 0..arch.num_experts() {
+                for key_opt in &[
+                    arch.expert_ffn_up_key(layer, expert),
+                    arch.expert_ffn_down_key(layer, expert),
+                ] {
+                    if let Some(key) = key_opt {
+                        if let Some(tensor) = weights.tensors.get(key) {
+                            let len = write_tensor(&mut ffn_file, tensor)?;
+                            entries.push(WeightEntry {
+                                key: key.clone(),
+                                kind: "tensor".into(),
+                                shape: vec![tensor.shape()[0], tensor.shape()[1]],
+                                offset: ffn_offset,
+                                length: len,
+                                file: "ffn_weights.bin".into(),
+                            });
+                            ffn_offset += len;
+                        }
+                    }
+                }
+            }
+            // MoE router weights
+            if let Some(key) = arch.moe_router_key(layer) {
+                if let Some(tensor) = weights.tensors.get(&key) {
+                    let len = write_tensor(&mut ffn_file, tensor)?;
+                    entries.push(WeightEntry {
+                        key,
+                        kind: "tensor".into(),
+                        shape: vec![tensor.shape()[0], tensor.shape()[1]],
+                        offset: ffn_offset,
+                        length: len,
+                        file: "ffn_weights.bin".into(),
+                    });
+                    ffn_offset += len;
+                }
+            }
+        } else {
+            // Dense: up + down only (gate already in gate_vectors.bin)
+            for key in &[
+                arch.ffn_up_key(layer),
+                arch.ffn_down_key(layer),
+            ] {
+                if let Some(tensor) = weights.tensors.get(key) {
+                    let len = write_tensor(&mut ffn_file, tensor)?;
+                    entries.push(WeightEntry {
+                        key: key.clone(),
+                        kind: "tensor".into(),
+                        shape: vec![tensor.shape()[0], tensor.shape()[1]],
+                        offset: ffn_offset,
+                        length: len,
+                        file: "ffn_weights.bin".into(),
+                    });
+                    ffn_offset += len;
+                }
             }
         }
 
-        callbacks.on_layer_done("weights", layer, 0.0);
+        callbacks.on_layer_done("ffn_weights", layer, 0.0);
     }
+    ffn_file.flush()?;
 
-    // Write 1D vectors (all norms)
+    // ── Norms ──
+    let norms_path = dir.join("norms.bin");
+    let mut norms_file = BufWriter::new(std::fs::File::create(&norms_path)?);
+    let mut norms_offset: u64 = 0;
+
     for (key, vec) in &weights.vectors {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(vec.as_ptr() as *const u8, vec.len() * 4)
         };
-        bin_file.write_all(bytes)?;
+        norms_file.write_all(bytes)?;
         entries.push(WeightEntry {
             key: key.clone(),
             kind: "vector".into(),
             shape: vec![vec.len()],
-            offset,
+            offset: norms_offset,
             length: bytes.len() as u64,
+            file: "norms.bin".into(),
         });
-        offset += bytes.len() as u64;
+        norms_offset += bytes.len() as u64;
     }
+    norms_file.flush()?;
 
-    bin_file.flush()?;
+    // ── LM Head ──
+    let lm_head_path = dir.join("lm_head.bin");
+    let lm_data = weights.lm_head.as_slice().unwrap();
+    let lm_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(lm_data.as_ptr() as *const u8, lm_data.len() * 4)
+    };
+    std::fs::write(&lm_head_path, lm_bytes)?;
+    entries.push(WeightEntry {
+        key: "lm_head.weight".into(),
+        kind: "tensor".into(),
+        shape: vec![weights.lm_head.shape()[0], weights.lm_head.shape()[1]],
+        offset: 0,
+        length: lm_bytes.len() as u64,
+        file: "lm_head.bin".into(),
+    });
 
-    // Write manifest
+    // ── Manifest ──
     let manifest_json = serde_json::to_string_pretty(&entries)
         .map_err(|e| InferenceError::Parse(e.to_string()))?;
     std::fs::write(dir.join("weight_manifest.json"), manifest_json)?;
 
-    // Update index.json
+    // ── Update index.json ──
     let config_path = dir.join("index.json");
     let config_text = std::fs::read_to_string(&config_path)?;
     let mut config: VindexConfig = serde_json::from_str(&config_text)
@@ -137,6 +207,16 @@ pub fn write_model_weights(
         num_kv_heads: weights.num_kv_heads,
         rope_base: weights.rope_base,
         sliding_window: weights.arch.config().sliding_window,
+        moe: if weights.arch.is_moe() {
+            Some(larql_vindex::MoeConfig {
+                num_experts: weights.arch.num_experts(),
+                top_k: weights.arch.num_experts_per_token(),
+                shared_expert: weights.arch.num_shared_experts() > 0,
+                router_type: "top_k_softmax".into(),
+            })
+        } else {
+            None
+        },
     });
 
     let config_json = serde_json::to_string_pretty(&config)
@@ -147,11 +227,18 @@ pub fn write_model_weights(
     Ok(())
 }
 
+fn write_tensor(w: &mut BufWriter<std::fs::File>, tensor: &Array2<f32>) -> Result<u64, InferenceError> {
+    let data = tensor.as_slice().unwrap();
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    };
+    w.write_all(bytes)?;
+    Ok(bytes.len() as u64)
+}
+
 /// Load a full ModelWeights from a vindex directory.
 ///
-/// Reads model_weights.bin + embeddings.bin + weight_manifest.json,
-/// reconstructs the architecture from index.json config.
-/// Returns a ModelWeights that can be used with the existing forward pass.
+/// Tries split files (v2) first, falls back to model_weights.bin (v1).
 pub fn load_model_weights_from_vindex(
     dir: &Path,
     callbacks: &mut dyn IndexLoadCallbacks,
@@ -168,34 +255,7 @@ pub fn load_model_weights_from_vindex(
         InferenceError::Parse("vindex missing model_config in index.json".into())
     })?;
 
-    // Reconstruct architecture
-    let _arch_config = larql_models::ModelConfig {
-        model_type: model_cfg.model_type.clone(),
-        num_layers: config.num_layers,
-        hidden_size: config.hidden_size,
-        intermediate_size: config.intermediate_size,
-        head_dim: model_cfg.head_dim,
-        num_q_heads: model_cfg.num_q_heads,
-        num_kv_heads: model_cfg.num_kv_heads,
-        vocab_size: Some(config.vocab_size),
-        rope_base: model_cfg.rope_base,
-        sliding_window: model_cfg.sliding_window,
-        num_experts: None,
-        num_experts_per_token: None,
-        num_shared_experts: None,
-        kv_lora_rank: None,
-        q_lora_rank: None,
-        rope_scaling: None,
-        rope_local_base: None,
-        embedding_multiplier: None,
-        residual_multiplier: None,
-        attention_multiplier: None,
-        logits_scaling: None,
-        attn_logit_softcapping: None,
-        final_logit_softcapping: None,
-        query_pre_attn_scalar: None,
-    };
-
+    // Reconstruct architecture from config
     let arch_json = serde_json::json!({
         "model_type": model_cfg.model_type,
         "hidden_size": config.hidden_size,
@@ -225,58 +285,105 @@ pub fn load_model_weights_from_vindex(
     callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
 
     // Load weight manifest
-    callbacks.on_file_start("model_weights", &dir.join("model_weights.bin").display().to_string());
-    let manifest_text = std::fs::read_to_string(dir.join("weight_manifest.json"))?;
-
-    #[derive(Deserialize)]
-    struct WeightEntry {
-        key: String,
-        kind: String,
-        shape: Vec<usize>,
-        offset: u64,
-        length: u64,
+    let manifest_path = dir.join("weight_manifest.json");
+    if !manifest_path.exists() {
+        return Err(InferenceError::Parse(
+            "weight_manifest.json not found".into(),
+        ));
     }
 
+    callbacks.on_file_start("model_weights", "weight_manifest.json");
+    let manifest_text = std::fs::read_to_string(&manifest_path)?;
     let entries: Vec<WeightEntry> = serde_json::from_str(&manifest_text)
         .map_err(|e| InferenceError::Parse(e.to_string()))?;
 
-    // Read binary weight data
-    let bin_data = std::fs::read(dir.join("model_weights.bin"))?;
-    let all_floats: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            bin_data.as_ptr() as *const f32,
-            bin_data.len() / 4,
-        )
-    };
+    // Cache loaded file data to avoid re-reading
+    let mut file_cache: HashMap<String, Vec<u8>> = HashMap::new();
 
     let mut tensors: HashMap<String, Array2<f32>> = HashMap::new();
     let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut lm_head_loaded: Option<Array2<f32>> = None;
 
     for entry in &entries {
+        // Determine which file to read from
+        let filename = if entry.file.is_empty() {
+            "model_weights.bin".to_string() // legacy v1 format
+        } else {
+            entry.file.clone()
+        };
+
+        let data = file_cache.entry(filename.clone()).or_insert_with(|| {
+            std::fs::read(dir.join(&filename)).unwrap_or_default()
+        });
+
+        if data.is_empty() {
+            continue;
+        }
+
+        let all_floats: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const f32,
+                data.len() / 4,
+            )
+        };
+
         let float_offset = entry.offset as usize / 4;
         let float_count = entry.length as usize / 4;
-        let data = &all_floats[float_offset..float_offset + float_count];
+        if float_offset + float_count > all_floats.len() {
+            continue;
+        }
+        let slice = &all_floats[float_offset..float_offset + float_count];
 
         match entry.kind.as_str() {
             "tensor" => {
                 let arr = Array2::from_shape_vec(
                     (entry.shape[0], entry.shape[1]),
-                    data.to_vec(),
+                    slice.to_vec(),
                 )
                 .map_err(|e| InferenceError::Parse(e.to_string()))?;
-                tensors.insert(entry.key.clone(), arr);
+
+                if entry.key == "lm_head.weight" {
+                    lm_head_loaded = Some(arr);
+                } else {
+                    tensors.insert(entry.key.clone(), arr);
+                }
             }
             "vector" => {
-                vectors.insert(entry.key.clone(), data.to_vec());
+                vectors.insert(entry.key.clone(), slice.to_vec());
             }
             _ => {}
+        }
+    }
+
+    // Gate vectors: read from gate_vectors.bin and inject into tensors
+    // (the forward pass needs them as tensors, but they're stored in the query index)
+    let gate_bytes = std::fs::read(dir.join("gate_vectors.bin"))?;
+    let gate_floats: &[f32] = unsafe {
+        std::slice::from_raw_parts(
+            gate_bytes.as_ptr() as *const f32,
+            gate_bytes.len() / 4,
+        )
+    };
+    for info in &config.layers {
+        let float_offset = info.offset as usize / 4;
+        let float_count = info.num_features * config.hidden_size;
+        if float_offset + float_count <= gate_floats.len() {
+            let gate_data = &gate_floats[float_offset..float_offset + float_count];
+            let gate_matrix = Array2::from_shape_vec(
+                (info.num_features, config.hidden_size),
+                gate_data.to_vec(),
+            )
+            .map_err(|e| InferenceError::Parse(e.to_string()))?;
+            let gate_key = arch.ffn_gate_key(info.layer);
+            tensors.insert(gate_key, gate_matrix);
         }
     }
 
     callbacks.on_file_done("model_weights", entries.len(), 0.0);
 
     let cfg = arch.config();
-    let lm_head = embed.clone();
+    let lm_head = lm_head_loaded.unwrap_or_else(|| embed.clone());
+
     Ok(ModelWeights {
         tensors,
         vectors,

@@ -124,7 +124,12 @@ def build_match_index(triples: dict) -> dict[tuple[str, str], str]:
 
 
 def load_vindex_gates_and_meta(vindex_dir):
-    """Load gate vectors and down_meta from vindex."""
+    """Load gate vectors and down_meta from vindex.
+
+    down_meta stores ALL top-K output tokens per feature (not just top-1).
+    Format per entry: {l, f, t, i, c, k: [{t, i, s}, ...]}
+    Returns down_meta as {(layer, feature): [token_str, ...]} with all top-K.
+    """
     vindex_dir = Path(vindex_dir)
 
     with open(vindex_dir / "index.json") as f:
@@ -146,7 +151,18 @@ def load_vindex_gates_and_meta(vindex_dir):
             if not line:
                 continue
             obj = json.loads(line)
-            down_meta[(obj.get("l", 0), obj.get("f", 0))] = obj.get("t", "")
+            key = (obj.get("l", 0), obj.get("f", 0))
+            # Collect all top-K tokens for this feature
+            tokens = []
+            top_token = obj.get("t", "")
+            if top_token:
+                tokens.append(top_token)
+            # Add remaining top-K entries (field "k" in new vindex format)
+            for entry in obj.get("k", []):
+                tok = entry.get("t", "")
+                if tok and tok != top_token:
+                    tokens.append(tok)
+            down_meta[key] = tokens
 
     return config, gates, down_meta
 
@@ -327,25 +343,36 @@ def main() -> None:
     model_id = args.model
     model_slug = _model_slug(model_id)
 
-    # Resolve vindex path
+    # Load vindex if available (optional — enables gate matching)
     vindex_path = args.vindex
-    if vindex_path is None:
-        vindex_path = str(_REPO_ROOT / "output" / f"{model_slug}.vindex")
+    gates = {}
+    down_meta = {}
+    knowledge_layers = []
+    has_vindex = False
 
-    print("Loading vindex gates and metadata...")
-    config, gates, down_meta = load_vindex_gates_and_meta(vindex_path)
-    hidden_size = config["hidden_size"]
-    num_layers = config["num_layers"]
-    # Knowledge layers: middle ~40% of the model (where factual knowledge lives)
-    # Gemma 34L: L14-27, Llama 32L: L13-25, Mistral 32L: L13-25
-    knowledge_start = num_layers * 2 // 5
-    knowledge_end = num_layers * 4 // 5
-    knowledge_layers = range(knowledge_start, knowledge_end)
-    print(
-        f"  {num_layers} layers, {hidden_size} hidden,"
-        f" {len(down_meta)} features,"
-        f" knowledge L{knowledge_start}-L{knowledge_end - 1}"
-    )
+    if vindex_path is None:
+        # Try default path
+        default_vindex = _REPO_ROOT / "output" / f"{model_slug}.vindex"
+        if default_vindex.exists():
+            vindex_path = str(default_vindex)
+
+    if vindex_path and Path(vindex_path).exists():
+        print("Loading vindex gates and metadata...")
+        config, gates, down_meta = load_vindex_gates_and_meta(vindex_path)
+        num_layers = config["num_layers"]
+        knowledge_start = num_layers * 2 // 5
+        knowledge_end = num_layers * 4 // 5
+        knowledge_layers = range(knowledge_start, knowledge_end)
+        has_vindex = True
+        print(
+            f"  {num_layers} layers, {config['hidden_size']} hidden,"
+            f" {len(down_meta)} features,"
+            f" knowledge L{knowledge_start}-L{knowledge_end - 1}"
+        )
+    else:
+        print("No vindex found — running prediction-only mode (no gate matching)")
+        if vindex_path:
+            print(f"  (looked for {vindex_path})")
 
     print("Loading triples...")
     with open(args.triples) as f:
@@ -375,16 +402,17 @@ def main() -> None:
     print(f"  Captured residuals at {len(residuals)} layers")
     print(f"  Top predictions: {predictions[:5]}")
 
-    # Check gate activations at peak knowledge layer
-    peak_layer = knowledge_end - 1
-    if peak_layer in residuals and peak_layer in gates:
-        r = residuals[peak_layer]
-        scores = gates[peak_layer] @ r
-        top5 = np.argsort(-np.abs(scores))[:5]
-        print(f"  L{peak_layer} top features:")
-        for idx in top5:
-            target = down_meta.get((peak_layer, int(idx)), "?")
-            print(f"    F{idx} gate={scores[idx]:+.1f} -> {target}")
+    # Check gate activations at peak knowledge layer (if vindex available)
+    if has_vindex and knowledge_layers:
+        peak_layer = knowledge_layers[-1]
+        if peak_layer in residuals and peak_layer in gates:
+            r = residuals[peak_layer]
+            scores = gates[peak_layer] @ r
+            top5 = np.argsort(-np.abs(scores))[:5]
+            print(f"  L{peak_layer} top features:")
+            for idx in top5:
+                tokens = down_meta.get((peak_layer, int(idx)), ["?"])
+                print(f"    F{idx} gate={scores[idx]:+.1f} -> {tokens}")
 
     # Full probe
     TEMPLATES = load_templates(args.templates)
@@ -438,59 +466,68 @@ def main() -> None:
                 )
                 sys.stdout.flush()
 
-            # --- Strategy 1: Gate matching ---
-            # Project residuals through gate vectors, match down_meta tokens
-            for layer in knowledge_layers:
-                if layer not in residuals or layer not in gates:
-                    continue
-                r = residuals[layer]
-                scores = gates[layer] @ r
-                top_indices = np.argsort(-np.abs(scores))[:args.top_k]
-
-                for feat_idx in top_indices:
-                    score = float(scores[feat_idx])
-                    if abs(score) < args.min_gate_score:
+            # --- Strategy 1: Gate matching (requires vindex) ---
+            if has_vindex:
+                for layer in knowledge_layers:
+                    if layer not in residuals or layer not in gates:
                         continue
-                    target = down_meta.get((layer, int(feat_idx)), "")
-                    if len(target) < 2:
-                        continue
+                    r = residuals[layer]
+                    scores = gates[layer] @ r
+                    top_indices = np.argsort(-np.abs(scores))[:args.top_k]
 
-                    tgt_lower = target.lower().strip()
-                    key = (subj_key, tgt_lower)
-                    if match_index.get(key) == rel_name:
+                    for feat_idx in top_indices:
+                        score = float(scores[feat_idx])
+                        if abs(score) < args.min_gate_score:
+                            continue
+                        tokens = down_meta.get((layer, int(feat_idx)), [])
+                        if not tokens:
+                            continue
+
                         feat_key = f"L{layer}_F{feat_idx}"
-                        if feat_key not in feature_labels:
-                            feature_labels[feat_key] = rel_name
-                            relation_counts[rel_name] += 1
-                            gate_matched += 1
+                        if feat_key in feature_labels:
+                            continue
+                        for target in tokens:
+                            if len(target) < 2:
+                                continue
+                            tgt_lower = target.lower().strip()
+                            key = (subj_key, tgt_lower)
+                            if match_index.get(key) == rel_name:
+                                feature_labels[feat_key] = rel_name
+                                relation_counts[rel_name] += 1
+                                gate_matched += 1
+                                break
 
-            # --- Strategy 2: Prediction matching ---
-            # Check if the model's top predicted tokens match any triple object
+            # --- Strategy 2: Prediction matching (model-only, no vindex needed) ---
             if predictions:
                 for pred_token, pred_prob in predictions[:10]:
                     if pred_prob < 0.01:
                         break
                     key = (subj_key, pred_token)
                     if match_index.get(key) == rel_name:
-                        # Find which features are most active for this
-                        # prediction — attribute to the top gate feature
-                        # at the peak knowledge layer (L26-27)
-                        best_feat = None
-                        best_score = 0
-                        for layer in [27, 26, 25, 24]:
-                            if layer not in residuals or layer not in gates:
-                                continue
-                            r = residuals[layer]
-                            scores = gates[layer] @ r
-                            top_idx = np.argmax(np.abs(scores))
-                            if abs(scores[top_idx]) > best_score:
-                                best_score = abs(scores[top_idx])
-                                best_feat = f"L{layer}_F{top_idx}"
-                        if best_feat and best_feat not in feature_labels:
-                            if best_feat not in prediction_labels:
-                                prediction_labels[best_feat] = rel_name
+                        if has_vindex:
+                            # Attribute to the top gate feature at peak layers
+                            best_feat = None
+                            best_score = 0
+                            for layer in list(knowledge_layers)[-4:]:
+                                if layer not in residuals or layer not in gates:
+                                    continue
+                                r = residuals[layer]
+                                scores = gates[layer] @ r
+                                top_idx = np.argmax(np.abs(scores))
+                                if abs(scores[top_idx]) > best_score:
+                                    best_score = abs(scores[top_idx])
+                                    best_feat = f"L{layer}_F{top_idx}"
+                            if best_feat and best_feat not in feature_labels:
+                                if best_feat not in prediction_labels:
+                                    prediction_labels[best_feat] = rel_name
+                                    pred_matched += 1
+                        else:
+                            # No vindex — record as relation-level match
+                            pred_key = f"pred_{rel_name}_{pred_token}"
+                            if pred_key not in prediction_labels:
+                                prediction_labels[pred_key] = rel_name
                                 pred_matched += 1
-                        break  # Only count first matching prediction
+                        break
 
         elapsed = time.time() - start_time
         rate = total_probes / elapsed if elapsed > 0 else 0
@@ -540,33 +577,34 @@ def main() -> None:
         ):
             print(f"  {rel:<25s} {count:4d}")
 
-    # Merge with existing labels on disk
-    vindex_labels = Path(vindex_path) / "feature_labels.json"
-    existing = {}
-    if vindex_labels.exists():
-        with open(vindex_labels) as f:
-            existing = json.load(f)
+    # Save to vindex (if available)
+    if has_vindex:
+        vindex_labels = Path(vindex_path) / "feature_labels.json"
+        existing = {}
+        if vindex_labels.exists():
+            with open(vindex_labels) as f:
+                existing = json.load(f)
 
-    new_count = 0
-    for key, rel in all_labels.items():
-        if key not in existing:
-            existing[key] = rel
-            new_count += 1
+        new_count = 0
+        for key, rel in all_labels.items():
+            if key not in existing:
+                existing[key] = rel
+                new_count += 1
 
-    with open(vindex_labels, "w") as f:
-        json.dump(existing, f, indent=2)
+        with open(vindex_labels, "w") as f:
+            json.dump(existing, f, indent=2)
+        print(f"\nVindex: {new_count} new + {len(existing) - new_count}"
+              f" existing = {len(existing)} total -> {vindex_labels}")
+    else:
+        existing = all_labels
+        new_count = len(all_labels)
 
+    # Always save to probes directory
     probe_path = Path(args.output) / model_slug / "feature_labels.json"
     probe_path.parent.mkdir(parents=True, exist_ok=True)
     with open(probe_path, "w") as f:
         json.dump(existing, f, indent=2)
-
-    print(
-        f"\nMerged: {new_count} new + {len(existing) - new_count}"
-        f" existing = {len(existing)} total"
-    )
-    print(f"Saved to {vindex_labels}")
-    print(f"Saved to {probe_path}")
+    print(f"Probes: {len(existing)} labels -> {probe_path}")
 
 
 if __name__ == "__main__":

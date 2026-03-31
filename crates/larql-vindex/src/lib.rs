@@ -9,7 +9,10 @@
 
 extern crate blas_src;
 
+pub mod checksums;
 pub mod config;
+pub mod describe;
+pub mod down_meta;
 pub mod error;
 pub mod index;
 pub mod load;
@@ -20,7 +23,11 @@ pub use ndarray;
 pub use tokenizers;
 
 // Re-export essentials at crate root.
-pub use config::{VindexConfig, VindexLayerInfo, VindexModelConfig};
+pub use config::{
+    ExtractLevel, LayerBands, MoeConfig, VindexConfig, VindexLayerInfo, VindexModelConfig,
+    VindexSource,
+};
+pub use describe::{DescribeEdge, LabelSource};
 pub use error::VindexError;
 pub use index::{
     FeatureMeta, IndexLoadCallbacks, SilentLoadCallbacks, VectorIndex, WalkHit, WalkTrace,

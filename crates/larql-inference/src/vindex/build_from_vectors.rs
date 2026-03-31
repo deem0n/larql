@@ -126,7 +126,7 @@ use larql_vindex::config::{
             bin_file.write_all(bytes)?;
 
             let length = bytes.len() as u64;
-            layer_infos.push(VindexLayerInfo { layer, num_features, offset, length });
+            layer_infos.push(VindexLayerInfo { layer, num_features, offset, length, num_experts: None, num_features_per_expert: None });
             offset += length;
         }
         bin_file.flush()?;
@@ -286,6 +286,9 @@ use larql_vindex::config::{
             layers: layer_infos,
             down_top_k: down_top_k_size,
             has_model_weights: false,
+            source: None,
+            checksums: None,            extract_level: larql_vindex::ExtractLevel::Browse,
+            layer_bands: None,
             model_config: None,
         };
 
