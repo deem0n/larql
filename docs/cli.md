@@ -14,6 +14,7 @@ The primary workflow: extract a vindex, launch the REPL, or build from a Vindexf
 | `build` | Build a custom model from a Vindexfile (FROM + PATCH + INSERT) |
 | `convert` | Convert between formats (GGUF → vindex, safetensors → vindex, gguf-info) |
 | `hf` | HuggingFace Hub: download or publish vindexes |
+| `verify` | Verify vindex file integrity (SHA256 checksums) |
 | `repl` | Launch the LQL interactive REPL |
 | `lql` | Execute a single LQL statement |
 | `walk` | Walk the model as a local vector index (gate KNN + down lookup) |
@@ -418,6 +419,24 @@ larql> DESCRIBE "France";
 ```
 
 Publishing requires `HF_TOKEN` environment variable or `huggingface-cli login`.
+
+### `larql verify`
+
+Verify vindex file integrity against stored SHA256 checksums.
+
+```
+larql verify <VINDEX>
+```
+
+**Example:**
+
+```bash
+larql verify gemma3-4b.vindex
+# gate_vectors.bin ... OK (1.66 GB)
+# embeddings.bin ... OK (1.25 GB)
+# down_meta.bin ... OK (2.0 MB)
+# All 3 files verified.
+```
 
 ### `larql vector-extract` (legacy)
 

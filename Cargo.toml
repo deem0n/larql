@@ -8,6 +8,7 @@ members = [
     "crates/larql-lql",
     "crates/larql-surreal",
     "crates/larql-cli",
+    "crates/larql-server",
     "crates/larql-python",
 ]
 default-members = [
@@ -18,6 +19,7 @@ default-members = [
     "crates/larql-lql",
     "crates/larql-surreal",
     "crates/larql-cli",
+    "crates/larql-server",
 ]
 
 [workspace.package]

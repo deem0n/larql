@@ -308,17 +308,23 @@ fn save_and_load_down_meta_round_trip() {
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
+    // Write a minimal tokenizer (needed for binary down_meta loading)
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
     // Load it back via the proper load path
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let idx2 = VectorIndex::load_vindex(&dir, &mut cb).unwrap();
 
-    // Verify content
+    // Verify content — binary down_meta stores token IDs, not strings.
+    // With an empty tokenizer vocab, strings decode to empty or token IDs.
+    // Check that the data round-trips (token_id and c_score preserved).
     let meta = idx2.feature_meta(0, 0).unwrap();
-    assert_eq!(meta.top_token, "Paris");
     assert_eq!(meta.top_token_id, 100);
+    assert!((meta.c_score - 0.95).abs() < 0.01);
 
     let meta1 = idx2.feature_meta(1, 0).unwrap();
-    assert_eq!(meta1.top_token, "Berlin");
+    assert_eq!(meta1.top_token_id, 200);
 
     // Feature 1 at layer 1 should still be None
     assert!(idx2.feature_meta(1, 1).is_none());
@@ -449,23 +455,21 @@ fn binary_down_meta_write_read_round_trip() {
 }
 
 #[test]
-fn save_down_meta_writes_both_formats() {
+fn save_down_meta_writes_binary() {
     let idx = test_index();
-    let dir = std::env::temp_dir().join("larql_test_both_dm");
+    let dir = std::env::temp_dir().join("larql_test_dm_binary");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     let count = idx.save_down_meta(&dir).unwrap();
     assert_eq!(count, 5); // 3 + 2
 
-    // Both files should exist
+    // Binary file should exist (JSONL no longer written)
     assert!(dir.join("down_meta.bin").exists());
-    assert!(dir.join("down_meta.jsonl").exists());
+    assert!(!dir.join("down_meta.jsonl").exists());
 
-    // Binary should be smaller than JSONL
     let bin_size = std::fs::metadata(dir.join("down_meta.bin")).unwrap().len();
-    let jsonl_size = std::fs::metadata(dir.join("down_meta.jsonl")).unwrap().len();
-    assert!(bin_size < jsonl_size, "binary ({bin_size}) should be smaller than JSONL ({jsonl_size})");
+    assert!(bin_size > 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -910,14 +914,14 @@ fn checksum_compute_and_verify() {
     // Write some test data
     std::fs::write(dir.join("gate_vectors.bin"), b"test gate data").unwrap();
     std::fs::write(dir.join("embeddings.bin"), b"test embed data").unwrap();
-    std::fs::write(dir.join("down_meta.jsonl"), b"test down data").unwrap();
+    std::fs::write(dir.join("down_meta.bin"), b"test down data").unwrap();
 
     // Compute checksums
     let checksums = larql_vindex::checksums::compute_checksums(&dir).unwrap();
     assert_eq!(checksums.len(), 3); // 3 files present
     assert!(checksums.contains_key("gate_vectors.bin"));
     assert!(checksums.contains_key("embeddings.bin"));
-    assert!(checksums.contains_key("down_meta.jsonl"));
+    assert!(checksums.contains_key("down_meta.bin"));
 
     // Verify — should all pass
     let results = larql_vindex::checksums::verify_checksums(&dir, &checksums).unwrap();
@@ -1523,15 +1527,19 @@ fn full_lifecycle_build_query_mutate_save_reload() {
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
+    // Write tokenizer for binary down_meta loading
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
     // Reload
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let loaded = VectorIndex::load_vindex(&dir, &mut cb).unwrap();
 
-    // Verify
+    // Verify — token IDs and scores round-trip through binary
     assert_eq!(loaded.total_gate_vectors(), 4);
     assert_eq!(loaded.total_down_meta(), 4);
-    assert_eq!(loaded.feature_meta(0, 0).unwrap().top_token, "Paris");
-    assert_eq!(loaded.feature_meta(0, 3).unwrap().top_token, "Canberra");
+    assert_eq!(loaded.feature_meta(0, 0).unwrap().top_token_id, 100);
+    assert_eq!(loaded.feature_meta(0, 3).unwrap().top_token_id, 103);
 
     // KNN should find Canberra for dim 3
     let q2 = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
@@ -1652,7 +1660,7 @@ fn extract_synthetic_model_f32() {
     // Verify files exist
     assert!(dir.join("gate_vectors.bin").exists());
     assert!(dir.join("embeddings.bin").exists());
-    assert!(dir.join("down_meta.jsonl").exists());
+    assert!(dir.join("down_meta.bin").exists());
     assert!(dir.join("down_meta.bin").exists(), "binary down_meta should be written during extract");
     assert!(dir.join("index.json").exists());
     assert!(dir.join("attn_weights.bin").exists());
@@ -1662,11 +1670,10 @@ fn extract_synthetic_model_f32() {
     assert!(dir.join("lm_head.bin").exists());
     assert!(dir.join("weight_manifest.json").exists());
 
-    // Both formats should be non-empty
+    // Binary down_meta should be non-empty (JSONL no longer written)
     let bin_size = std::fs::metadata(dir.join("down_meta.bin")).unwrap().len();
-    let jsonl_size = std::fs::metadata(dir.join("down_meta.jsonl")).unwrap().len();
     assert!(bin_size > 0, "binary down_meta should be non-empty");
-    assert!(jsonl_size > 0, "JSONL down_meta should be non-empty");
+    assert!(!dir.join("down_meta.jsonl").exists(), "JSONL should not be written during extract");
 
     // Verify config
     let config = larql_vindex::load_vindex_config(&dir).unwrap();
@@ -1718,7 +1725,7 @@ fn extract_synthetic_model_f16() {
 
     // Verify both down_meta formats written
     assert!(dir.join("down_meta.bin").exists(), "binary down_meta should be written during f16 extract");
-    assert!(dir.join("down_meta.jsonl").exists());
+    assert!(dir.join("down_meta.bin").exists());
 
     // Verify f16 files are smaller
     let gate_size = std::fs::metadata(dir.join("gate_vectors.bin")).unwrap().len();
@@ -1832,17 +1839,15 @@ fn extract_mutate_reload_verifies_mutation() {
     index.set_gate_vector(0, slot, &gate_vec);
     index.set_feature_meta(0, slot, make_meta("INSERTED", 999, 0.99));
 
-    // Save back
+    // Save back (binary only — no JSONL)
     index.save_gate_vectors(&dir).unwrap();
     index.save_down_meta(&dir).unwrap();
 
-    // Remove binary down_meta so reload uses JSONL (which has string tokens)
-    let _ = std::fs::remove_file(dir.join("down_meta.bin"));
-
-    // Reload and verify mutation persisted
+    // Reload and verify mutation persisted (binary format round-trip)
     let index2 = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();
     let meta = index2.feature_meta(0, slot).unwrap();
-    assert_eq!(meta.top_token, "INSERTED");
+    assert_eq!(meta.top_token_id, 999);
+    assert!((meta.c_score - 0.99).abs() < 0.01);
 
     // KNN should find the inserted feature for dim 7
     let query = ndarray::Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
@@ -2035,7 +2040,10 @@ fn vindexfile_parse_and_build() {
     let _ = std::fs::remove_dir_all(&base_dir);
     std::fs::create_dir_all(&base_dir).unwrap();
 
-    // Save a base vindex
+    // Save a base vindex (with tokenizer for binary down_meta loading)
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(base_dir.join("tokenizer.json"), tok_json).unwrap();
+
     let index = test_index();
     let mut config = VindexConfig {
         version: 2,
@@ -2091,8 +2099,11 @@ fn vindexfile_parse_and_build() {
     let vf = larql_vindex::vindexfile::parse_vindexfile_str(&vf_content).unwrap();
     let result = larql_vindex::build_from_vindexfile(&vf, None, &std::env::temp_dir()).unwrap();
 
-    assert_eq!(result.index.feature_meta(0, 0).unwrap().top_token, "PATCHED");
-    assert_eq!(result.index.feature_meta(0, 1).unwrap().top_token, "French");
+    // Patched feature should have the update applied
+    assert_eq!(result.index.feature_meta(0, 0).unwrap().top_token_id, 999);
+    assert!((result.index.feature_meta(0, 0).unwrap().c_score - 9.0).abs() < 0.01);
+    // Unpatched feature should remain (token_id preserved through binary round-trip)
+    assert_eq!(result.index.feature_meta(0, 1).unwrap().top_token_id, 101);
     assert_eq!(result.layers.len(), 2);
 
     let _ = std::fs::remove_dir_all(&base_dir);

@@ -96,10 +96,8 @@ fn main() {
     let _dm_count = index.save_down_meta(&dir).unwrap();
 
     let bin_size = std::fs::metadata(dir.join("down_meta.bin")).unwrap().len();
-    let jsonl_size = std::fs::metadata(dir.join("down_meta.jsonl")).unwrap().len();
-    println!("  down_meta.bin:   {} bytes", bin_size);
-    println!("  down_meta.jsonl: {} bytes", jsonl_size);
-    println!("  Compression:     {:.0}% smaller", (1.0 - bin_size as f64 / jsonl_size as f64) * 100.0);
+    println!("  down_meta.bin:   {} bytes (binary only — JSONL no longer written)", bin_size);
+    assert!(!dir.join("down_meta.jsonl").exists());
 
     let config = make_config("showcase", 2, 4, 5, layer_infos, larql_vindex::StorageDtype::F32);
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -113,6 +111,9 @@ fn main() {
 
     // ── 8. Reload ──
     section("8. Reload and verify");
+    // Write a minimal tokenizer (needed for binary down_meta token resolution)
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let loaded = VectorIndex::load_vindex(&dir, &mut cb).unwrap();
     let lc = larql_vindex::load_vindex_config(&dir).unwrap();
@@ -122,8 +123,9 @@ fn main() {
         println!("  Source: {}", src.huggingface_repo.as_deref().unwrap_or("?"));
     }
     let hits = loaded.gate_knn(0, &Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]), 1);
-    println!("  KNN [1,0,0,0] → F{}: {} ✓",
-        hits[0].0, loaded.feature_meta(0, hits[0].0).unwrap().top_token);
+    let meta = loaded.feature_meta(0, hits[0].0).unwrap();
+    println!("  KNN [1,0,0,0] → F{}: token_id={} (score={:.2}) ✓",
+        hits[0].0, meta.top_token_id, meta.c_score);
     let _ = std::fs::remove_dir_all(&dir);
 
     // ── 9. f16 storage ──

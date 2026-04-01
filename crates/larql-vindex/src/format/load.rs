@@ -36,8 +36,9 @@ impl VectorIndex {
         let start = std::time::Instant::now();
 
         let gate_path = dir.join("gate_vectors.bin");
-        let gate_bytes = std::fs::read(&gate_path)?;
-        let gate_floats = crate::config::dtype::decode_floats(&gate_bytes, config.dtype);
+        let gate_file = std::fs::File::open(&gate_path)?;
+        let gate_mmap = unsafe { memmap2::Mmap::map(&gate_file)? };
+        let gate_floats = crate::config::dtype::decode_floats(&gate_mmap, config.dtype);
 
         let mut gate_vectors: Vec<Option<Array2<f32>>> = vec![None; num_layers];
         let mut total_gate = 0;
@@ -155,8 +156,9 @@ pub fn load_vindex_embeddings(dir: &Path) -> Result<(Array2<f32>, f32), VindexEr
     let config: VindexConfig = serde_json::from_str(&config_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
 
-    let embed_bytes = std::fs::read(dir.join("embeddings.bin"))?;
-    let embed_floats = crate::config::dtype::decode_floats(&embed_bytes, config.dtype);
+    let embed_file = std::fs::File::open(dir.join("embeddings.bin"))?;
+    let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
+    let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, config.dtype);
 
     let embed = Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
         .map_err(|e| VindexError::Parse(e.to_string()))?;

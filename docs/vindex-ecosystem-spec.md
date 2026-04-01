@@ -3,8 +3,11 @@
 **Version:** 0.3  
 **Author:** Chris Hay  
 **Date:** 2026-04-01  
-**Status:** Vision  
+**Status:** Vision (~15% implemented)  
 **Companion specs:** [Format](vindex-format-spec.md), [Operations](vindex-operations-spec.md), [LQL](lql-spec.md)
+
+**What's implemented:** Format comparisons (Section 1), HuggingFace publish/download (Section 4.1), Vindexfile parsing and build (Section 6), browse-only and knowledge patching strategies (Section 3).  
+**What's planned:** Distributed hosting (HTTP server), USE REMOTE, decoupled inference, layer-on-demand, remote serving API, multi-tenant, CI/CD tooling.
 
 ---
 

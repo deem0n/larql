@@ -3,9 +3,11 @@
 **Version:** 0.3  
 **Author:** Chris Hay  
 **Date:** 2026-04-01  
-**Status:** Draft  
+**Status:** Implemented (~98%)  
 **Implementation:** `larql-vindex` crate (Rust)  
 **Companion specs:** [Format](vindex-format-spec.md), [Ecosystem](vindex-ecosystem-spec.md), [LQL](lql-spec.md)
+
+**Implementation coverage:** All core operations (load, KNN, walk, describe, mutate, compile), full patch lifecycle, build pipeline (safetensors/GGUF/MLX), Vindexfile, HuggingFace publish/download — all implemented. Readonly base with auto-patch overlay. 566 tests.
 
 ---
 
@@ -315,7 +317,7 @@ larql extract-index google/gemma-3-4b-it -o gemma3-4b.vindex --level all --f16
 1. Load model from safetensors, GGUF, or MLX (dequantize to f32 if needed)
 2. Extract gate vectors → `gate_vectors.bin`
 3. Extract embeddings → `embeddings.bin`
-4. Compute down metadata → `down_meta.bin` + `down_meta.jsonl`
+4. Compute down metadata → `down_meta.bin`
 5. Compute relation clusters → `relation_clusters.json`
 6. Copy tokenizer → `tokenizer.json`
 7. (Inference level) Write attn_weights.bin, norms.bin

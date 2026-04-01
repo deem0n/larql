@@ -3,9 +3,11 @@
 **Version:** 0.3  
 **Author:** Chris Hay  
 **Date:** 2026-04-01  
-**Status:** Draft  
+**Status:** Implemented (~95%)  
 **Implementation:** `larql-vindex` crate (Rust)  
 **Companion specs:** [Operations](vindex-operations-spec.md), [Ecosystem](vindex-ecosystem-spec.md), [LQL](lql-spec.md)
+
+**Implementation coverage:** File layout, binary formats, extract levels, f16 storage, checksums, mmap loading, `larql verify` — all implemented. Remaining: int8/int4 quantisation, streaming build (future).
 
 ---
 
@@ -84,8 +86,7 @@ model.vindex/
 │
 ├── gate_vectors.bin          # W_gate rows per layer (KNN index)
 ├── embeddings.bin            # W_embed matrix (token lookup)
-├── down_meta.bin             # Per-feature output metadata (binary, compact)
-├── down_meta.jsonl           # Per-feature output metadata (human-readable fallback)
+├── down_meta.bin             # Per-feature output metadata (binary)
 │
 │  # ═══ Inference Weights (for INFER) ═══
 │
@@ -194,24 +195,11 @@ top_k entries:
 
 Token strings resolved at read time via tokenizer. No string storage needed.
 
-Loading tries `down_meta.bin` first. Falls back to `down_meta.jsonl` if binary is absent. Both are written during extraction.
+Only `down_meta.bin` is written during extraction. Loading falls back to `down_meta.jsonl` if binary is absent (v1 compatibility).
 
-### 5.4 down_meta.jsonl (JSONL, fallback)
+### 5.4 down_meta.jsonl (v1 legacy)
 
-NDJSON (newline-delimited JSON). One record per feature per layer. Human-readable but ~80x larger.
-
-```json
-{"l":0,"f":512,"t":"the","i":278,"c":3.45,"k":[{"t":"the","i":278,"s":3.45},{"t":"and","i":345,"s":2.12}]}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `l` | usize | Layer index |
-| `f` | usize | Feature index within layer |
-| `t` | string | Top output token (decoded) |
-| `i` | u32 | Top output token ID |
-| `c` | f32 | C-score (selectivity of top token) |
-| `k` | array | Top-K output tokens `{"t", "i", "s"}` |
+NDJSON format from v1 vindexes. No longer written during extraction. Supported for loading only (backward compatibility). ~5.5x larger than binary.
 
 ### 5.5 attn_weights.bin
 
@@ -462,25 +450,31 @@ Legacy `model_weights.bin` is still supported for loading. The engine checks for
 
 ---
 
-## 11. Planned Format Changes
+## 11. Implemented Format Features
 
-### 11.1 Memory-Mapped Loading (Priority: MEDIUM)
+### 11.1 Memory-Mapped Loading — IMPLEMENTED
 
-Use `mmap` for gate_vectors.bin instead of reading into heap.
+`gate_vectors.bin` and `embeddings.bin` are loaded via `mmap` (memmap2). The OS pages data in on demand — no heap allocation for the raw file. Multiple vindexes can share physical memory for overlapping pages.
 
-**Benefit:** Instant load time. OS pages in data on demand. Multiple vindexes can share physical memory.
+### 11.2 Checksums and Verification — IMPLEMENTED
 
-### 11.2 Incremental down_meta (Priority: LOW)
+SHA256 hashes of all binary files, stored in `index.json` under `checksums`. Computed during EXTRACT. Verified via CLI:
 
-Append-only format for mutation without full rewrite. INSERT appends new records, marks originals as superseded via a tombstone index.
+```bash
+larql verify gemma3-4b.vindex
+# gate_vectors.bin ... OK (1.66 GB)
+# embeddings.bin ... OK (1.25 GB)
+# down_meta.bin ... OK (29 MB)
+# All 3 files verified.
+```
 
-### 11.3 Streaming Build (Priority: LOW)
+---
 
-Build vindex without loading entire model into memory. Process one layer at a time, write immediately to disk. Enables 70B+ model extraction on machines with limited RAM.
+## 12. Future Format Changes
 
-### 11.4 Quantised Browse (Priority: LOW)
+### 12.1 Quantised Browse (Priority: LOW)
 
-Store gate vectors at int8 or int4 precision. KNN accuracy is nearly identical — ranking is preserved even at low precision.
+Store gate vectors at int8 or int4 precision. KNN accuracy is nearly identical — ranking is preserved.
 
 ```
 Gate vectors at f32:  3.32 GB
@@ -489,19 +483,9 @@ Gate vectors at int8: 0.83 GB
 Gate vectors at int4: 0.42 GB — a 4B model's knowledge in 400 MB
 ```
 
----
+### 12.2 Streaming Build (Priority: LOW)
 
-## 12. Checksums
-
-SHA256 hashes of all binary files, stored in `index.json` under `checksums`. Computed during EXTRACT.
-
-```bash
-larql verify gemma3-4b.vindex
-# Checking gate_vectors.bin... OK (1.66 GB, sha256 matches)
-# Checking embeddings.bin... OK (1.25 GB, sha256 matches)
-# Checking down_meta.bin... OK (2 MB, sha256 matches)
-# All files verified.
-```
+Build vindex without loading entire model into memory. Process one layer at a time, write immediately to disk. Enables 70B+ model extraction on machines with limited RAM.
 
 ---
 

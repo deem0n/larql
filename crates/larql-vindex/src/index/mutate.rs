@@ -8,7 +8,7 @@ use std::path::Path;
 use ndarray::Array1;
 
 use crate::error::VindexError;
-use crate::config::{DownMetaRecord, DownMetaTopK, VindexConfig};
+use crate::config::VindexConfig;
 use crate::index::{FeatureMeta, VectorIndex};
 
 impl VectorIndex {
@@ -120,11 +120,10 @@ impl VectorIndex {
         results
     }
 
-    /// Write down_meta to disk in both binary and JSONL formats.
-    /// Binary (down_meta.bin) is the primary format for fast loading.
-    /// JSONL (down_meta.jsonl) is kept for backward compat and human readability.
+    /// Write down_meta to disk as binary format (down_meta.bin).
+    /// JSONL is no longer written — use `larql dump-meta` for human-readable output.
+    /// Loading still falls back to JSONL for v1 compat if binary is absent.
     pub fn save_down_meta(&self, dir: &Path) -> Result<usize, VindexError> {
-        // Determine max top_k across all features
         let max_top_k = self.down_meta.iter()
             .filter_map(|l| l.as_ref())
             .flat_map(|metas| metas.iter().filter_map(|m| m.as_ref()))
@@ -132,44 +131,7 @@ impl VectorIndex {
             .max()
             .unwrap_or(10);
 
-        // Write binary format
-        let count = crate::format::down_meta::write_binary(dir, &self.down_meta, max_top_k)?;
-
-        // Also write JSONL for backward compat
-        let path = dir.join("down_meta.jsonl");
-        let file = std::fs::File::create(&path)?;
-        let mut writer = BufWriter::new(file);
-
-        for (layer, layer_meta) in self.down_meta.iter().enumerate() {
-            if let Some(ref metas) = layer_meta {
-                for (feature, meta_opt) in metas.iter().enumerate() {
-                    if let Some(meta) = meta_opt {
-                        let record = DownMetaRecord {
-                            layer,
-                            feature,
-                            top_token: meta.top_token.clone(),
-                            top_token_id: meta.top_token_id,
-                            c_score: meta.c_score,
-                            top_k: meta
-                                .top_k
-                                .iter()
-                                .map(|t| DownMetaTopK {
-                                    token: t.token.clone(),
-                                    token_id: t.token_id,
-                                    logit: t.logit,
-                                })
-                                .collect(),
-                        };
-                        serde_json::to_writer(&mut writer, &record)
-                            .map_err(|e| VindexError::Parse(e.to_string()))?;
-                        writer.write_all(b"\n")?;
-                    }
-                }
-            }
-        }
-        writer.flush()?;
-
-        Ok(count)
+        crate::format::down_meta::write_binary(dir, &self.down_meta, max_top_k)
     }
 
     /// Write gate_vectors.bin back to disk and return updated layer info.

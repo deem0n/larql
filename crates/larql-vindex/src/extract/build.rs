@@ -281,7 +281,7 @@ fn run_clustering_pipeline(
 }
 
 use crate::config::{
-    DownMetaRecord, DownMetaTopK, VindexConfig, VindexLayerInfo, VindexModelConfig,
+    VindexConfig, VindexLayerInfo, VindexModelConfig,
 };
 
 // Callbacks from larql-vindex (canonical definition)
@@ -405,10 +405,8 @@ pub use crate::extract::callbacks::IndexBuildCallbacks;
 
         // ── 3. Write down metadata + collect directions for relation clustering ──
         callbacks.on_stage("down_meta");
-        let down_path = output_dir.join("down_meta.jsonl");
-        let mut down_file = BufWriter::new(std::fs::File::create(&down_path)?);
 
-        // Collect down_meta in memory for binary format
+        // Collect down_meta in memory — written as binary at end of loop
         let mut all_down_meta: Vec<Option<Vec<Option<crate::FeatureMeta>>>> = vec![None; num_layers];
 
         // Collect offset directions for knowledge layers (L14-28) for relation clustering
@@ -547,27 +545,7 @@ pub use crate::extract::callbacks::IndexBuildCallbacks;
                     }
                 }
 
-                let record = DownMetaRecord {
-                    layer,
-                    feature: feature_offset + feat,
-                    top_token,
-                    top_token_id,
-                    c_score,
-                    top_k: top_k_entries
-                        .iter()
-                        .map(|e| DownMetaTopK {
-                            token: e.token.clone(),
-                            token_id: e.token_id,
-                            logit: e.logit,
-                        })
-                        .collect(),
-                };
-
-                serde_json::to_writer(&mut down_file, &record)
-                    .map_err(|e| VindexError::Parse(e.to_string()))?;
-                down_file.write_all(b"\n")?;
-
-                // Collect for binary format
+                // Collect in memory for binary write
                 let feat_idx = feature_offset + feat;
                 if all_down_meta[layer].is_none() {
                     all_down_meta[layer] = Some(Vec::new());
@@ -577,14 +555,10 @@ pub use crate::extract::callbacks::IndexBuildCallbacks;
                         metas.push(None);
                     }
                     metas[feat_idx] = Some(crate::FeatureMeta {
-                        top_token: record.top_token.clone(),
-                        top_token_id: record.top_token_id,
-                        c_score: record.c_score,
-                        top_k: record.top_k.iter().map(|t| TopKEntry {
-                            token: t.token.clone(),
-                            token_id: t.token_id,
-                            logit: t.logit,
-                        }).collect(),
+                        top_token,
+                        top_token_id,
+                        c_score,
+                        top_k: top_k_entries,
                     });
                 }
             }
@@ -595,9 +569,8 @@ pub use crate::extract::callbacks::IndexBuildCallbacks;
 
             callbacks.on_layer_done("down", layer, start.elapsed().as_secs_f64() * 1000.0);
         }
-        down_file.flush()?;
 
-        // Write binary down_meta
+        // Write binary down_meta (only format — no JSONL)
         crate::format::down_meta::write_binary(output_dir, &all_down_meta, down_top_k)?;
 
         callbacks.on_stage_done("down_meta", 0.0);

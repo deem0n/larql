@@ -94,6 +94,9 @@ enum Commands {
     /// HuggingFace Hub: download or publish vindexes.
     Hf(hf_cmd::HfArgs),
 
+    /// Verify vindex file integrity (SHA256 checksums).
+    Verify(verify_cmd::VerifyArgs),
+
     /// Graph-routed walk with banded layer strategy (graph FFN + highway skip).
     GraphWalk(graph_walk_cmd::GraphWalkArgs),
 
@@ -156,12 +159,47 @@ enum Commands {
 
     /// Execute an LQL statement.
     Lql(LqlArgs),
+
+    // ── Server ──
+    /// Serve a vindex over HTTP.
+    Serve(ServeArgs),
 }
 
 #[derive(clap::Args)]
 struct LqlArgs {
     /// LQL statement to execute (e.g., 'WALK "The capital of France is" TOP 5;')
     statement: String,
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Path to a .vindex directory (or hf:// path).
+    #[arg(value_name = "VINDEX_PATH")]
+    vindex_path: Option<String>,
+
+    /// Serve all .vindex directories in this folder.
+    #[arg(long)]
+    dir: Option<std::path::PathBuf>,
+
+    /// Listen port.
+    #[arg(long, default_value = "8080")]
+    port: u16,
+
+    /// Bind address.
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+
+    /// Disable INFER endpoint (browse-only, reduces memory).
+    #[arg(long)]
+    no_infer: bool,
+
+    /// Enable CORS for browser access.
+    #[arg(long)]
+    cors: bool,
+
+    /// Logging level.
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 fn main() {
@@ -193,6 +231,7 @@ fn main() {
         Commands::Build(args) => build_cmd::run(args),
         Commands::Convert(args) => convert_cmd::run(args),
         Commands::Hf(args) => hf_cmd::run(args),
+        Commands::Verify(args) => verify_cmd::run(args),
         Commands::GraphWalk(args) => graph_walk_cmd::run(args),
         Commands::TrajectoryTrace(args) => trajectory_trace_cmd::run(args),
         Commands::VindexBench(args) => vindex_bench_cmd::run(args),
@@ -227,6 +266,58 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => Err(e),
+            }
+        }
+        Commands::Serve(args) => {
+            // Build the argument list and exec larql-server.
+            let mut cmd_args = Vec::new();
+            if let Some(ref path) = args.vindex_path {
+                cmd_args.push(path.clone());
+            }
+            if let Some(ref dir) = args.dir {
+                cmd_args.push("--dir".into());
+                cmd_args.push(dir.display().to_string());
+            }
+            cmd_args.push("--port".into());
+            cmd_args.push(args.port.to_string());
+            cmd_args.push("--host".into());
+            cmd_args.push(args.host.clone());
+            cmd_args.push("--log-level".into());
+            cmd_args.push(args.log_level.clone());
+            if args.no_infer {
+                cmd_args.push("--no-infer".into());
+            }
+            if args.cors {
+                cmd_args.push("--cors".into());
+            }
+
+            // Try to find larql-server binary next to this binary.
+            let exe = std::env::current_exe().ok();
+            let server_bin = exe
+                .as_ref()
+                .and_then(|e| e.parent())
+                .map(|d| d.join("larql-server"))
+                .filter(|p| p.exists());
+
+            let bin = server_bin
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "larql-server".into());
+
+            let status = std::process::Command::new(&bin)
+                .args(&cmd_args)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => Ok(()),
+                Ok(s) => {
+                    eprintln!("larql-server exited with {}", s);
+                    std::process::exit(s.code().unwrap_or(1));
+                }
+                Err(e) => {
+                    eprintln!("Failed to start larql-server: {e}");
+                    eprintln!("Make sure larql-server is installed (cargo install --path crates/larql-server)");
+                    std::process::exit(1);
+                }
             }
         }
     };

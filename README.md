@@ -60,7 +60,7 @@ A vindex is a directory containing a model's weights reorganised for queryabilit
 gemma3-4b.vindex/
   gate_vectors.bin         # W_gate rows (KNN index, 3.3 GB)
   embeddings.bin           # W_embed matrix (token lookup, 2.5 GB)
-  down_meta.bin            # Per-feature output metadata
+  down_meta.bin            # Per-feature output metadata (binary)
   index.json               # Config, layer bands, provenance
   tokenizer.json           # Tokenizer
   relation_clusters.json   # Discovered relation types
@@ -247,9 +247,9 @@ MoE models store all experts' features in one flat index. Gate KNN naturally sel
 | Doc | Description |
 |---|---|
 | [docs/lql-spec.md](docs/lql-spec.md) | LQL language specification (v0.3) |
-| [docs/vindex-format-spec.md](docs/vindex-format-spec.md) | Vindex file format specification (v0.3) |
-| [docs/vindex-operations-spec.md](docs/vindex-operations-spec.md) | Vindex operations, API, patches |
-| [docs/vindex-ecosystem-spec.md](docs/vindex-ecosystem-spec.md) | Distributed hosting, HuggingFace, Vindexfile |
+| [docs/vindex-format-spec.md](docs/vindex-format-spec.md) | Vindex file format specification (v0.3, ~95% implemented) |
+| [docs/vindex-operations-spec.md](docs/vindex-operations-spec.md) | Vindex operations, API, patches (~98% implemented) |
+| [docs/vindex-ecosystem-spec.md](docs/vindex-ecosystem-spec.md) | Distributed hosting, HuggingFace, Vindexfile (vision) |
 | [docs/lql-guide.md](docs/lql-guide.md) | LQL quick start guide |
 | [docs/cli.md](docs/cli.md) | CLI reference |
 | [docs/knowledge-pipeline.md](docs/knowledge-pipeline.md) | Knowledge labelling pipeline |
@@ -258,7 +258,7 @@ MoE models store all experts' features in one flat index. Gate KNN naturally sel
 
 ```bash
 cargo build --release       # optimized build
-cargo test                  # 566 tests across all crates
+cargo test                  # 545 tests across all crates
 cargo run -p larql-vindex --example vindex_demo    # vindex feature demo
 cargo run -p larql-vindex --example vindex_bench --release  # benchmarks
 cargo run -p larql-lql --example parser_demo       # parser demo
