@@ -48,7 +48,28 @@ crates/larql-python/src/trace_py.rs
 
 ## Usage
 
-### Capture a trace
+### LQL
+
+```sql
+-- Answer trajectory: track Paris through all 34 layers
+TRACE "The capital of France is" ANSWER "Paris";
+
+-- Attn vs FFN decomposition at the phase transition
+TRACE "The capital of France is" DECOMPOSE LAYERS 22-27;
+
+-- Full decomposition, all layers
+TRACE "The capital of France is" DECOMPOSE;
+
+-- Save to mmap'd file
+TRACE "The capital of France is" SAVE "france.trace";
+
+-- All positions, specific layer range, with answer tracking
+TRACE "The capital of France is" ANSWER "Paris" LAYERS 20-33 POSITIONS ALL;
+```
+
+The LQL TRACE command uses the same backend as INFER — mutations via INSERT/DELETE are reflected in trace results.
+
+### Python: Capture a trace
 
 ```python
 import larql
@@ -58,7 +79,7 @@ t = wm.trace("The capital of France is")
 # ResidualTrace('The capital of France is', 6 tokens, 34 layers, 35 nodes)
 ```
 
-### Query the answer trajectory
+### Python: Query the answer trajectory
 
 ```python
 traj = t.answer_trajectory("Paris")
@@ -72,7 +93,7 @@ for w in traj:
 # AnswerWaypoint(L26, rank=1,   prob=0.999, attn=83.1,  ffn=18.7)
 ```
 
-### Inspect any layer
+### Python: Inspect any layer
 
 ```python
 t.top_k(24)        # [('Paris', 0.714), ('located', 0.133), ...]
@@ -82,7 +103,7 @@ t.attn_delta(24)    # [f32; 2560] — what attention added
 t.ffn_delta(24)     # [f32; 2560] — what FFN added
 ```
 
-### Multi-position trace
+### Python: Multi-position trace
 
 ```python
 t = wm.trace("The capital of France is", positions="all")
@@ -90,7 +111,7 @@ t = wm.trace("The capital of France is", positions="all")
 t.residual(24, position=4)  # France's residual at L24
 ```
 
-### Save and mmap
+### Python: Save and mmap
 
 ```python
 from larql._native import TraceStore
@@ -101,7 +122,7 @@ store = TraceStore("trace.bin")
 store.residual(5, 25)   # token 5, layer 25 — zero-copy from mmap
 ```
 
-### Boundary store (production context)
+### Python: Boundary store (production context)
 
 ```python
 from larql._native import BoundaryWriter, BoundaryStore
@@ -246,3 +267,4 @@ The trace connects several proven findings:
 - **FFN cached 4160x:** the FFN deltas in the trace are exactly what the vindex walk FFN computes. The trace stores the result; the vindex enables the lookup.
 - **Gate vectors full rank:** the FFN uses all 2560 dimensions. Entity-specific FFN deltas can't be templated — they're the knowledge.
 - **8 circuits / 192 OV edges:** the attention deltas at L24 and L26 (+106, +83 logits) are the circuit outputs. The two biggest attention events in the entire forward pass.
+- **LQL integration:** TRACE uses the same WalkFfn backend as INFER — mutations via INSERT/DELETE are reflected in trace results. The knowledge graph and the inference trace are consistent.

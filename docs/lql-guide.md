@@ -148,6 +148,30 @@ DIFF "gemma3-4b.vindex" CURRENT;
 COMPILE CURRENT INTO MODEL "gemma3-4b-edited/" FORMAT safetensors;
 ```
 
+## Residual Stream Trace
+
+Trace decomposes a forward pass into attention and FFN contributions at every layer.
+
+```sql
+-- What does the model predict at each layer?
+TRACE "The capital of France is";
+
+-- Track a specific answer through all layers
+TRACE "The capital of France is" ANSWER "Paris";
+-- Shows rank, probability, attn/FFN logit contribution, who pushes the answer
+
+-- Attention vs FFN decomposition at the phase transition
+TRACE "The capital of France is" DECOMPOSE LAYERS 22-27;
+
+-- Save the trace to an mmap'd file
+TRACE "The capital of France is" SAVE "france.trace";
+
+-- Trace all token positions (not just last)
+TRACE "The capital of France is" POSITIONS ALL SAVE "france_all.trace";
+```
+
+TRACE requires model weights (`WITH ALL` or `WITH INFERENCE` during EXTRACT). It uses the same WalkFfn as INFER — INSERT/DELETE mutations are reflected.
+
 ## Introspection
 
 ```sql
@@ -197,6 +221,7 @@ Bands are model-specific — computed automatically during EXTRACT from known ar
 | Lifecycle | EXTRACT, COMPILE, DIFF, USE |
 | Browse | WALK, DESCRIBE, SELECT, EXPLAIN WALK |
 | Inference | INFER, EXPLAIN INFER |
+| Trace | TRACE (with ANSWER, DECOMPOSE, LAYERS, POSITIONS, SAVE) |
 | Mutation | INSERT, DELETE, UPDATE, MERGE |
 | Patches | BEGIN PATCH, SAVE PATCH, APPLY PATCH, SHOW PATCHES, REMOVE PATCH |
 | Introspection | SHOW RELATIONS/LAYERS/FEATURES/MODELS/PATCHES, STATS |

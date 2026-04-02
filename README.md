@@ -253,22 +253,32 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 
 Capture the complete record of inference — every layer, every contribution, queryable.
 
+```sql
+-- LQL: answer trajectory through all layers
+larql> TRACE "The capital of France is" ANSWER "Paris";
+  Layer   Rank     Prob      Attn       FFN      Who
+    L22     50    0.002     +22.2     +34.4   BOTH ↑
+    L23     10    0.024     -16.9     +55.9    FFN ↑
+    L24      1    0.714    +105.7     +24.4   BOTH ↑  ← phase transition
+    L25      1    0.997      +4.3     +94.4    FFN ↑
+    L26      1    0.999     +83.1     +18.7   BOTH ↑
+
+-- Attn vs FFN decomposition at the phase transition
+larql> TRACE "The capital of France is" DECOMPOSE LAYERS 22-27;
+
+-- Persist for later analysis
+larql> TRACE "The capital of France is" SAVE "france.trace";
+```
+
 ```python
+# Python: same trace, programmatic access
 import larql
 
 wm = larql.WalkModel("gemma3-4b.vindex")
 t = wm.trace("The capital of France is")
-
-# When does Paris appear? Track through all 34 layers.
-for w in t.answer_trajectory("Paris"):
-    if w.rank <= 10:
-        print(f"  L{w.layer}: rank={w.rank}, attn={w.attn_logit:.0f}, ffn={w.ffn_logit:.0f}")
-# L23: rank=10, attn=-17, ffn=56
-# L24: rank=1,  attn=106, ffn=24   ← phase transition
-# L25: rank=1,  attn=4,   ffn=94
-
-# Save to mmap'd store — zero-copy reads, append-only
-t.save("trace.bin")
+t.answer_trajectory("Paris")   # rank, prob, attn/ffn logits per layer
+t.top_k(24)                    # [('Paris', 0.714), ...]
+t.save("trace.bin")            # mmap'd store
 ```
 
 ### Tiered Context (infinite context without KV cache)

@@ -163,6 +163,55 @@ vindex.compile("mlx-model/", format="mlx")
 
 ---
 
+## 2.5 Residual Stream Trace
+
+Capture a decomposed forward pass — attn/FFN deltas at every layer, queryable.
+
+```python
+import larql
+
+wm = larql.WalkModel("gemma3-4b.vindex")
+
+# Capture trace (last token position by default)
+t = wm.trace("The capital of France is")
+# ResidualTrace('The capital of France is', 6 tokens, 34 layers, 35 nodes)
+
+# Answer trajectory — track a token through all layers
+traj = t.answer_trajectory("Paris")
+for w in traj:
+    print(f"L{w.layer}: rank={w.rank}, prob={w.prob:.3f}, attn={w.attn_logit:.1f}, ffn={w.ffn_logit:.1f}")
+
+# Inspect any layer
+t.top_k(24)              # top-5 predictions at L24
+t.rank_of("Paris", 23)   # rank of Paris at L23
+t.residual(24)            # raw residual vector at L24
+t.attn_delta(24)          # what attention added at L24
+t.ffn_delta(24)           # what FFN added at L24
+t.summary()               # per-layer compact summary
+
+# Multi-position trace (all token positions)
+t = wm.trace("The capital of France is", positions="all")
+t.residual(24, position=4)  # France's residual at L24
+
+# Save / load (mmap'd, zero-copy)
+t.save("trace.bin")
+from larql._native import TraceStore
+store = TraceStore("trace.bin")
+store.residual(0, 25)  # token 0, layer 25
+
+# Boundary store (production context, 10 KB/window)
+from larql._native import BoundaryWriter, BoundaryStore
+writer = BoundaryWriter("ctx.bndx", hidden_size=2560, window_size=200)
+writer.append(token_offset=0, window_tokens=200, residual=vec)
+writer.finish()
+store = BoundaryStore("ctx.bndx")
+store.residual(0)  # zero-copy from mmap
+```
+
+See [residual-trace.md](residual-trace.md) for architecture details and tiered context storage.
+
+---
+
 ## 3. MLX Integration
 
 ### 3.1 Three Inference Modes
