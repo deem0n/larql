@@ -98,7 +98,38 @@ larql repl
 
 **Sessions:** Clients can send `X-Session-Id` header to isolate patches per session. Without the header, patches apply globally.
 
-See `crates/larql-server/README.md` and `docs/vindex-server-spec.md` for full API documentation.
+See `crates/larql-server/README.md` for full API documentation.
+
+### `larql repl`
+
+Launch the LQL interactive REPL. Tab completion, history, multi-line input.
+
+```bash
+larql repl
+```
+
+```sql
+larql> USE "gemma3-4b.vindex";
+larql> DESCRIBE "France";
+larql> WALK "The capital of France is" TOP 5;
+larql> INSERT INTO EDGES (entity, relation, target) VALUES ("John", "lives-in", "London");
+larql> SAVE PATCH "edits.vlp";
+```
+
+Remote mode:
+```sql
+larql> USE REMOTE "http://localhost:8080";
+larql> DESCRIBE "France";
+```
+
+### `larql lql`
+
+Execute a single LQL statement from the command line.
+
+```bash
+larql lql 'USE "gemma3-4b.vindex"; DESCRIBE "France";'
+larql lql 'USE "gemma3-4b.vindex"; WALK "Einstein" TOP 10;'
+```
 
 ## Legacy extraction commands
 
@@ -520,7 +551,7 @@ larql verify gemma3-4b.vindex
 
 ### `larql vector-extract` (legacy)
 
-Extract full weight vectors to intermediate NDJSON files for SurrealDB ingestion.
+Extract full weight vectors to intermediate NDJSON files.
 
 ```
 larql vector-extract <MODEL> --output <OUTPUT> [OPTIONS]
@@ -546,102 +577,6 @@ larql vector-extract google/gemma-3-4b-it -o vectors/ \
     --components ffn_down --layers 25,26,27,28,29,30,31,32,33
 ```
 
-### `larql vector-load` (legacy)
-
-Load extracted vectors into SurrealDB with HNSW indexes.
-
-```
-larql vector-load <INPUT> --ns <NS> --db <DB> [OPTIONS]
-```
-
-| Flag | Description |
-|---|---|
-| `<INPUT>` | Directory containing `.vectors.jsonl` files |
-| `--surreal <URL>` | SurrealDB endpoint [default: `http://localhost:8000`] |
-| `--ns <NS>` | SurrealDB namespace |
-| `--db <DB>` | SurrealDB database |
-| `--user <USER>` | Username [default: `root`] |
-| `--pass <PASS>` | Password [default: `root`] |
-| `--tables <TABLES>` | Tables to load (comma-separated). Default: all |
-| `--layers <LAYERS>` | Layers to load (comma-separated). Default: all |
-| `--batch-size <N>` | Batch size for INSERT transactions [default: 50] |
-| `--resume` | Resume interrupted load (skips completed layers) |
-| `--schema-only` | Create schema only (no data load) |
-
-**Examples:**
-
-```bash
-larql vector-load vectors/ --ns larql --db gemma3_4b
-larql vector-load vectors/ --ns larql --db gemma3_4b --layers 25,26,33 --batch-size 1000
-```
-
-### `larql vector-import` (legacy)
-
-Import vectors into SurrealDB via batched `surreal import` CLI. Handles large tables (embeddings, FFN) that exceed HTTP body limits by writing temporary `.surql` batch files and importing each one.
-
-```
-larql vector-import <INPUT> --ns <NS> --db <DB> [OPTIONS]
-```
-
-| Flag | Description |
-|---|---|
-| `<INPUT>` | Directory containing `.vectors.jsonl` files |
-| `--ns <NS>` | SurrealDB namespace |
-| `--db <DB>` | SurrealDB database |
-| `--tables <TABLES>` | Tables to import (comma-separated). Default: all |
-| `--layers <LAYERS>` | Layers to import (comma-separated). Default: all |
-| `--endpoint <URL>` | SurrealDB endpoint [default: `http://localhost:8000`] |
-| `--user <USER>` | Username [default: `root`] |
-| `--pass <PASS>` | Password [default: `root`] |
-| `--batch-size <N>` | Records per batch file [default: 5000] |
-| `--resume` | Skip completed layers (tracks progress in `load_progress` table) |
-
-**Requires:** `surreal` CLI installed and SurrealDB running.
-
-**Examples:**
-
-```bash
-# Import embeddings with progress bar
-larql vector-import output/vectors --tables embeddings --ns larql --db gemma3_4b --resume
-
-# Import FFN factual layers
-larql vector-import output/vectors --tables ffn_gate,ffn_down \
-    --layers 25,26,27,28,29,30,31,32,33 --ns larql --db gemma3_4b --resume
-
-# Import everything
-larql vector-import output/vectors --tables ffn_gate,ffn_down,ffn_up \
-    --ns larql --db gemma3_4b --resume
-```
-
-### `larql vector-export-surql` (legacy)
-
-Export vectors to `.surql` files for manual `surreal import`. Useful if you want to inspect the SQL or import on a different machine.
-
-```
-larql vector-export-surql <INPUT> --output <OUTPUT> [OPTIONS]
-```
-
-| Flag | Description |
-|---|---|
-| `<INPUT>` | Directory containing `.vectors.jsonl` files |
-| `-o, --output <OUTPUT>` | Output directory for `.surql` files |
-| `--tables <TABLES>` | Tables to export (comma-separated). Default: all |
-| `--layers <LAYERS>` | Layers to export (comma-separated). Default: all |
-| `--ns <NS>` | Namespace for `USE` statement [default: `larql`] |
-| `--db <DB>` | Database for `USE` statement [default: `gemma3_4b`] |
-
-**Examples:**
-
-```bash
-larql vector-export-surql output/vectors -o output/surql --tables embeddings
-
-# Then import manually
-surreal import --endpoint http://localhost:8000 \
-    --namespace larql --database gemma3_4b \
-    --username root --password root \
-    output/surql/embeddings.surql
-```
-
 ### `larql residuals capture` (legacy)
 
 Capture residual stream vectors for entities via forward passes. The residuals are the hidden state at a specific layer — the signal that the next layer's features actually see during inference.
@@ -661,9 +596,9 @@ larql residuals capture <MODEL> --entities <ENTITIES> --output <OUTPUT> [OPTIONS
 | `--activations` | Also capture sparse FFN activations (top-K features per layer) |
 | `--activation-top-k <N>` | Number of top features to record per layer [default: 50] |
 
-**How it works:** Tokenizes each entity, runs a full forward pass through the transformer up to the target layer(s), and saves the last-token hidden state as a vector in NDJSON format. The output is compatible with `vector-load` for SurrealDB ingestion.
+**How it works:** Tokenizes each entity, runs a full forward pass through the transformer up to the target layer(s), and saves the last-token hidden state as a vector in NDJSON format.
 
-**Use case:** Seed SurrealDB with real residuals for a small set of entities (50–100). Then use SurrealDB vector similarity queries against gate vectors to discover factual edges for thousands of entities without additional forward passes.
+**Use case:** Capture real residual vectors for a small set of entities (50–100). These can be used as query vectors for vindex gate KNN lookups to discover factual edges without additional forward passes.
 
 **Examples:**
 
@@ -692,7 +627,7 @@ larql residuals capture google/gemma-3-4b-it \
     -o residuals-capital.vectors.ndjson
 ```
 
-**Output format:** Same NDJSON as `vector-extract`, loadable by `vector-load`:
+**Output format:** Same NDJSON as `vector-extract`:
 
 ```json
 {"_header": true, "component": "residuals", "model": "google/gemma-3-4b-it", "dimension": 2560}

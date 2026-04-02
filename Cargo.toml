@@ -6,7 +6,6 @@ members = [
     "crates/larql-vindex",
     "crates/larql-inference",
     "crates/larql-lql",
-    "crates/larql-surreal",
     "crates/larql-cli",
     "crates/larql-server",
     "crates/larql-python",
@@ -17,7 +16,6 @@ default-members = [
     "crates/larql-vindex",
     "crates/larql-inference",
     "crates/larql-lql",
-    "crates/larql-surreal",
     "crates/larql-cli",
     "crates/larql-server",
 ]

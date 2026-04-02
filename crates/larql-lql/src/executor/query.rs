@@ -697,8 +697,8 @@ impl Session {
 
         for (feat, score) in &hits {
             let tok = index.feature_meta(nc.layer as usize, *feat)
-                .map(|m| m.top_token.as_str())
-                .unwrap_or("-");
+                .map(|m| m.top_token.clone())
+                .unwrap_or_else(|| "-".into());
             out.push(format!(
                 "L{:<7} F{:<7} {:20} {:>10.4}",
                 nc.layer, feat, tok, score

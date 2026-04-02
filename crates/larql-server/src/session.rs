@@ -22,6 +22,7 @@ struct SessionState {
 }
 
 /// Manages per-session PatchedVindex instances.
+#[allow(dead_code)]
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, SessionState>>,
     ttl: Duration,
@@ -35,8 +36,8 @@ impl SessionManager {
         }
     }
 
-    /// Get or create a session's PatchedVindex. Returns a clone for the caller
-    /// to use (the session retains ownership).
+    /// Get or create a session's PatchedVindex.
+    #[allow(dead_code)]
     pub async fn get_or_create(
         &self,
         session_id: &str,
@@ -150,6 +151,7 @@ impl SessionManager {
     }
 
     /// Number of active sessions.
+    #[allow(dead_code)]
     pub async fn session_count(&self) -> usize {
         self.sessions.read().await.len()
     }

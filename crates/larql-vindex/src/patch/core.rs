@@ -360,10 +360,10 @@ impl PatchedVindex {
     }
 
     /// Look up feature metadata, checking overrides first.
-    pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<&FeatureMeta> {
+    pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
         let key = (layer, feature);
         if let Some(override_meta) = self.overrides_meta.get(&key) {
-            return override_meta.as_ref();
+            return override_meta.clone();
         }
         if self.deleted.contains(&key) {
             return None;
@@ -461,26 +461,29 @@ impl PatchedVindex {
             });
             new_gate.push(gate);
 
-            // Clone base metadata
-            let meta = self.base.down_meta_at(layer).map(|metas| {
-                let mut new_metas: Vec<Option<FeatureMeta>> = metas.to_vec();
-                // Apply meta overrides
-                for (&(l, f), override_meta) in &self.overrides_meta {
-                    if l != layer { continue; }
-                    while new_metas.len() <= f {
-                        new_metas.push(None);
-                    }
-                    new_metas[f] = override_meta.clone();
-                }
-                // Apply deletes
-                for &(l, f) in &self.deleted {
-                    if l == layer && f < new_metas.len() {
-                        new_metas[f] = None;
-                    }
-                }
-                new_metas
-            });
-            new_meta.push(meta);
+            // Build metadata from heap or mmap
+            let num_features = self.base.num_features(layer);
+            let mut new_metas: Vec<Option<FeatureMeta>> = if let Some(heap) = self.base.down_meta_at(layer) {
+                heap.to_vec()
+            } else if num_features > 0 {
+                // Mmap: read each feature on demand
+                (0..num_features).map(|f| self.base.feature_meta(layer, f)).collect()
+            } else {
+                Vec::new()
+            };
+
+            // Apply meta overrides
+            for (&(l, f), override_meta) in &self.overrides_meta {
+                if l != layer { continue; }
+                while new_metas.len() <= f { new_metas.push(None); }
+                new_metas[f] = override_meta.clone();
+            }
+            // Apply deletes
+            for &(l, f) in &self.deleted {
+                if l == layer && f < new_metas.len() { new_metas[f] = None; }
+            }
+
+            new_meta.push(if new_metas.is_empty() { None } else { Some(new_metas) });
         }
 
         VectorIndex::new(new_gate, new_meta, self.base.num_layers, self.base.hidden_size)

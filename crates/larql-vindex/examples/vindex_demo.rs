@@ -39,7 +39,7 @@ fn main() {
     let q = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
     println!("  Query [1,0,0,0]:");
     for (feat, score) in index.gate_knn(0, &q, 3) {
-        let tok = index.feature_meta(0, feat).map(|m| m.top_token.as_str()).unwrap_or("-");
+        let tok = index.feature_meta(0, feat).map(|m| m.top_token.clone()).unwrap_or_else(|| "-".into());
         println!("    F{}: {} ({:.1})", feat, tok, score);
     }
 
@@ -62,7 +62,7 @@ fn main() {
         println!("  {}:", label);
         for (f, s) in moe_index.gate_knn(0, &Array1::from_vec(q.clone()), 2) {
             let e = if f < 3 { 0 } else { 1 };
-            let tok = moe_index.feature_meta(0, f).map(|m| m.top_token.as_str()).unwrap_or("-");
+            let tok = moe_index.feature_meta(0, f).map(|m| m.top_token.clone()).unwrap_or_else(|| "-".into());
             println!("    E{}:F{} → {} ({:.1})", e, f % 3, tok, s);
         }
     }
@@ -249,15 +249,15 @@ fn main() {
     // Apply
     patched.apply_patch(loaded_patch);
     println!("  Applied: {} patches, {} overrides", patched.num_patches(), patched.num_overrides());
-    println!("    F0 = {}", patched.feature_meta(0, 0).map(|m| m.top_token.as_str()).unwrap_or("(none)"));
-    println!("    F2 = {}", patched.feature_meta(0, 2).map(|m| m.top_token.as_str()).unwrap_or("(none)"));
-    println!("    F4 = {}", patched.feature_meta(0, 4).map(|m| m.top_token.as_str()).unwrap_or("(none)"));
+    println!("    F0 = {}", patched.feature_meta(0, 0).map(|m| m.top_token.clone()).unwrap_or_else(|| "(none)".into()));
+    println!("    F2 = {}", patched.feature_meta(0, 2).map(|m| m.top_token.clone()).unwrap_or_else(|| "(none)".into()));
+    println!("    F4 = {}", patched.feature_meta(0, 4).map(|m| m.top_token.clone()).unwrap_or_else(|| "(none)".into()));
 
     // KNN with patch
     let pq = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
     let phits = patched.gate_knn(0, &pq, 1);
     println!("  KNN [0,0,0,1] → F{}: {}",
-        phits[0].0, patched.feature_meta(0, phits[0].0).map(|m| m.top_token.as_str()).unwrap_or("?"));
+        phits[0].0, patched.feature_meta(0, phits[0].0).map(|m| m.top_token.clone()).unwrap_or_else(|| "?".into()));
 
     // Bake down
     let baked = patched.bake_down();
@@ -266,7 +266,7 @@ fn main() {
     // Revert
     patched.remove_patch(0);
     println!("  Reverted: F2 = {} (restored)",
-        patched.feature_meta(0, 2).map(|m| m.top_token.as_str()).unwrap_or("(none)"));
+        patched.feature_meta(0, 2).map(|m| m.top_token.clone()).unwrap_or_else(|| "(none)".into()));
 
     let _ = std::fs::remove_dir_all(&dir_p);
 

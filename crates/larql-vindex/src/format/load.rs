@@ -7,11 +7,8 @@ use std::path::Path;
 use ndarray::Array2;
 
 use crate::error::VindexError;
-
-use larql_models::TopKEntry;
-
-use crate::config::{DownMetaRecord, VindexConfig};
-use crate::index::{FeatureMeta, IndexLoadCallbacks, VectorIndex};
+use crate::config::VindexConfig;
+use crate::index::{IndexLoadCallbacks, VectorIndex};
 
 impl VectorIndex {
     /// Load a VectorIndex from a .vindex directory.
@@ -61,17 +58,19 @@ impl VectorIndex {
             start.elapsed().as_secs_f64() * 1000.0,
         );
 
-        // Load down metadata — prefer binary, fall back to JSONL
+        // Load down metadata — mmap binary (zero heap), fall back to JSONL (legacy)
         let start = std::time::Instant::now();
-        // Try binary first (fast), fall back to JSONL (compatible)
-        let binary_result = if crate::format::down_meta::has_binary(dir) {
+
+        let down_meta_mmap = if crate::format::down_meta::has_binary(dir) {
             match load_vindex_tokenizer(dir) {
                 Ok(tokenizer) => {
                     callbacks.on_file_start("down_meta", &dir.join("down_meta.bin").display().to_string());
-                    match crate::format::down_meta::read_binary(dir, &tokenizer) {
-                        Ok((dm, count)) => {
+                    let tok = std::sync::Arc::new(tokenizer);
+                    match crate::format::down_meta::mmap_binary(dir, tok) {
+                        Ok(dm) => {
+                            let count = dm.total_features();
                             callbacks.on_file_done("down_meta", count, start.elapsed().as_secs_f64() * 1000.0);
-                            Some((dm, count))
+                            Some(dm)
                         }
                         Err(_) => None,
                     }
@@ -82,69 +81,7 @@ impl VectorIndex {
             None
         };
 
-        let (down_meta, down_count) = if let Some(result) = binary_result {
-            result
-        } else {
-            callbacks.on_file_start("down_meta", &dir.join("down_meta.jsonl").display().to_string());
-            let down_path = dir.join("down_meta.jsonl");
-            let down_file = std::fs::File::open(&down_path)?;
-            let reader = BufReader::with_capacity(1 << 20, down_file);
-
-            let mut dm: Vec<Option<Vec<Option<FeatureMeta>>>> = vec![None; num_layers];
-            let mut count = 0;
-
-            for line in reader.lines() {
-                let line = line?;
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-
-                let record: DownMetaRecord = serde_json::from_str(line)
-                    .map_err(|e| VindexError::Parse(e.to_string()))?;
-
-                let layer = record.layer;
-                let feature = record.feature;
-
-                let meta = FeatureMeta {
-                    top_token: record.top_token,
-                    top_token_id: record.top_token_id,
-                    c_score: record.c_score,
-                    top_k: record
-                        .top_k
-                        .into_iter()
-                        .map(|e| TopKEntry {
-                            token: e.token,
-                            token_id: e.token_id,
-                            logit: e.logit,
-                        })
-                        .collect(),
-                };
-
-                if layer < num_layers {
-                    if dm[layer].is_none() {
-                        dm[layer] = Some(Vec::new());
-                    }
-                    if let Some(ref mut metas) = dm[layer] {
-                        while metas.len() <= feature {
-                            metas.push(None);
-                        }
-                        metas[feature] = Some(meta);
-                    }
-                }
-
-                count += 1;
-                if count % 10000 == 0 {
-                    callbacks.on_progress(count);
-                }
-            }
-
-            callbacks.on_file_done("down_meta", count, start.elapsed().as_secs_f64() * 1000.0);
-            (dm, count)
-        };
-        let _ = down_count; // used in callbacks above
-
-        Ok(VectorIndex::new_mmap(gate_mmap, gate_slices, config.dtype, down_meta, num_layers, hidden_size))
+        Ok(VectorIndex::new_mmap(gate_mmap, gate_slices, config.dtype, down_meta_mmap, num_layers, hidden_size))
     }
 }
 

@@ -6,7 +6,6 @@ mod utils;
 
 use commands::extraction::*;
 use commands::query::*;
-use commands::surreal::*;
 
 #[derive(Parser)]
 #[command(
@@ -120,19 +119,6 @@ enum Commands {
 
     /// BFS extraction from a model endpoint.
     Bfs(bfs_cmd::BfsArgs),
-
-    // ── SurrealDB ──
-    /// Load vectors into SurrealDB with HNSW indexes (small tables, HTTP).
-    VectorLoad(vector_load_cmd::VectorLoadArgs),
-
-    /// Import vectors into SurrealDB via batched `surreal import` (large tables).
-    VectorImport(vector_import_cmd::VectorImportArgs),
-
-    /// Export vectors to .surql files for manual import.
-    VectorExportSurql(vector_export_surql_cmd::VectorExportSurqlArgs),
-
-    /// Load OV→gate coupling edges into SurrealDB for circuit discovery.
-    CouplingLoad(coupling_load_cmd::CouplingLoadArgs),
 
     // ── Query ──
     /// Query a graph for facts.
@@ -268,11 +254,6 @@ fn main() {
         Commands::BottleneckTest(args) => bottleneck_test_cmd::run(args),
         Commands::EmbeddingJump(args) => embedding_jump_cmd::run(args),
         Commands::Bfs(args) => bfs_cmd::run(args),
-        // SurrealDB
-        Commands::VectorLoad(args) => vector_load_cmd::run(args),
-        Commands::VectorImport(args) => vector_import_cmd::run(args),
-        Commands::VectorExportSurql(args) => vector_export_surql_cmd::run(args),
-        Commands::CouplingLoad(args) => coupling_load_cmd::run(args),
         // Query
         Commands::Query(args) => query_cmd::run(args),
         Commands::Describe(args) => describe_cmd::run(args),

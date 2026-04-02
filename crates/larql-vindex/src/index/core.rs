@@ -51,6 +51,72 @@ pub struct GateLayerSlice {
     pub num_features: usize,
 }
 
+/// Mmap'd down_meta.bin — reads individual feature records on demand.
+/// Zero heap allocation for millions of features.
+#[derive(Clone)]
+pub struct DownMetaMmap {
+    pub(crate) mmap: Arc<memmap2::Mmap>,
+    /// Byte offset where each layer's records start.
+    pub(crate) layer_offsets: Vec<usize>,
+    /// Number of features per layer.
+    pub(crate) layer_num_features: Vec<usize>,
+    /// Number of top-K entries per feature record.
+    pub(crate) top_k_count: usize,
+    /// Tokenizer for resolving token IDs to strings.
+    pub(crate) tokenizer: Arc<tokenizers::Tokenizer>,
+}
+
+impl DownMetaMmap {
+    /// Bytes per feature record.
+    fn record_size(&self) -> usize {
+        8 + self.top_k_count * 8 // top_token_id(4) + c_score(4) + top_k*(token_id(4) + logit(4))
+    }
+
+    /// Read a single feature's metadata on demand from the mmap.
+    pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
+        if layer >= self.layer_offsets.len() { return None; }
+        let num_features = self.layer_num_features[layer];
+        if num_features == 0 || feature >= num_features { return None; }
+
+        let offset = self.layer_offsets[layer] + feature * self.record_size();
+        let rec_size = self.record_size();
+        if offset + rec_size > self.mmap.len() { return None; }
+
+        let b = &self.mmap[offset..offset + rec_size];
+        let top_token_id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let c_score = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+
+        if top_token_id == 0 && c_score == 0.0 { return None; }
+
+        let mut top_k = Vec::new();
+        for i in 0..self.top_k_count {
+            let o = 8 + i * 8;
+            let tid = u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
+            let logit = f32::from_le_bytes([b[o+4], b[o+5], b[o+6], b[o+7]]);
+            if tid > 0 || logit != 0.0 {
+                let token = self.tokenizer.decode(&[tid], true)
+                    .unwrap_or_else(|_| format!("T{tid}")).trim().to_string();
+                top_k.push(larql_models::TopKEntry { token, token_id: tid, logit });
+            }
+        }
+
+        let top_token = self.tokenizer.decode(&[top_token_id], true)
+            .unwrap_or_else(|_| format!("T{top_token_id}")).trim().to_string();
+
+        Some(FeatureMeta { top_token, top_token_id, c_score, top_k })
+    }
+
+    /// Number of features at a layer.
+    pub fn num_features(&self, layer: usize) -> usize {
+        self.layer_num_features.get(layer).copied().unwrap_or(0)
+    }
+
+    /// Total features across all layers.
+    pub fn total_features(&self) -> usize {
+        self.layer_num_features.iter().sum()
+    }
+}
+
 /// The full model as a local vector index.
 ///
 /// Gate vectors for KNN matching + down token metadata for output lookup.
@@ -77,7 +143,12 @@ pub struct VectorIndex {
 
     /// Per-layer, per-feature output token metadata from down projections.
     /// down_meta[layer][feature] = FeatureMeta with top tokens.
+    /// Heap mode: populated during builds or when loaded from JSONL.
     pub(crate) down_meta: Vec<Option<Vec<Option<FeatureMeta>>>>,
+
+    /// Mmap'd down_meta.bin bytes (zero-copy mode).
+    /// When set, feature_meta() reads records on demand from the mmap.
+    pub(crate) down_meta_mmap: Option<Arc<DownMetaMmap>>,
 
     /// Number of layers in the model.
     pub num_layers: usize,
@@ -100,19 +171,19 @@ impl VectorIndex {
             gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
             gate_mmap_slices: Vec::new(),
             down_meta,
+            down_meta_mmap: None,
             num_layers,
             hidden_size,
         }
     }
 
-    /// Create a VectorIndex with zero-copy mmap'd gate vectors.
-    /// For f32: bytes reinterpreted directly as &[f32] — zero heap allocation.
-    /// For f16: decoded per-layer on demand during gate_knn.
+    /// Create a VectorIndex with zero-copy mmap'd gate vectors and down_meta.
+    /// No heap allocation — everything read on demand from mmap'd files.
     pub fn new_mmap(
         gate_mmap: memmap2::Mmap,
         gate_slices: Vec<GateLayerSlice>,
         dtype: crate::config::dtype::StorageDtype,
-        down_meta: Vec<Option<Vec<Option<FeatureMeta>>>>,
+        down_meta_mmap: Option<DownMetaMmap>,
         num_layers: usize,
         hidden_size: usize,
     ) -> Self {
@@ -121,7 +192,8 @@ impl VectorIndex {
             gate_mmap_bytes: Some(Arc::new(gate_mmap)),
             gate_mmap_dtype: dtype,
             gate_mmap_slices: gate_slices,
-            down_meta,
+            down_meta: vec![None; num_layers],
+            down_meta_mmap: down_meta_mmap.map(Arc::new),
             num_layers,
             hidden_size,
         }
@@ -273,6 +345,7 @@ impl VectorIndex {
             gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
             gate_mmap_slices: Vec::new(),
             down_meta: gate_meta,
+            down_meta_mmap: None,
             num_layers,
             hidden_size,
         })
@@ -450,13 +523,7 @@ impl VectorIndex {
             let walk_hits: Vec<WalkHit> = hits
                 .into_iter()
                 .filter_map(|(feature, gate_score)| {
-                    let meta = self
-                        .down_meta
-                        .get(layer)
-                        .and_then(|v| v.as_ref())
-                        .and_then(|metas| metas.get(feature))
-                        .and_then(|m| m.as_ref())
-                        .cloned()?;
+                    let meta = self.feature_meta(layer, feature)?;
                     Some(WalkHit {
                         layer,
                         feature,
@@ -474,12 +541,19 @@ impl VectorIndex {
     }
 
     /// Look up metadata for a specific feature.
-    pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<&FeatureMeta> {
+    /// Mmap mode: reads on demand from mmap'd down_meta.bin (zero heap).
+    /// Heap mode: reads from in-memory Vec (builds, tests).
+    pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
+        // Mmap path (production — zero heap)
+        if let Some(ref dm) = self.down_meta_mmap {
+            return dm.feature_meta(layer, feature);
+        }
+        // Heap path (builds, tests)
         self.down_meta
             .get(layer)
             .and_then(|v| v.as_ref())
             .and_then(|metas| metas.get(feature))
-            .and_then(|m| m.as_ref())
+            .and_then(|m| m.clone())
     }
 
     /// Number of features indexed at a layer.
@@ -511,6 +585,9 @@ impl VectorIndex {
 
     /// Total down metadata entries loaded across all layers.
     pub fn total_down_meta(&self) -> usize {
+        if let Some(ref dm) = self.down_meta_mmap {
+            return dm.total_features();
+        }
         self.down_meta
             .iter()
             .filter_map(|v| v.as_ref())

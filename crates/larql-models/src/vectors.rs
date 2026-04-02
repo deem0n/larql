@@ -1,7 +1,7 @@
 //! Shared NDJSON vector record types.
 //!
 //! These types are the interchange format between extraction (inference)
-//! and loading (surreal). Defined here so both crates can use them
+//! and loading. Defined here so multiple crates can use them
 //! without depending on each other.
 
 /// Component name constants — strings, not enums.

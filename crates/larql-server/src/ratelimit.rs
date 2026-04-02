@@ -70,7 +70,8 @@ impl RateLimiter {
         }
     }
 
-    /// Evict stale entries (call periodically).
+    /// Evict stale entries (call periodically from a background task).
+    #[allow(dead_code)]
     pub fn evict_stale(&self) {
         if let Ok(mut buckets) = self.buckets.lock() {
             let now = Instant::now();

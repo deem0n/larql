@@ -172,6 +172,56 @@ pub fn has_binary(dir: &Path) -> bool {
     dir.join("down_meta.bin").exists()
 }
 
+/// Mmap down_meta.bin and build a lazy reader (zero heap for feature data).
+/// Only parses the header + per-layer feature counts to build the offset table.
+pub fn mmap_binary(
+    dir: &Path,
+    tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
+) -> Result<crate::index::core::DownMetaMmap, VindexError> {
+    let path = dir.join("down_meta.bin");
+    let file = std::fs::File::open(&path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+    if mmap.len() < 16 {
+        return Err(VindexError::Parse("down_meta.bin too small".into()));
+    }
+
+    // Read header
+    let magic = u32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
+    if magic != MAGIC {
+        return Err(VindexError::Parse(format!(
+            "invalid down_meta.bin magic: 0x{magic:08X}"
+        )));
+    }
+    let _version = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]);
+    let num_layers = u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
+    let top_k_count = u32::from_le_bytes([mmap[12], mmap[13], mmap[14], mmap[15]]) as usize;
+
+    let record_size = 8 + top_k_count * 8; // top_token_id(4) + c_score(4) + top_k*(tid(4)+logit(4))
+
+    // Build offset table by scanning per-layer num_features headers
+    let mut layer_offsets = Vec::with_capacity(num_layers);
+    let mut layer_num_features = Vec::with_capacity(num_layers);
+    let mut pos = 16usize; // after header
+
+    for _ in 0..num_layers {
+        if pos + 4 > mmap.len() { break; }
+        let nf = u32::from_le_bytes([mmap[pos], mmap[pos+1], mmap[pos+2], mmap[pos+3]]) as usize;
+        pos += 4; // skip num_features u32
+        layer_offsets.push(pos); // records start here
+        layer_num_features.push(nf);
+        pos += nf * record_size; // skip all records
+    }
+
+    Ok(crate::index::core::DownMetaMmap {
+        mmap: std::sync::Arc::new(mmap),
+        layer_offsets,
+        layer_num_features,
+        top_k_count,
+        tokenizer,
+    })
+}
+
 fn read_u32<R: Read>(r: &mut R) -> Result<u32, VindexError> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;

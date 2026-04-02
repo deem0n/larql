@@ -79,25 +79,26 @@ Add `--f16` to halve file sizes with negligible accuracy loss.
 
 ## Architecture
 
-Seven crates. Clean dependency chain.
+Eight crates. Clean dependency chain.
 
 ```
-larql-models      Model config, architecture traits, ModelWeights
+larql-models      Model config, architecture traits, weight loading, quant/dequant
     ↓
-larql-vindex      Complete vindex lifecycle: extract, load, query, mutate, patch, save
+larql-vindex      Vindex lifecycle: extract, load, query, mutate, patch, save
     ↓
 larql-core        Graph algorithms, merge, diff
 larql-inference   Forward pass, attention, WalkFfn (uses vindex KNN)
     ↓
-larql-lql         LQL parser, executor, REPL
+larql-lql         LQL parser, executor, REPL, USE REMOTE client
     ↓
-larql-cli         CLI commands
+larql-server      HTTP/gRPC server: serve vindexes over the network
+larql-cli         CLI commands (extract-index, build, serve, repl, convert, hf, verify)
 ```
 
 ### larql-vindex
 
-Owns the complete vindex lifecycle. Extract from safetensors, KNN via BLAS matmul,
-load/save with split weight files, mutate, patch overlay, clustering, f16 storage.
+Owns the vindex lifecycle. Streaming extraction (mmap, no full model load), KNN via BLAS matmul,
+zero-copy mmap loading, split weight files, readonly base with patch overlay, clustering, f16 storage.
 
 ```rust
 // Load (readonly base)
@@ -247,9 +248,9 @@ MoE models store all experts' features in one flat index. Gate KNN naturally sel
 | Doc | Description |
 |---|---|
 | [docs/lql-spec.md](docs/lql-spec.md) | LQL language specification (v0.3) |
-| [docs/vindex-format-spec.md](docs/vindex-format-spec.md) | Vindex file format specification (v0.3, ~95% implemented) |
+| [docs/vindex-format-spec.md](docs/vindex-format-spec.md) | Vindex file format specification (v0.3, ~98% implemented) |
 | [docs/vindex-operations-spec.md](docs/vindex-operations-spec.md) | Vindex operations, API, patches (~98% implemented) |
-| [docs/vindex-ecosystem-spec.md](docs/vindex-ecosystem-spec.md) | Distributed hosting, HuggingFace, Vindexfile (vision) |
+| [docs/vindex-ecosystem-spec.md](docs/vindex-ecosystem-spec.md) | Distributed hosting, HuggingFace, Vindexfile (~85% implemented) |
 | [docs/lql-guide.md](docs/lql-guide.md) | LQL quick start guide |
 | [docs/cli.md](docs/cli.md) | CLI reference |
 | [docs/knowledge-pipeline.md](docs/knowledge-pipeline.md) | Knowledge labelling pipeline |

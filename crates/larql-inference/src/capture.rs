@@ -1,7 +1,7 @@
 //! Capture residual stream vectors and sparse activations for entities.
 //!
 //! High-level API: load a model, tokenize entities, run forward passes,
-//! write NDJSON output files compatible with vector-load/SurrealDB.
+//! write NDJSON output files compatible with vector-load and vindex builds.
 
 use std::io::{BufWriter, Write};
 use std::path::Path;

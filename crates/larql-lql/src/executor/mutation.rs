@@ -250,7 +250,7 @@ impl Session {
             }
 
             for &(layer, feature) in &matches {
-                if let Some(meta) = patched.feature_meta(layer, feature).cloned() {
+                if let Some(meta) = patched.feature_meta(layer, feature) {
                     let mut new_meta = meta;
                     for assignment in set {
                         match assignment.field.as_str() {

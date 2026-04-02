@@ -176,7 +176,7 @@ impl Session {
             }
             Statement::Delete { conditions } => self.remote_delete(conditions),
             Statement::Update { set, conditions } => self.remote_update(set, conditions),
-            Statement::Select { fields, conditions, nearest, order, limit } => {
+            Statement::Select { fields: _, conditions, nearest: _, order: _, limit } => {
                 self.remote_select(conditions, *limit)
             }
             Statement::ApplyPatch { path } => self.remote_apply_local_patch(path),

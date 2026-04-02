@@ -570,15 +570,6 @@ Error: INSERT requires a vindex. Run:
   USE "gemma3-4b.vindex";
 ```
 
-### 4.4 SurrealDB as Future Third Backend (Workshop)
-
-For vector-level queries (KNN across all features, cross-model comparison, attention→FFN routing discovery), SurrealDB is the workshop backend. Not in V1, but the trait accommodates it:
-
-```sql
-USE SURREAL "localhost:8000" NS larql DB gemma3_4b;
-SELECT * FROM EDGES NEAREST TO "Mozart" AT LAYER 26 LIMIT 20;
-```
-
 ---
 
 ## 5. Label Architecture
@@ -1005,8 +996,9 @@ pub enum ExtractLevel {
 | Split weight files | ✅ Done — attn, up, down, norms, lm_head (no gate duplication) |
 | f16 storage | ✅ Done — `--f16` flag, halves file sizes |
 | Vindexfile | ✅ Done — declarative builds (FROM + PATCH + INSERT), `larql build` CLI |
-| WeightBackend (USE MODEL) | 🔴 Planned — direct safetensors access |
-| USE REMOTE | 🔴 Planned — remote vindex via HTTP |
+| USE REMOTE | ✅ Done — HTTP client to larql-server, all queries forwarded, local patch overlay |
+| `larql serve` | ✅ Done — HTTP/gRPC server, all endpoints, multi-model, per-session patches |
+| WeightBackend (USE MODEL) | 🔴 Planned — direct safetensors access without vindex extraction |
 | GGUF output format | 🔴 Planned — COMPILE INTO MODEL FORMAT gguf |
 
 ### 8.5 INSERT Semantics — How Edge Becomes Vector
@@ -1253,7 +1245,6 @@ The layer-level byte offsets in gate_vectors.bin enable this — each layer can 
 - **LIFT** — analogy operation (same edge, different node). Proven but needs model.
 - **GRAPH ALGORITHMS** — PageRank, community detection, shortest path across the knowledge graph.
 - **INGEST** — document → context graph extraction (Mode 5, the Apollo demo).
-- **SurrealDB backend** — third backend for vector-level KNN queries via HNSW indexes.
 - **Training from graph** — compile an edited knowledge graph back to weights, bypassing gradient descent entirely.
 
 ### 11.7 Attention Template Cache (Research, Not Yet Proven at Scale)

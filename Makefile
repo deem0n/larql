@@ -39,13 +39,12 @@ demos:
 	cargo run --release -p larql-core --example edge_demo
 	cargo run --release -p larql-core --example serialization_demo
 	cargo run --release -p larql-core --example algorithm_demo
-	cargo run --release -p larql-surreal --example sql_demo
 
 demos-inference:
 	cargo run --release -p larql-inference --example inference_demo
 
 # Benchmarks
-bench: bench-core bench-surreal
+bench: bench-core
 
 bench-core:
 	cargo run --release -p larql-core --example bench_graph
@@ -53,10 +52,7 @@ bench-core:
 bench-inference:
 	cargo run --release -p larql-inference --example bench_inference
 
-bench-surreal:
-	cargo run --release -p larql-surreal --example bench_sql
-
-bench-all: bench-core bench-surreal bench-inference
+bench-all: bench-core bench-inference
 
 # Python extension (requires virtualenv)
 python-build:
