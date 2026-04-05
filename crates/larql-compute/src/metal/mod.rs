@@ -40,10 +40,14 @@ pub struct MetalBackend {
     f32_ops: F32Ops,
     q4: Q4Pipelines,
     causal_attn_pipeline: ComputePipelineState,
+    pub fused_attn_pipeline: ComputePipelineState,
     geglu_pipeline: ComputePipelineState,
     q8_quant_pipeline: ComputePipelineState,
     pub kv_attend_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
+    q8_matvec_pipeline: ComputePipelineState,
+    rms_norm_pipeline: ComputePipelineState,
+    residual_add_pipeline: ComputePipelineState,
     flop_threshold: AtomicUsize,
 }
 
@@ -88,6 +92,20 @@ impl MetalBackend {
         let geglu_pipeline = device.new_compute_pipeline_state_with_function(&geglu_fn).ok()?;
         let q8_quant_pipeline = device.new_compute_pipeline_state_with_function(&q8_quant_fn).ok()?;
 
+        // Q8 matvec for attention projections
+        let q8_matvec_fn = library.get_function("q8_matvec", None).ok()?;
+        let q8_matvec_pipeline = device.new_compute_pipeline_state_with_function(&q8_matvec_fn).ok()?;
+
+        // Norm and residual ops
+        let rms_norm_fn = library.get_function("rms_norm", None).ok()?;
+        let residual_add_fn = library.get_function("residual_add", None).ok()?;
+        let rms_norm_pipeline = device.new_compute_pipeline_state_with_function(&rms_norm_fn).ok()?;
+        let residual_add_pipeline = device.new_compute_pipeline_state_with_function(&residual_add_fn).ok()?;
+
+        // Fused attention (RoPE + GQA + softcap)
+        let fused_attn_fn = library.get_function("fused_attention", None).ok()?;
+        let fused_attn_pipeline = device.new_compute_pipeline_state_with_function(&fused_attn_fn).ok()?;
+
         // KV cache attention
         let kv_attend_fn = library.get_function("kv_attention", None).ok()?;
         let kv_append_fn = library.get_function("kv_cache_append", None).ok()?;
@@ -95,9 +113,11 @@ impl MetalBackend {
         let kv_append_pipeline = device.new_compute_pipeline_state_with_function(&kv_append_fn).ok()?;
 
         Some(Self {
-            queue, bufs, f32_ops, q4, causal_attn_pipeline,
+            queue, bufs, f32_ops, q4, causal_attn_pipeline, fused_attn_pipeline,
             geglu_pipeline, q8_quant_pipeline,
             kv_attend_pipeline, kv_append_pipeline,
+            q8_matvec_pipeline,
+            rms_norm_pipeline, residual_add_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),
         })
     }
@@ -163,7 +183,7 @@ impl MetalBackend {
     /// All on GPU, no CPU return between layers.
     pub fn multi_layer_q4_ffn(
         &self,
-        layers_q4: &[(Vec<u8>, Vec<u8>, Vec<u8>)], // [(gate, up, down_t)]
+        layers_q4: &[(&[u8], &[u8], &[u8])], // [(gate, up, down_t)]
         x: &[f32],
         inter: usize,
         hidden: usize,
@@ -177,6 +197,7 @@ impl MetalBackend {
 
     /// Full pipeline: attention + FFN for all layers in ONE command buffer.
     /// No CPU-GPU round-trips between layers.
+    /// This is the old benchmark entry point — uses dummy norms (no residual correctness).
     pub fn full_pipeline(
         &self,
         layers: &[ops::full_pipeline::LayerWeights],
@@ -184,10 +205,31 @@ impl MetalBackend {
         hidden: usize, inter: usize,
         q_dim: usize, kv_dim: usize,
     ) -> Vec<f32> {
+        // Convert old LayerWeights to new FullPipelineLayer with dummy norms
+        let dummy_norm = vec![1.0f32; hidden];
+        // Convert old LayerWeights (Q4 attention) to new FullPipelineLayer (Q8 attention)
+        // For backward compat: treat Q4 data as Q8 (wrong but benchmark-only path)
+        let dummy_scales = vec![1.0f32; hidden * hidden / 32]; // oversized, safe
+        let full_layers: Vec<crate::FullPipelineLayer> = layers.iter().map(|l| {
+            crate::FullPipelineLayer {
+                wq_q8: l.wq_q4, wq_scales: &dummy_scales,
+                wk_q8: l.wk_q4, wk_scales: &dummy_scales,
+                wv_q8: l.wv_q4, wv_scales: &dummy_scales,
+                wo_q8: l.wo_q4, wo_scales: &dummy_scales,
+                gate_q4: l.gate_q4, up_q4: l.up_q4, down_t_q4: l.down_t_q4,
+                input_norm: &dummy_norm, post_attn_norm: &dummy_norm,
+                pre_ffn_norm: None, post_ffn_norm: None,
+                norm_offset: 0.0, has_post_norms: false,
+            }
+        }).collect();
         ops::full_pipeline::dispatch_full_pipeline(
             &self.queue, &self.bufs, &self.q4,
             &self.geglu_pipeline, &self.q8_quant_pipeline,
-            layers, x, hidden, inter, q_dim, kv_dim,
+            None,
+            &self.q8_matvec_pipeline,
+            &self.rms_norm_pipeline, &self.residual_add_pipeline,
+            &full_layers, x, hidden, inter, q_dim, kv_dim,
+            1, 0, 0, 0, 0.0, false, 0.0,
         )
     }
 
@@ -241,6 +283,38 @@ impl ComputeBackend for MetalBackend {
         num_rows: usize, hidden: usize,
     ) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
         Some(self.q4_matvec_pair_batch_direct(gate_q4, up_q4, x_matrix, seq_len, num_rows, hidden))
+    }
+
+    fn full_pipeline_q4(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize, inter: usize,
+        q_dim: usize, kv_dim: usize,
+        seq_len: usize,
+        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        rope_base: f32, use_qk_norm: bool, softcap: f32,
+    ) -> Option<Vec<f32>> {
+        Some(ops::full_pipeline::dispatch_full_pipeline(
+            &self.queue, &self.bufs, &self.q4,
+            &self.geglu_pipeline, &self.q8_quant_pipeline,
+            Some(&self.fused_attn_pipeline),
+            &self.q8_matvec_pipeline,
+            &self.rms_norm_pipeline, &self.residual_add_pipeline,
+            layers, x, hidden, inter, q_dim, kv_dim,
+            seq_len, num_q_heads, num_kv_heads, head_dim,
+            rope_base, use_qk_norm, softcap,
+        ))
+    }
+
+    fn multi_layer_q4_ffn(
+        &self,
+        layers_q4: &[(&[u8], &[u8], &[u8])],
+        x: &[f32],
+        inter: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        Some(self.multi_layer_q4_ffn(layers_q4, x, inter, hidden))
     }
 
     fn has_q4(&self) -> bool { true }

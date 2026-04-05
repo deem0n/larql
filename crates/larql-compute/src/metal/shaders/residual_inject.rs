@@ -30,13 +30,15 @@ kernel void residual_add(
     out[tid] = a[tid] + b[tid];
 }
 
-// RMS norm: out = x * weight / sqrt(mean(x²) + eps)
+// RMS norm: out = x * (weight + offset) / sqrt(mean(x²) + eps)
+// offset=0 for standard models, offset=1 for Gemma (norm_weight_offset)
 kernel void rms_norm(
     device const float* x      [[buffer(0)]],
     device const float* weight [[buffer(1)]],
     device float*       out    [[buffer(2)]],
     constant uint&      len    [[buffer(3)]],
     constant float&     eps    [[buffer(4)]],
+    constant float&     offset [[buffer(5)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= len) return;
@@ -47,6 +49,6 @@ kernel void rms_norm(
         sum_sq += x[i] * x[i];
     }
     float rms = 1.0f / sqrt(sum_sq / float(len) + eps);
-    out[tid] = x[tid] * weight[tid] * rms;
+    out[tid] = x[tid] * (weight[tid] + offset) * rms;
 }
 "#;

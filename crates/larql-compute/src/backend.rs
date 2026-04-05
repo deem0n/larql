@@ -67,6 +67,33 @@ pub trait ComputeBackend: Send + Sync {
         _num_rows: usize, _hidden: usize,
     ) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> { None }
 
+    /// Full pipeline: ALL Q4 (attention + FFN) in one command buffer for all layers.
+    /// Each layer: Q4 Q/K/V proj → fused attention (RoPE+GQA+softcap) → Q4 O proj → Q4 FFN.
+    /// No CPU-GPU round-trips between layers.
+    #[allow(clippy::too_many_arguments)]
+    fn full_pipeline_q4(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize, _inter: usize,
+        _q_dim: usize, _kv_dim: usize,
+        _seq_len: usize,
+        _num_q_heads: usize, _num_kv_heads: usize, _head_dim: usize,
+        _rope_base: f32, _use_qk_norm: bool, _softcap: f32,
+    ) -> Option<Vec<f32>> { None }
+
+    /// Multi-layer Q4 FFN in one submission: gate → up → GEGLU → down, chained.
+    /// All layers processed in one command buffer — no CPU-GPU round-trips.
+    /// Input: per-layer (gate_q4, up_q4, down_t_q4), initial residual x.
+    /// Returns: final residual after all FFN layers.
+    fn multi_layer_q4_ffn(
+        &self,
+        _layers_q4: &[(&[u8], &[u8], &[u8])],
+        _x: &[f32],
+        _inter: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> { None }
+
     /// Whether this backend supports Q4 fused operations.
     fn has_q4(&self) -> bool { false }
 

@@ -327,6 +327,136 @@ impl VectorIndex {
         Some(&mmap[slice.byte_offset..end])
     }
 
+    /// Load Q8 attention weights + manifest for GPU full pipeline.
+    pub fn load_attn_q8(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+        let path = dir.join("attn_weights_q8.bin");
+        if !path.exists() {
+            return Err(VindexError::Parse("attn_weights_q8.bin not found".into()));
+        }
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { mmap_optimized(&file)? };
+        self.attn_q8_mmap = Some(Arc::new(mmap));
+
+        let manifest_path = dir.join("attn_weights_q8_manifest.json");
+        if manifest_path.exists() {
+            let json: Vec<serde_json::Value> = serde_json::from_str(
+                &std::fs::read_to_string(&manifest_path)
+                    .map_err(|e| VindexError::Parse(e.to_string()))?
+            ).map_err(|e| VindexError::Parse(e.to_string()))?;
+
+            let entries: Vec<(usize, usize, usize)> = json.iter()
+                .map(|e| {
+                    let offset = e["q8_offset"].as_u64().unwrap_or(0) as usize;
+                    let vals_len = e["q8_vals_len"].as_u64().unwrap_or(0) as usize;
+                    let scales_len = e["q8_scales_len"].as_u64().unwrap_or(0) as usize;
+                    (offset, vals_len, scales_len)
+                })
+                .collect();
+            self.attn_q8_manifest = Some(entries);
+        }
+        Ok(())
+    }
+
+    /// Get per-layer Q8 attention slices: (q_vals, q_scales, k_vals, k_scales, v_vals, v_scales, o_vals, o_scales)
+    pub fn attn_q8_layer_data(&self, layer: usize) -> Option<[(&[u8], &[f32]); 4]> {
+        let mmap = self.attn_q8_mmap.as_ref()?;
+        let manifest = self.attn_q8_manifest.as_ref()?;
+
+        let base = layer * 4;
+        if base + 3 >= manifest.len() { return None; }
+
+        let mut result = [(&[] as &[u8], &[] as &[f32]); 4];
+        for i in 0..4 {
+            let (offset, vals_len, scales_len) = manifest[base + i];
+            let vals = &mmap[offset..offset + vals_len];
+            let scales_start = offset + vals_len;
+            let scales_data = &mmap[scales_start..scales_start + scales_len];
+            let scales = unsafe {
+                std::slice::from_raw_parts(
+                    scales_data.as_ptr() as *const f32,
+                    scales_len / 4,
+                )
+            };
+            result[i] = (vals, scales);
+        }
+        Some(result)
+    }
+
+    /// Load Q4 attention weights + manifest for GPU full pipeline.
+    pub fn load_attn_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+        let path = dir.join("attn_weights_q4.bin");
+        if !path.exists() {
+            return Err(VindexError::Parse("attn_weights_q4.bin not found".into()));
+        }
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { mmap_optimized(&file)? };
+        self.attn_q4_mmap = Some(Arc::new(mmap));
+
+        // Load manifest with per-matrix offsets
+        let manifest_path = dir.join("attn_weights_q4_manifest.json");
+        if manifest_path.exists() {
+            let json: Vec<serde_json::Value> = serde_json::from_str(
+                &std::fs::read_to_string(&manifest_path)
+                    .map_err(|e| VindexError::Parse(e.to_string()))?
+            ).map_err(|e| VindexError::Parse(e.to_string()))?;
+
+            let entries: Vec<(usize, usize)> = json.iter()
+                .map(|e| {
+                    let offset = e["q4_offset"].as_u64().unwrap_or(0) as usize;
+                    let length = e["q4_length"].as_u64().unwrap_or(0) as usize;
+                    (offset, length)
+                })
+                .collect();
+            self.attn_q4_manifest = Some(entries);
+        }
+        Ok(())
+    }
+
+    /// Get raw Q4 attention weight bytes (all layers packed).
+    pub fn attn_q4_data(&self) -> Option<&[u8]> {
+        self.attn_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+    }
+
+    /// Get per-layer Q4 attention weight slices (Q, K, V, O) using the manifest.
+    /// Returns None if manifest or Q4 attn data is not loaded.
+    pub fn attn_q4_layer_slices(&self, layer: usize) -> Option<(&[u8], &[u8], &[u8], &[u8])> {
+        let mmap = self.attn_q4_mmap.as_ref()?;
+        let manifest = self.attn_q4_manifest.as_ref()?;
+
+        // Each layer has 4 tensors: Q, K, V, O
+        let base = layer * 4;
+        if base + 3 >= manifest.len() { return None; }
+
+        let q = &manifest[base];
+        let k = &manifest[base + 1];
+        let v = &manifest[base + 2];
+        let o = &manifest[base + 3];
+
+        let q_data = &mmap[q.0..q.0 + q.1];
+        let k_data = &mmap[k.0..k.0 + k.1];
+        let v_data = &mmap[v.0..v.0 + v.1];
+        let o_data = &mmap[o.0..o.0 + o.1];
+
+        Some((q_data, k_data, v_data, o_data))
+    }
+
+    /// Load Q4 lm_head for GPU logits (replaces CPU f32 lm_head KNN).
+    pub fn load_lm_head_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+        let path = dir.join("lm_head_q4.bin");
+        if !path.exists() {
+            return Err(VindexError::Parse("lm_head_q4.bin not found".into()));
+        }
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { mmap_optimized(&file)? };
+        self.lm_head_q4_mmap = Some(Arc::new(mmap));
+        Ok(())
+    }
+
+    /// Whether Q4 lm_head is loaded.
+    pub fn has_lm_head_q4(&self) -> bool {
+        self.lm_head_q4_mmap.is_some()
+    }
+
     // ── LM head (output projection) for vindex logits ──
 
     /// Load lm_head from lm_head.bin for KNN logit lookup.
@@ -347,6 +477,45 @@ impl VectorIndex {
     /// Whether lm_head is loaded for vindex logits.
     pub fn has_lm_head(&self) -> bool {
         self.lm_head_mmap.is_some() && self.vocab_size > 0
+    }
+
+    /// KNN against lm_head via a ComputeBackend — GPU Q4 or CPU BLAS.
+    ///
+    /// If Q4 lm_head data and a Q4-capable backend are provided, uses Q4 matvec (~1ms).
+    /// Otherwise falls back to CPU BLAS f32 (~10ms).
+    pub fn lm_head_knn_backend(
+        &self,
+        query: &ndarray::Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Vec<(u32, f32)> {
+        // Try Q4 path first
+        if backend.has_q4() {
+            if let Some(ref q4_mmap) = self.lm_head_q4_mmap {
+                let vocab = self.vocab_size;
+                let hidden = self.hidden_size;
+                if vocab > 0 {
+                    let x = query.as_slice().unwrap();
+                    let (q8_x, q8_scales) = larql_compute::cpu::q4::quantize_to_q8(x);
+                    if let Some(scores_vec) = backend.q4_matvec(
+                        q4_mmap.as_ref(), &q8_x, &q8_scales, vocab, hidden,
+                    ) {
+                        let mut indexed: Vec<(u32, f32)> = scores_vec.iter().copied().enumerate()
+                            .map(|(i, s)| (i as u32, s))
+                            .collect();
+                        let k = top_k.min(indexed.len());
+                        if k > 0 && k < indexed.len() {
+                            indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+                            indexed.truncate(k);
+                        }
+                        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        return indexed;
+                    }
+                }
+            }
+        }
+        // Fallback to f32 BLAS
+        self.lm_head_knn(query, top_k)
     }
 
     /// KNN against lm_head: find top-K tokens by dot product with query vector.

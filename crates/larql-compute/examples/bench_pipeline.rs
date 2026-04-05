@@ -151,10 +151,11 @@ fn main() {
     #[cfg(feature = "metal")]
     {
         if let Some(ref metal) = larql_compute::metal::MetalBackend::new() {
+            let layers_refs: Vec<(&[u8], &[u8], &[u8])> = layers_q4.iter().map(|(g, u, d)| (g.as_slice(), u.as_slice(), d.as_slice())).collect();
             let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.001).sin()).collect();
 
             t.run("Metal multi-layer Q4 (21L, 1 cmd buffer, all GPU)", || {
-                let _ = metal.multi_layer_q4_ffn(&layers_q4, &x, inter, hidden);
+                let _ = metal.multi_layer_q4_ffn(&layers_refs, &x, inter, hidden);
             });
         }
     }

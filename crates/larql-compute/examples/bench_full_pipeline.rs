@@ -75,12 +75,12 @@ fn main() {
         let tps = 1000.0 / full_ms;
 
         // FFN-only for comparison
-        let layers_q4: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = layers_data.iter()
-            .map(|ld| (ld.gate_q4.clone(), ld.up_q4.clone(), ld.down_t_q4.clone())).collect();
-        let _ = metal.multi_layer_q4_ffn(&layers_q4, &x, inter, hidden);
+        let layers_q4_refs: Vec<(&[u8], &[u8], &[u8])> = layers_data.iter()
+            .map(|ld| (ld.gate_q4.as_slice(), ld.up_q4.as_slice(), ld.down_t_q4.as_slice())).collect();
+        let _ = metal.multi_layer_q4_ffn(&layers_q4_refs, &x, inter, hidden);
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.multi_layer_q4_ffn(&layers_q4, &x, inter, hidden);
+            let _ = metal.multi_layer_q4_ffn(&layers_q4_refs, &x, inter, hidden);
         }
         let ffn_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 

@@ -14,8 +14,9 @@
 use std::time::Instant;
 
 use larql_inference::{
-    predict, predict_with_graph, predict_with_graph_vindex_logits,
-    InferenceModel, WeightFfn, WalkLayerGraph,
+    predict, predict_with_graph, predict_with_graph_vindex_logits, predict_pipeline,
+    predict_split_pass, predict_split_cached, predict_honest, AttentionCache,
+    InferenceModel, WeightFfn, WalkLayerGraph, PipelinedLayerGraph,
     CachedLayerGraph, build_adaptive_graph, default_backend,
 };
 use larql_inference::vindex::WalkFfn;
@@ -57,6 +58,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     index.load_down_features(&vindex_path)?;
     index.load_up_features(&vindex_path)?;
     index.load_lm_head(&vindex_path)?;
+    match index.load_lm_head_q4(&vindex_path) {
+        Ok(()) => print!("lm_head_q4 "),
+        Err(_) => {}
+    }
+    match index.load_attn_q4(&vindex_path) {
+        Ok(()) => print!("attn_q4 "),
+        Err(_) => {}
+    }
+    match index.load_attn_q8(&vindex_path) {
+        Ok(()) => print!("attn_q8 "),
+        Err(_) => {}
+    }
     match index.load_interleaved(&vindex_path) {
         Ok(()) => print!("interleaved "),
         Err(_) => {}
@@ -126,10 +139,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Cache+Walk (GPU):    {cw_gpu_tok:>10}           {cw_gpu_ms:>6.0}ms  ({:.1} tok/s)", 1000.0/cw_gpu_ms);
     println!("  Full pipe (CPU):     {full_cpu_tok:>10}           {full_cpu_ms:>6.0}ms  ({:.1} tok/s)", 1000.0/full_cpu_ms);
     println!("  Full pipe (GPU):     {full_gpu_tok:>10} ({:.2}%)  {full_gpu_ms:>6.0}ms  ({:.1} tok/s)", full_gpu_prob * 100.0, 1000.0/full_gpu_ms);
+
+    // 6. Pipelined: Cache + Q4 Metal FFN (per-layer dispatch via PipelinedLayerGraph)
+    let pipelined = PipelinedLayerGraph {
+        index: &index,
+        backend: &*gpu_be,
+        layer_range: 13..num_layers,
+    };
+    let pipelined_graph = build_adaptive_graph(&cache, &pipelined, num_layers, &(0..=12));
+    let _ = predict_pipeline(weights, tokenizer, &token_ids, 5, &pipelined_graph, Some(&index));
+    let t0 = Instant::now();
+    for _ in 0..n { let _ = predict_pipeline(weights, tokenizer, &token_ids, 5, &pipelined_graph, Some(&index)); }
+    let pipelined_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let pipelined_r = predict_pipeline(weights, tokenizer, &token_ids, 5, &pipelined_graph, Some(&index));
+    let (pipelined_tok, pipelined_prob) = pipelined_r.predictions.first()
+        .map(|(t, p)| (t.clone(), *p)).unwrap_or_default();
+
+    println!("  Pipelined (Q4+KNN): {pipelined_tok:>10} ({:.2}%)  {pipelined_ms:>6.0}ms  ({:.1} tok/s)", pipelined_prob * 100.0, 1000.0/pipelined_ms);
     println!();
-    println!("  GPU vs CPU attn+FFN: {:.2}x ({:.0}ms)", cw_cpu_ms / cw_gpu_ms, cw_cpu_ms - cw_gpu_ms);
-    println!("  GPU vs CPU full:     {:.2}x ({:.0}ms)", full_cpu_ms / full_gpu_ms, full_cpu_ms - full_gpu_ms);
-    println!("  Full(GPU) vs Dense:  {:.2}x ({:.0}ms saved)", dense_ms / full_gpu_ms, dense_ms - full_gpu_ms);
+    // 7. Split-pass: attention CPU + batched Metal Q4 FFN + vindex logits
+    let _ = predict_split_pass(weights, tokenizer, &token_ids, 5, &index, &*gpu_be, &cache, 13..num_layers);
+    let t0 = Instant::now();
+    for _ in 0..n { let _ = predict_split_pass(weights, tokenizer, &token_ids, 5, &index, &*gpu_be, &cache, 13..num_layers); }
+    let split_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let split_r = predict_split_pass(weights, tokenizer, &token_ids, 5, &index, &*gpu_be, &cache, 13..num_layers);
+    let (split_tok, split_prob) = split_r.predictions.first()
+        .map(|(t, p)| (t.clone(), *p)).unwrap_or_default();
+
+    println!("  Split pass (Q4+KNN): {split_tok:>10} ({:.2}%)  {split_ms:>6.0}ms  ({:.1} tok/s)", split_prob * 100.0, 1000.0/split_ms);
+    println!();
+    // 8. Split cached: exact attention cache + batched Metal Q4 FFN + vindex logits
+    // Build attention cache from one exact run (one-time cost)
+    let t0 = Instant::now();
+    let attn_cache = AttentionCache::build(weights, &token_ids, &cache, &dense_ffn, 13..num_layers);
+    let cache_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let _ = predict_split_cached(weights, tokenizer, 5, &index, &*gpu_be, &attn_cache, 13..num_layers);
+    let t0 = Instant::now();
+    for _ in 0..n { let _ = predict_split_cached(weights, tokenizer, 5, &index, &*gpu_be, &attn_cache, 13..num_layers); }
+    let cached_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let cached_r = predict_split_cached(weights, tokenizer, 5, &index, &*gpu_be, &attn_cache, 13..num_layers);
+    let (cached_tok, cached_prob) = cached_r.predictions.first()
+        .map(|(t, p)| (t.clone(), *p)).unwrap_or_default();
+
+    println!("  Split cached (Q4):   {cached_tok:>10} ({:.2}%)  {cached_ms:>6.0}ms  ({:.1} tok/s)  [cache build: {cache_build_ms:.0}ms]", cached_prob * 100.0, 1000.0/cached_ms);
+    println!();
+    // 9. Honest: cache L0-12, compute L13-33 (interleaved attn+FFN), GPU Q4 logits
+    let _ = predict_honest(weights, tokenizer, &token_ids, 5, &index, &*gpu_be, &cache, 13..num_layers);
+    let t0 = Instant::now();
+    for _ in 0..n { let _ = predict_honest(weights, tokenizer, &token_ids, 5, &index, &*gpu_be, &cache, 13..num_layers); }
+    let honest_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let honest_r = predict_honest(weights, tokenizer, &token_ids, 5, &index, &*gpu_be, &cache, 13..num_layers);
+    let (honest_tok, honest_prob) = honest_r.predictions.first()
+        .map(|(t, p)| (t.clone(), *p)).unwrap_or_default();
+
+    println!();
+    println!("  ═══ HONEST PRODUCTION PATH ═══");
+    println!("  Honest (Q4+cache13):  {honest_tok:>10} ({:.2}%)  {honest_ms:>6.0}ms  ({:.1} tok/s)", honest_prob * 100.0, 1000.0/honest_ms);
+    println!();
+    println!("  Honest vs Dense:     {:.1}x ({:.0}ms saved)", dense_ms / honest_ms, dense_ms - honest_ms);
+    println!("  Honest vs Ollama:    {:.1}x (Ollama ~10ms = 98 tok/s)", 10.0 / honest_ms);
 
     println!("=== Done ===");
     Ok(())

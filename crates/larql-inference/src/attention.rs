@@ -361,3 +361,32 @@ pub fn gqa_attention_with_weights(
 
     (out, weights)
 }
+
+/// Q4 attention projection: single projection via Q4 matvec through ComputeBackend.
+///
+/// Replaces `dot_proj_gpu(h, w, backend)` when Q4 weight data is available.
+/// Returns [seq_len, out_dim] f32 result.
+///
+/// The caller provides raw Q4 bytes for the weight matrix and the number of
+/// output rows (num_rows = out_dim for projections, since Q4 layout is [out, in]).
+pub fn q4_attention_proj(
+    h: &Array2<f32>,
+    q4_data: &[u8],
+    num_rows: usize,
+    hidden: usize,
+    backend: &dyn larql_compute::ComputeBackend,
+) -> Option<Array2<f32>> {
+    if !backend.has_q4() { return None; }
+    let seq_len = h.shape()[0];
+    let mut out = Array2::<f32>::zeros((seq_len, num_rows));
+
+    for s in 0..seq_len {
+        let x_row = h.row(s);
+        let x_slice = x_row.as_slice()?;
+        let (q8_x, q8_scales) = larql_compute::cpu::q4::quantize_to_q8(x_slice);
+        let scores = backend.q4_matvec(q4_data, &q8_x, &q8_scales, num_rows, hidden)?;
+        let mut out_row = out.row_mut(s);
+        for j in 0..num_rows { out_row[j] = scores[j]; }
+    }
+    Some(out)
+}

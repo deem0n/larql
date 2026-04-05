@@ -251,7 +251,9 @@ fn multi_layer_q4_produces_output() {
     }
 
     let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin()).collect();
-    let result = metal.multi_layer_q4_ffn(&layers_q4, &x, inter, hidden);
+    let layers_refs: Vec<(&[u8], &[u8], &[u8])> = layers_q4.iter()
+        .map(|(g, u, d)| (g.as_slice(), u.as_slice(), d.as_slice())).collect();
+    let result = metal.multi_layer_q4_ffn(&layers_refs, &x, inter, hidden);
 
     assert_eq!(result.len(), hidden);
     assert!(result.iter().any(|&v| v.abs() > 0.001), "multi-layer should produce nonzero output");
@@ -478,9 +480,487 @@ fn all_new_kernel_functions_exist() {
         "geglu_silu", "quantize_q8",
         "residual_copy", "residual_add", "rms_norm",
         "causal_attention", "kv_attention", "kv_cache_append",
+        "rope_apply", "fused_attention",
     ];
     for name in &names {
         lib.get_function(name, None)
             .unwrap_or_else(|e| panic!("Kernel '{name}' not found: {e}"));
     }
+}
+
+// ── RoPE shader ──
+
+#[test]
+fn rope_apply_matches_cpu() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("rope_apply", None).unwrap()
+    ).unwrap();
+
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let dim = 64u32;
+    let seq_len = 4u32;
+    let base = 10000.0f32;
+
+    // Create test data
+    let data: Vec<f32> = (0..seq_len as usize * dim as usize)
+        .map(|i| (i as f32 * 0.01).sin())
+        .collect();
+    let data_copy = data.clone();
+
+    // CPU reference: apply RoPE manually
+    let half = dim as usize / 2;
+    let mut cpu_result = data_copy.clone();
+    for pos in 0..seq_len as usize {
+        for d in 0..half {
+            let freq = 1.0 / base.powf(2.0 * d as f32 / dim as f32);
+            let angle = pos as f32 * freq;
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let re = cpu_result[pos * dim as usize + d];
+            let im = cpu_result[pos * dim as usize + d + half];
+            cpu_result[pos * dim as usize + d] = re * cos_a - im * sin_a;
+            cpu_result[pos * dim as usize + d + half] = re * sin_a + im * cos_a;
+        }
+    }
+
+    // Metal
+    let buf = bufs.transient_from_f32(&data);
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf), 0);
+    enc.set_bytes(1, 4, &dim as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(2, 4, &base as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_threads(
+        metal::MTLSize::new(half as u64, seq_len as u64, 1),
+        metal::MTLSize::new(half as u64, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf.contents() as *const f32;
+    let metal_result: Vec<f32> = unsafe {
+        std::slice::from_raw_parts(ptr, seq_len as usize * dim as usize).to_vec()
+    };
+
+    let diff = max_diff(&cpu_result, &metal_result);
+    assert!(diff < 1e-4, "RoPE max diff {diff} exceeds 1e-4");
+}
+
+// ── Fused attention shader ──
+
+#[test]
+fn fused_attention_single_token() {
+    // At seq=1, attention output = V (only one key to attend to, weight = 1.0)
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("fused_attention", None).unwrap()
+    ).unwrap();
+
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let seq_len = 1u32;
+    let head_dim = 32u32;
+    let num_q = 2u32;
+    let num_kv = 2u32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let rope_base = 10000.0f32;
+    let use_qk_norm = 0u32;
+    let softcap = 0.0f32;
+
+    let total = seq_len as usize * num_q as usize * head_dim as usize;
+    let kv_total = seq_len as usize * num_kv as usize * head_dim as usize;
+
+    let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.1).sin()).collect();
+    let k: Vec<f32> = (0..kv_total).map(|i| (i as f32 * 0.2).cos()).collect();
+    let v: Vec<f32> = (0..kv_total).map(|i| (i as f32 * 0.05 + 1.0)).collect();
+
+    let buf_q = bufs.transient_from_f32(&q);
+    let buf_k = bufs.transient_from_f32(&k);
+    let buf_v = bufs.transient_from_f32(&v);
+    let buf_out = bufs.output((total * 4) as u64);
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_q), 0);
+    enc.set_buffer(1, Some(&buf_k), 0);
+    enc.set_buffer(2, Some(&buf_v), 0);
+    enc.set_buffer(3, Some(&buf_out), 0);
+    enc.set_bytes(4, 4, &seq_len as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &head_dim as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &num_q as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &num_kv as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(9, 4, &rope_base as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(10, 4, &use_qk_norm as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(11, 4, &softcap as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(num_q as u64, seq_len as u64, 1),
+        metal::MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf_out.contents() as *const f32;
+    let result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, total).to_vec() };
+
+    // At seq=1, output should be V (rotated by RoPE, but with weight=1.0)
+    // Just verify nonzero and finite
+    assert!(result.iter().all(|v| v.is_finite()), "output should be finite");
+    assert!(result.iter().any(|v| v.abs() > 0.01), "output should be nonzero");
+}
+
+// ══════════════════════════════════════════════════════════════
+// Shader correctness tests — each shader vs CPU reference
+// ══════════════════════════════════════════════════════════════
+
+// ── rms_norm with offset ──
+
+#[test]
+fn rms_norm_matches_cpu() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("rms_norm", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 64usize;
+    let x: Vec<f32> = (0..len).map(|i| (i as f32 * 0.1 - 3.2)).collect();
+    let weight: Vec<f32> = (0..len).map(|i| 0.5 + (i as f32 * 0.01)).collect();
+    let eps = 1e-6f32;
+    let offset = 1.0f32; // Gemma-style
+
+    // CPU reference
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let rms = 1.0 / (sum_sq / len as f32 + eps).sqrt();
+    let cpu_result: Vec<f32> = x.iter().zip(weight.iter())
+        .map(|(xi, wi)| xi * (wi + offset) * rms)
+        .collect();
+
+    // Metal
+    let buf_x = bufs.transient_from_f32(&x);
+    let buf_w = bufs.transient_from_f32(&weight);
+    let buf_out = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_x), 0);
+    enc.set_buffer(1, Some(&buf_w), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_threads(metal::MTLSize::new(len as u64, 1, 1), metal::MTLSize::new(len as u64, 1, 1));
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf_out.contents() as *const f32;
+    let metal_result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+
+    let diff = max_diff(&cpu_result, &metal_result);
+    assert!(diff < 1e-5, "rms_norm max diff {diff}");
+}
+
+#[test]
+fn rms_norm_zero_offset() {
+    // Standard RMS norm (Llama-style, offset=0)
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("rms_norm", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 32usize;
+    let x: Vec<f32> = (0..len).map(|i| (i as f32 * 0.2 - 3.0)).collect();
+    let weight: Vec<f32> = vec![1.0f32; len];
+    let eps = 1e-6f32;
+    let offset = 0.0f32;
+
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let rms = 1.0 / (sum_sq / len as f32 + eps).sqrt();
+    let cpu_result: Vec<f32> = x.iter().map(|xi| xi * rms).collect();
+
+    let buf_x = bufs.transient_from_f32(&x);
+    let buf_w = bufs.transient_from_f32(&weight);
+    let buf_out = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_x), 0);
+    enc.set_buffer(1, Some(&buf_w), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_threads(metal::MTLSize::new(len as u64, 1, 1), metal::MTLSize::new(len as u64, 1, 1));
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf_out.contents() as *const f32;
+    let metal_result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+
+    let diff = max_diff(&cpu_result, &metal_result);
+    assert!(diff < 1e-5, "rms_norm(offset=0) max diff {diff}");
+}
+
+// ── residual_add ──
+
+#[test]
+fn residual_add_matches_cpu() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("residual_add", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 128usize;
+    let a: Vec<f32> = (0..len).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..len).map(|i| -(i as f32 * 0.05)).collect();
+    let cpu_result: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+
+    let buf_a = bufs.transient_from_f32(&a);
+    let buf_b = bufs.transient_from_f32(&b);
+    let buf_out = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_a), 0);
+    enc.set_buffer(1, Some(&buf_b), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_threads(metal::MTLSize::new(len as u64, 1, 1), metal::MTLSize::new(len as u64, 1, 1));
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf_out.contents() as *const f32;
+    let metal_result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+
+    let diff = max_diff(&cpu_result, &metal_result);
+    assert!(diff < 1e-6, "residual_add max diff {diff}");
+}
+
+// ── fused_attention correctness (3 tokens, 2 heads, verified against CPU) ──
+
+#[test]
+fn fused_attention_matches_cpu_reference() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("fused_attention", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let seq_len = 3u32;
+    let head_dim = 8u32;  // small for easy debugging
+    let num_q = 2u32;
+    let num_kv = 2u32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let rope_base = 10000.0f32;
+    let use_qk_norm = 0u32;
+    let softcap = 0.0f32;
+
+    let total = (seq_len * num_q * head_dim) as usize;
+    let kv_total = (seq_len * num_kv * head_dim) as usize;
+
+    // Deterministic test data
+    let q: Vec<f32> = (0..total).map(|i| ((i as f32 * 0.37 + 1.0).sin() * 0.5)).collect();
+    let k: Vec<f32> = (0..kv_total).map(|i| ((i as f32 * 0.23 + 2.0).cos() * 0.5)).collect();
+    let v: Vec<f32> = (0..kv_total).map(|i| ((i as f32 * 0.11 + 3.0).sin() * 0.3)).collect();
+
+    // ── CPU reference: apply RoPE then causal attention ──
+    let hd = head_dim as usize;
+    let half = hd / 2;
+    let nq = num_q as usize;
+    let nkv = num_kv as usize;
+    let sl = seq_len as usize;
+
+    // Apply RoPE to Q and K
+    let mut q_rope = q.clone();
+    let mut k_rope = k.clone();
+    for pos in 0..sl {
+        for head in 0..nq {
+            for d in 0..half {
+                let freq = 1.0 / rope_base.powf(2.0 * d as f32 / hd as f32);
+                let angle = pos as f32 * freq;
+                let (cos_a, sin_a) = (angle.cos(), angle.sin());
+                let idx_re = pos * nq * hd + head * hd + d;
+                let idx_im = pos * nq * hd + head * hd + d + half;
+                let re = q[idx_re];
+                let im = q[idx_im];
+                q_rope[idx_re] = re * cos_a - im * sin_a;
+                q_rope[idx_im] = re * sin_a + im * cos_a;
+            }
+        }
+        for head in 0..nkv {
+            for d in 0..half {
+                let freq = 1.0 / rope_base.powf(2.0 * d as f32 / hd as f32);
+                let angle = pos as f32 * freq;
+                let (cos_a, sin_a) = (angle.cos(), angle.sin());
+                let idx_re = pos * nkv * hd + head * hd + d;
+                let idx_im = pos * nkv * hd + head * hd + d + half;
+                let re = k[idx_re];
+                let im = k[idx_im];
+                k_rope[idx_re] = re * cos_a - im * sin_a;
+                k_rope[idx_im] = re * sin_a + im * cos_a;
+            }
+        }
+    }
+
+    // Causal attention per head per position
+    let mut cpu_out = vec![0.0f32; total];
+    for head in 0..nq {
+        let kv_head = head / (nq / nkv);
+        for qi in 0..sl {
+            // Compute scores for all k <= qi
+            let mut scores = Vec::new();
+            for ki in 0..=qi {
+                let mut dot = 0.0f32;
+                for d in 0..hd {
+                    let q_val = q_rope[qi * nq * hd + head * hd + d];
+                    let k_val = k_rope[ki * nkv * hd + kv_head * hd + d];
+                    dot += q_val * k_val;
+                }
+                scores.push(dot * scale);
+            }
+            // Softmax
+            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            let weights: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+            // Weighted V
+            for d in 0..hd {
+                let mut acc = 0.0f32;
+                for ki in 0..=qi {
+                    acc += weights[ki] * v[ki * nkv * hd + kv_head * hd + d];
+                }
+                cpu_out[qi * nq * hd + head * hd + d] = acc;
+            }
+        }
+    }
+
+    // ── Metal ──
+    let buf_q = bufs.transient_from_f32(&q);
+    let buf_k = bufs.transient_from_f32(&k);
+    let buf_v = bufs.transient_from_f32(&v);
+    let buf_out = bufs.output((total * 4) as u64);
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_q), 0);
+    enc.set_buffer(1, Some(&buf_k), 0);
+    enc.set_buffer(2, Some(&buf_v), 0);
+    enc.set_buffer(3, Some(&buf_out), 0);
+    enc.set_bytes(4, 4, &seq_len as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &head_dim as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &num_q as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &num_kv as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(9, 4, &rope_base as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(10, 4, &use_qk_norm as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(11, 4, &softcap as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(num_q as u64, seq_len as u64, 1),
+        metal::MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf_out.contents() as *const f32;
+    let metal_result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, total).to_vec() };
+
+    // Compare
+    let diff = max_diff(&cpu_out, &metal_result);
+    assert!(diff < 0.01, "fused_attention max diff {diff} (expected < 0.01).\nCPU[0..8]: {:?}\nGPU[0..8]: {:?}",
+        &cpu_out[..8.min(total)], &metal_result[..8.min(total)]);
+}
+
+// ── quantize_q8 shader ──
+
+#[test]
+fn quantize_q8_matches_cpu() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("quantize_q8", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 64usize;
+    let x: Vec<f32> = (0..len).map(|i| (i as f32 * 0.15 - 4.8)).collect();
+
+    // CPU reference
+    let (cpu_q8, cpu_scales) = larql_compute::cpu::q4::quantize_to_q8(&x);
+
+    // Metal
+    let buf_x = bufs.transient_from_f32(&x);
+    let buf_q8 = bufs.output(len as u64);
+    let buf_scales = bufs.output((len / 32 * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_x), 0);
+    enc.set_buffer(1, Some(&buf_q8), 0);
+    enc.set_buffer(2, Some(&buf_scales), 0);
+    let n_blocks = (len / 32) as u32;
+    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_threads(metal::MTLSize::new(n_blocks as u64, 1, 1), metal::MTLSize::new(n_blocks as u64, 1, 1));
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let q8_ptr = buf_q8.contents() as *const i8;
+    let sc_ptr = buf_scales.contents() as *const f32;
+    let metal_q8: Vec<i8> = unsafe { std::slice::from_raw_parts(q8_ptr, len).to_vec() };
+    let metal_scales: Vec<f32> = unsafe { std::slice::from_raw_parts(sc_ptr, len / 32).to_vec() };
+
+    // Check scales match
+    for i in 0..len/32 {
+        let diff = (cpu_scales[i] - metal_scales[i]).abs();
+        assert!(diff < 0.01, "Q8 scale[{i}] diff: cpu={} metal={}", cpu_scales[i], metal_scales[i]);
+    }
+    // Check quantized values match (allow ±1 for rounding)
+    let mut mismatches = 0;
+    for i in 0..len {
+        if (cpu_q8[i] as i32 - metal_q8[i] as i32).abs() > 1 {
+            mismatches += 1;
+        }
+    }
+    assert!(mismatches == 0, "Q8 quantize: {mismatches}/{len} values differ by >1");
 }

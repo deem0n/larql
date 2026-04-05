@@ -20,6 +20,8 @@ pub mod q8_matvec;
 pub mod kv_attention;
 pub mod q4_sparse_matvec;
 pub mod residual_inject;
+pub mod rope;
+pub mod fused_attention;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -47,5 +49,7 @@ pub fn all_shaders() -> String {
     // Attention
     src.push_str(causal_attention::SHADER);
     src.push_str(kv_attention::SHADER);
+    src.push_str(rope::SHADER);
+    src.push_str(fused_attention::SHADER);
     src
 }

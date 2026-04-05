@@ -65,9 +65,10 @@ pub use trace::{
 };
 pub use layer_graph::{
     // Production
-    LayerGraph, LayerOutput, DenseLayerGraph, WalkLayerGraph,
+    LayerGraph, LayerOutput, DenseLayerGraph, WalkLayerGraph, PipelinedLayerGraph,
     CachedLayerGraph, PerLayerGraph,
-    predict_with_graph, predict_with_graph_vindex_logits,
+    predict_with_graph, predict_with_graph_vindex_logits, predict_pipeline,
+    predict_split_pass, predict_split_cached, predict_honest, AttentionCache,
     trace_with_graph, build_adaptive_graph,
     // Analysis/validation
     TemplatePattern, TemplateUniverse, GuidedWalkLayerGraph,

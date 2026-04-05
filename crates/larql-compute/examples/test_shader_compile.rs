@@ -13,7 +13,10 @@ fn main() {
             Ok(lib) => {
                 println!("Compiled OK!");
                 for name in &["sgemm", "sgemm_transb", "q4_matvec", "q4_vecmat",
-                              "q4_f32_matvec", "geglu_silu", "quantize_q8", "causal_attention"] {
+                              "q4_f32_matvec", "geglu_silu", "quantize_q8", "causal_attention",
+                              "rope_apply", "fused_attention",
+                              "kv_attention", "kv_cache_append",
+                              "q4_matvec_v2", "q4_matvec_v3", "q4_matvec_v4", "q4_matvec_v5"] {
                     match lib.get_function(name, None) {
                         Ok(_) => println!("  ✓ {name}"),
                         Err(e) => println!("  ✗ {name}: {e}"),

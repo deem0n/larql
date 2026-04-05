@@ -248,9 +248,10 @@ fn main() {
                 for r in 0..inter { for c in 0..hidden { dt[c * inter + r] = ((r * hidden + c) as f64 * 0.0003).cos() as f32; } }
                 layers.push((quantize_q4_0(&g), quantize_q4_0(&u), quantize_q4_0(&dt)));
             }
+            let layers_refs: Vec<(&[u8], &[u8], &[u8])> = layers.iter().map(|(g, u, d)| (g.as_slice(), u.as_slice(), d.as_slice())).collect();
             let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.001).sin()).collect();
             t.run("Metal 21-layer Q4 FFN (1 cmd buffer)", || {
-                let _ = metal.multi_layer_q4_ffn(&layers, &x, inter, hidden);
+                let _ = metal.multi_layer_q4_ffn(&layers_refs, &x, inter, hidden);
             });
         }
     }

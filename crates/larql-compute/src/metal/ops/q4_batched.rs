@@ -100,7 +100,7 @@ pub fn multi_layer_ffn(
     pipelines: &Q4Pipelines,
     geglu_pipeline: &ComputePipelineState,
     q8_quant_pipeline: &ComputePipelineState,
-    layers_q4: &[(Vec<u8>, Vec<u8>, Vec<u8>)], // [(gate, up, down_t)]
+    layers_q4: &[(&[u8], &[u8], &[u8])], // [(gate, up, down_t)]
     x: &[f32],
     inter: usize,
     hidden: usize,

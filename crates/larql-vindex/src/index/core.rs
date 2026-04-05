@@ -74,10 +74,19 @@ pub struct VectorIndex {
     pub(crate) interleaved_q4_mmap: Option<Arc<memmap2::Mmap>>,
 
     /// Q4_0 gate vectors mmap — for fast Q4 KNN via larql-compute.
-    /// Layout: layers packed contiguously, each [num_features, hidden] in Q4_0 format.
     pub(crate) gate_q4_mmap: Option<Arc<memmap2::Mmap>>,
     /// Per-layer byte offset + byte length in gate_q4_mmap.
     pub(crate) gate_q4_slices: Vec<GateQ4Slice>,
+    /// Q4_0 lm_head mmap — for GPU Q4 logits (replaces CPU f32 lm_head KNN).
+    pub(crate) lm_head_q4_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Q4_0 attention weights mmap — for GPU full pipeline.
+    pub(crate) attn_q4_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Per-matrix (offset, length) in attn_q4_mmap — from manifest.
+    pub(crate) attn_q4_manifest: Option<Vec<(usize, usize)>>,
+    /// Q8_0 attention weights mmap — higher precision for attention projections.
+    pub(crate) attn_q8_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Per-matrix (offset, vals_len, scales_len) in attn_q8_mmap.
+    pub(crate) attn_q8_manifest: Option<Vec<(usize, usize, usize)>>,
 }
 
 impl Clone for VectorIndex {
@@ -110,6 +119,11 @@ impl Clone for VectorIndex {
             interleaved_q4_mmap: self.interleaved_q4_mmap.clone(),
             gate_q4_mmap: self.gate_q4_mmap.clone(),
             gate_q4_slices: self.gate_q4_slices.clone(),
+            lm_head_q4_mmap: self.lm_head_q4_mmap.clone(),
+            attn_q4_mmap: self.attn_q4_mmap.clone(),
+            attn_q4_manifest: self.attn_q4_manifest.clone(),
+            attn_q8_mmap: self.attn_q8_mmap.clone(),
+            attn_q8_manifest: self.attn_q8_manifest.clone(),
         }
     }
 }
@@ -145,6 +159,11 @@ impl VectorIndex {
             interleaved_q4_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
+            lm_head_q4_mmap: None,
+            attn_q4_mmap: None,
+            attn_q4_manifest: None,
+            attn_q8_mmap: None,
+            attn_q8_manifest: None,
         }
     }
 
@@ -181,6 +200,11 @@ impl VectorIndex {
             interleaved_q4_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
+            lm_head_q4_mmap: None,
+            attn_q4_mmap: None,
+            attn_q4_manifest: None,
+            attn_q8_mmap: None,
+            attn_q8_manifest: None,
         }
     }
 
@@ -345,6 +369,11 @@ impl VectorIndex {
             interleaved_q4_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
+            lm_head_q4_mmap: None,
+            attn_q4_mmap: None,
+            attn_q4_manifest: None,
+            attn_q8_mmap: None,
+            attn_q8_manifest: None,
             num_layers,
             hidden_size,
         })
