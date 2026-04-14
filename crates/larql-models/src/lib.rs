@@ -21,6 +21,7 @@ pub use architectures::mistral::MistralArch;
 pub use architectures::mixtral::MixtralArch;
 pub use architectures::qwen::QwenArch;
 pub use architectures::starcoder2::StarCoder2Arch;
+pub use architectures::tinymodel::TinyModelArch;
 
 pub use vectors::{
     TopKEntry, VectorFileHeader, VectorRecord, ALL_COMPONENTS, COMPONENT_ATTN_OV,

@@ -14,6 +14,7 @@ use crate::architectures::mistral::MistralArch;
 use crate::architectures::mixtral::MixtralArch;
 use crate::architectures::qwen::QwenArch;
 use crate::architectures::starcoder2::StarCoder2Arch;
+use crate::architectures::tinymodel::TinyModelArch;
 use crate::config::{ModelArchitecture, ModelConfig, RopeScaling};
 
 /// Error from model detection/config parsing.
@@ -57,7 +58,9 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         // Gemma family
         t if t.starts_with("gemma4") => Box::new(Gemma4Arch::from_config(model_config)),
         t if t.starts_with("gemma3") => Box::new(Gemma3Arch::from_config(model_config)),
-        t if t.starts_with("gemma2") || t == "gemma" => Box::new(Gemma2Arch::from_config(model_config)),
+        t if t.starts_with("gemma2") || t == "gemma" => {
+            Box::new(Gemma2Arch::from_config(model_config))
+        }
         // Llama family
         t if t.starts_with("llama") => Box::new(LlamaArch::from_config(model_config)),
         // Mistral (dense)
@@ -74,6 +77,8 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "starcoder2" => Box::new(StarCoder2Arch::from_config(model_config)),
         // Granite family (dense and MoE share same base keys)
         t if t.starts_with("granite") => Box::new(GraniteArch::from_config(model_config)),
+        // TinyModel — research-scale decoder used for LARQL compile/walk work
+        "tinymodel" => Box::new(TinyModelArch::from_config(model_config)),
         // Unknown — generic fallback
         _ => Box::new(GenericArch::from_config(model_config)),
     }
@@ -106,7 +111,11 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let head_dim = text_config["head_dim"]
         .as_u64()
         .map(|v| v as usize)
-        .unwrap_or(if default_head_dim > 0 { default_head_dim } else { hidden_size / num_q_heads });
+        .unwrap_or(if default_head_dim > 0 {
+            default_head_dim
+        } else {
+            hidden_size / num_q_heads
+        });
     let num_kv_heads = text_config["num_key_value_heads"].as_u64().unwrap_or(4) as usize;
     // RoPE base: check rope_parameters.full_attention.rope_theta (Gemma 4),
     // then top-level rope_theta, then default.
@@ -134,9 +143,7 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .as_u64()
         .or_else(|| text_config["num_experts_per_token"].as_u64())
         .map(|v| v as usize);
-    let num_shared_experts = text_config["n_shared_experts"]
-        .as_u64()
-        .map(|v| v as usize);
+    let num_shared_experts = text_config["n_shared_experts"].as_u64().map(|v| v as usize);
 
     // MLA fields
     let kv_lora_rank = text_config["kv_lora_rank"].as_u64().map(|v| v as usize);
@@ -293,6 +300,39 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_tinymodel() {
+        let config = serde_json::json!({
+            "model_type": "tinymodel",
+            "hidden_size": 512,
+            "num_hidden_layers": 20,
+            "intermediate_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "vocab_size": 71261,
+            "max_position_embeddings": 256
+        });
+
+        let arch = detect_from_json(&config);
+        assert_eq!(arch.family(), "tinymodel");
+        assert_eq!(arch.config().hidden_size, 512);
+        assert_eq!(arch.config().num_layers, 20);
+        assert_eq!(arch.config().rope_base, 10_000.0);
+        assert_eq!(arch.embed_scale(), (512.0_f32).sqrt());
+        assert_eq!(arch.embed_key(), "embed.weight");
+        assert_eq!(arch.final_norm_key(), "norm.weight");
+        assert_eq!(arch.attn_q_key(5), "layers.5.attn.q_proj.weight");
+        assert_eq!(arch.ffn_gate_key(5), "layers.5.ffn.gate.weight");
+        assert_eq!(arch.ffn_down_key(5), "layers.5.ffn.down.weight");
+        assert_eq!(arch.input_layernorm_key(5), "layers.5.attn_norm.weight");
+        assert_eq!(
+            arch.post_attention_layernorm_key(5),
+            "layers.5.ffn_norm.weight"
+        );
+        assert_eq!(arch.key_prefixes_to_strip(), &[] as &[&str]);
+        assert!(!arch.has_post_norms());
+    }
+
+    #[test]
     fn test_detect_mistral() {
         let config = serde_json::json!({
             "model_type": "mistral",
@@ -379,7 +419,7 @@ mod tests {
         assert_eq!(arch.config().hidden_size, 4096);
         assert_eq!(arch.config().num_q_heads, 32);
         assert_eq!(arch.config().num_kv_heads, 32); // no GQA in Llama 2
-        // head_dim computed: 4096 / 32 = 128
+                                                    // head_dim computed: 4096 / 32 = 128
         assert_eq!(arch.config().head_dim, 128);
         // rope_theta absent → defaults to 10000
         assert_eq!(arch.config().rope_base, 10_000.0);
@@ -1024,13 +1064,16 @@ mod tests {
     #[test]
     fn test_detect_gemma4_real_config() {
         // Test against the actual HuggingFace config.json if available
-        let config_path = std::env::var("HOME").ok()
-            .map(|h| std::path::PathBuf::from(h).join(".cache/huggingface/hub/models--google--gemma-4-31B-it"));
+        let config_path = std::env::var("HOME").ok().map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".cache/huggingface/hub/models--google--gemma-4-31B-it")
+        });
         let config_path = match config_path {
             Some(p) if p.exists() => {
                 // Find the snapshot
                 let snapshots = p.join("snapshots");
-                std::fs::read_dir(&snapshots).ok()
+                std::fs::read_dir(&snapshots)
+                    .ok()
                     .and_then(|mut entries| entries.next())
                     .and_then(|e| e.ok())
                     .map(|e| e.path().join("config.json"))
