@@ -744,7 +744,7 @@ impl Session {
             for _iter in 0..CROSS_ITERS {
                 let mut any_regressed = false;
                 let priors_to_check: Vec<_> = self
-                    .installed_facts
+                    .installed_edges
                     .iter()
                     .rev()
                     .take(MAX_PRIORS_CHECKED)
@@ -795,7 +795,7 @@ impl Session {
 
             // Register THIS fact for future cross-balance passes
             for &(layer, feature) in &installed_slots {
-                self.installed_facts.push(crate::executor::InstalledFact {
+                self.installed_edges.push(crate::executor::InstalledEdge {
                     layer,
                     feature,
                     canonical_prompt: canonical_prompt.clone(),
@@ -858,7 +858,7 @@ impl Session {
     // compose-mode install:
     //
     //   for iter in 0..max_iters:
-    //       for fact in installed_facts:
+    //       for fact in installed_edges:
     //           prob = INFER(fact.canonical); extract target_prob
     //           if prob > ceiling: scale down_col(fact) × 0.85
     //           elif prob < floor:  scale down_col(fact) × 1.15
@@ -876,14 +876,14 @@ impl Session {
         let floor = floor.unwrap_or(0.30) as f64;
         let ceiling = ceiling.unwrap_or(0.90) as f64;
 
-        if self.installed_facts.is_empty() {
+        if self.installed_edges.is_empty() {
             return Ok(vec![
                 "Rebalance: no compose-mode installs to rebalance (KNN installs don't need it)"
                     .into(),
             ]);
         }
 
-        let n_facts = self.installed_facts.len();
+        let n_facts = self.installed_edges.len();
         let (path, _config, _patched) = self.require_vindex()?;
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let weights = larql_vindex::load_model_weights(path, &mut cb)
@@ -901,7 +901,7 @@ impl Session {
         for iter in 0..max_iters {
             iters_run = iter + 1;
             let mut any_changed = false;
-            let facts_snapshot = self.installed_facts.clone();
+            let facts_snapshot = self.installed_edges.clone();
 
             for (i, fact) in facts_snapshot.iter().enumerate() {
                 let enc = tokenizer

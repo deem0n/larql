@@ -453,9 +453,10 @@ impl Session {
             let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
                 .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
 
-            // MEMIT parameters — validated in Python reference
-            // (experiments/15_v11_model/RESULTS.md §20).
-            let ridge = 0.1;
+            let ridge = std::env::var("LARQL_MEMIT_RIDGE")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.1);
             let target_alpha = 5.0;
 
             out.push(format!(
@@ -467,13 +468,28 @@ impl Session {
                     .len(),
             ));
 
-            let results = larql_inference::run_memit(
-                &weights,
-                &memit_facts,
-                ridge,
-                target_alpha,
-                &tokenizer,
-            ).map_err(|e| LqlError::Execution(format!("MEMIT failed: {e}")))?;
+            let use_target_delta = std::env::var("LARQL_MEMIT_TARGET_DELTA")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let results = if use_target_delta {
+                larql_inference::run_memit_with_target_opt(
+                    &weights,
+                    &memit_facts,
+                    ridge,
+                    larql_inference::TargetDeltaOpts::default(),
+                    &tokenizer,
+                )
+            } else {
+                larql_inference::run_memit(
+                    &weights,
+                    &memit_facts,
+                    ridge,
+                    target_alpha,
+                    &tokenizer,
+                )
+            }
+            .map_err(|e| LqlError::Execution(format!("MEMIT failed: {e}")))?;
 
             for result in &results {
                 let delta_norm: f32 = result.delta_w.iter()
@@ -589,20 +605,56 @@ impl Session {
         // column-replace bake of gate/up/down overlays, matching the
         // pre-MEMIT behaviour used by unit tests that exercise the bake
         // path without shipping a real model.
-        let memit_results = if !memit_facts.is_empty() && config.has_model_weights {
+        let memit_disabled = std::env::var("LARQL_MEMIT_DISABLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let memit_results = if !memit_facts.is_empty() && config.has_model_weights && !memit_disabled {
             let mut cb = larql_vindex::SilentLoadCallbacks;
             let weights = larql_vindex::load_model_weights(path, &mut cb)
                 .map_err(|e| LqlError::exec("load weights for MEMIT", e))?;
             let tokenizer = larql_vindex::load_vindex_tokenizer(path)
                 .map_err(|e| LqlError::exec("load tokenizer for MEMIT", e))?;
-            let results = larql_inference::run_memit(
-                &weights,
-                &memit_facts,
-                0.1, // ridge
-                5.0, // target_alpha
-                &tokenizer,
-            )
-            .map_err(|e| LqlError::Execution(format!("MEMIT solve failed: {e}")))?;
+            // LARQL_MEMIT_TARGET_DELTA=1 switches MEMIT from the
+            // `target_alpha × embed(target)` shortcut to the
+            // per-fact gradient-optimised delta (Python reference
+            // Phase 3 + Phase 4). Slow (60 Adam steps/fact) but
+            // unlocks the scale ceiling.
+            let use_target_delta = std::env::var("LARQL_MEMIT_TARGET_DELTA")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let spread = std::env::var("LARQL_MEMIT_SPREAD")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            let ridge = std::env::var("LARQL_MEMIT_RIDGE")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.1);
+            let template_decoys =
+                build_template_decoys(patched, path, &recording_ops)?;
+            let results = if use_target_delta {
+                larql_inference::forward::memit::run_memit_with_target_opt_multi_ex(
+                    &weights,
+                    &memit_facts,
+                    ridge,
+                    larql_inference::TargetDeltaOpts::default(),
+                    &tokenizer,
+                    spread,
+                    &template_decoys,
+                )
+            } else {
+                larql_inference::run_memit(
+                    &weights,
+                    &memit_facts,
+                    ridge,
+                    5.0, // target_alpha
+                    &tokenizer,
+                )
+            };
+            let results = results
+                .map_err(|e| LqlError::Execution(format!("MEMIT solve failed: {e}")))?;
             Some(results)
         } else {
             None
@@ -1058,6 +1110,157 @@ fn collect_memit_facts(
 /// AND the in-memory `patch_recording` of the current session.
 /// Live INSERT ops go to `patch_recording` until SAVE PATCH; MEMIT
 /// needs to see them for COMPILE to bake the uncommitted edits.
+/// Common entities to substitute into the INSERT template at
+/// covariance-estimation time. Each forms a template-matched decoy
+/// prompt ("The {relation} of {common_entity} is"), ensuring MEMIT's
+/// ΔW_down lands in the null-space of the full template family. Without
+/// this, a single install hijacks every sibling prompt that shares the
+/// template (France/Germany native retrieval breaks when fictional
+/// capitals are installed).
+const MEMIT_TEMPLATE_DECOY_ENTITIES: &[&str] = &[
+    // Major countries — well-represented in Gemma's training
+    "France", "Germany", "Italy", "Spain", "Britain",
+    "Japan", "China", "India", "Russia", "Brazil",
+    "Egypt", "Greece", "Portugal", "Austria", "Poland",
+    "Sweden", "Norway", "Finland", "Canada", "Mexico",
+    "Argentina", "Chile", "Peru", "Turkey", "Iran",
+    "Australia", "Thailand", "Vietnam", "Indonesia", "Malaysia",
+    "Philippines", "Pakistan", "Bangladesh", "Nigeria", "Kenya",
+    "Ethiopia", "Ghana", "Morocco", "Algeria", "Tunisia",
+    "Colombia", "Venezuela", "Ecuador", "Bolivia", "Paraguay",
+    "Uruguay", "Cuba", "Jamaica", "Haiti", "Guatemala",
+    "Honduras", "Panama", "Denmark", "Belgium", "Netherlands",
+    "Switzerland", "Ireland", "Scotland", "Wales", "Iceland",
+    "Hungary", "Romania", "Bulgaria", "Serbia", "Croatia",
+    "Slovenia", "Slovakia", "Lithuania", "Latvia", "Estonia",
+    "Ukraine", "Belarus", "Georgia", "Armenia", "Azerbaijan",
+    "Kazakhstan", "Uzbekistan", "Mongolia", "Nepal", "Myanmar",
+    "Cambodia", "Laos", "Singapore", "Taiwan", "Korea",
+    "Iraq", "Syria", "Jordan", "Lebanon", "Israel",
+    "Libya", "Sudan", "Tanzania", "Uganda", "Rwanda",
+    "Mozambique", "Zimbabwe", "Zambia", "Angola", "Cameroon",
+    "Madagascar", "Senegal", "Mali", "Niger", "Chad",
+    // Major cities — different entity class, same template
+    "London", "Paris", "Berlin", "Tokyo", "Beijing",
+    "Moscow", "Rome", "Madrid", "Lisbon", "Vienna",
+    "Prague", "Warsaw", "Budapest", "Athens", "Istanbul",
+    "Cairo", "Lagos", "Nairobi", "Mumbai", "Delhi",
+    "Bangkok", "Jakarta", "Manila", "Seoul", "Sydney",
+    "Melbourne", "Toronto", "Vancouver", "Montreal", "Chicago",
+    "Boston", "Miami", "Houston", "Dallas", "Phoenix",
+    "Denver", "Seattle", "Portland", "Detroit", "Atlanta",
+    "Edinburgh", "Dublin", "Oslo", "Stockholm", "Helsinki",
+    "Copenhagen", "Amsterdam", "Brussels", "Zurich", "Geneva",
+    "Barcelona", "Milan", "Naples", "Munich", "Hamburg",
+    "Lyon", "Marseille", "Osaka", "Kyoto", "Shanghai",
+    "Guangzhou", "Shenzhen", "Taipei", "Hanoi", "Manila",
+    "Karachi", "Dhaka", "Lima", "Bogota", "Santiago",
+    // People — further diversifies template-family activations
+    "Einstein", "Newton", "Darwin", "Shakespeare", "Mozart",
+    "Beethoven", "Picasso", "Napoleon", "Caesar", "Aristotle",
+    "Plato", "Socrates", "Galileo", "Copernicus", "Tesla",
+    "Edison", "Curie", "Pasteur", "Fleming", "Turing",
+    "Euclid", "Pythagoras", "Archimedes", "Descartes", "Leibniz",
+    "Bach", "Handel", "Chopin", "Tchaikovsky", "Wagner",
+    "Tolstoy", "Dostoevsky", "Dickens", "Hemingway", "Twain",
+    "Homer", "Virgil", "Dante", "Cervantes", "Goethe",
+    "Rembrandt", "Michelangelo", "Leonardo", "Raphael", "Monet",
+    "Columbus", "Magellan", "Vespucci", "Drake", "Cook",
+    // Organisations / institutions
+    "Microsoft", "Google", "Apple", "Amazon", "Tesla",
+    "Toyota", "Samsung", "Nintendo", "Sony", "Honda",
+    "Boeing", "Airbus", "Siemens", "Volkswagen", "Mercedes",
+    "Harvard", "Oxford", "Cambridge", "Stanford", "MIT",
+    // Abstract / generic nouns
+    "water", "fire", "earth", "iron", "gold",
+    "silver", "copper", "carbon", "oxygen", "nitrogen",
+    "hydrogen", "helium", "mercury", "uranium", "silicon",
+    "diamond", "marble", "granite", "limestone", "sandstone",
+    "wheat", "rice", "corn", "cotton", "sugar",
+    "coffee", "chocolate", "vanilla", "cinnamon", "pepper",
+    "oak", "maple", "pine", "cedar", "bamboo",
+    "salmon", "eagle", "dolphin", "elephant", "tiger",
+    "wolf", "bear", "lion", "whale", "shark",
+    "python", "cobra", "falcon", "sparrow", "robin",
+];
+
+/// Build template-matched decoy prompts for the MEMIT covariance set.
+/// For each distinct (relation) in the collected facts, synthesises
+/// "The {relation} of {entity} is" for every common entity.
+fn build_template_decoys(
+    patched: &larql_vindex::PatchedVindex,
+    vindex_path: &std::path::Path,
+    recording_ops: &[larql_vindex::PatchOp],
+) -> Result<Vec<Vec<u32>>, crate::error::LqlError> {
+    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
+        .map_err(|e| crate::error::LqlError::exec("load tokenizer for decoys", e))?;
+
+    let mut relations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut fact_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut collect_op = |op: &larql_vindex::PatchOp| {
+        if let larql_vindex::PatchOp::Insert { relation, entity, .. } = op {
+            if let Some(r) = relation.as_deref() {
+                relations.insert(r.to_string());
+            }
+            fact_entities.insert(entity.clone());
+        }
+    };
+    for p in &patched.patches {
+        for op in &p.operations {
+            collect_op(op);
+        }
+    }
+    for op in recording_ops {
+        collect_op(op);
+    }
+
+    let mut out = Vec::new();
+    let mut push_prompt = |out: &mut Vec<Vec<u32>>, prompt: &str| {
+        if let Ok(enc) = tokenizer.encode(prompt, true) {
+            out.push(enc.get_ids().to_vec());
+        }
+    };
+
+    // Template-matched decoys: the installed-relation × common-entity grid.
+    for rel in &relations {
+        let rel_words = rel.replace(['-', '_'], " ");
+        for entity in MEMIT_TEMPLATE_DECOY_ENTITIES {
+            if fact_entities.contains(&entity.to_string()) {
+                continue;
+            }
+            let prompt = format!("The {rel_words} of {entity} is");
+            push_prompt(&mut out, &prompt);
+        }
+    }
+
+    // Vindex-native prompts: every (entity, relation) in the KnnStore
+    // already present on the vindex (capped to keep compile time
+    // bounded). Matches Python MEMIT's "first 2000 vindex prompts"
+    // covariance source — without these, C is rank-deficient and the
+    // ridge dominates, collapsing every template-family prompt onto
+    // the installed payload.
+    const MAX_VINDEX_COV_PROMPTS: usize = 2000;
+    let mut harvested = 0usize;
+    let knn_entries = patched.knn_store.entries();
+    'outer: for entries in knn_entries.values() {
+        for entry in entries {
+            if harvested >= MAX_VINDEX_COV_PROMPTS {
+                break 'outer;
+            }
+            if fact_entities.contains(&entry.entity) {
+                continue;
+            }
+            let rel_words = entry.relation.replace(['-', '_'], " ");
+            let prompt = format!("The {rel_words} of {} is", entry.entity);
+            push_prompt(&mut out, &prompt);
+            harvested += 1;
+        }
+    }
+
+    Ok(out)
+}
+
 fn collect_memit_facts_with_recording(
     patched: &larql_vindex::PatchedVindex,
     vindex_path: &std::path::Path,

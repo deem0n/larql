@@ -120,5 +120,5 @@ pub use trace::{
     trace_forward, trace_forward_with_ffn, trace_forward_full,
     calibrate_scalar_gains,
 };
-pub use memit::{run_memit, MemitFact, MemitResult, MemitFactResult};
+pub use memit::{run_memit, run_memit_with_target_opt, MemitFact, MemitResult, MemitFactResult};
 pub use target_delta::{TargetDelta, TargetDeltaOpts};

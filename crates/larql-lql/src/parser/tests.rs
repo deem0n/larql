@@ -1071,6 +1071,20 @@ fn parse_show_models() {
     assert!(matches!(stmt, Statement::ShowModels));
 }
 
+// ── SHOW COMPACT STATUS ──
+
+#[test]
+fn parse_show_compact_status() {
+    let stmt = parse("SHOW COMPACT STATUS;").unwrap();
+    assert!(matches!(stmt, Statement::ShowCompactStatus));
+}
+
+#[test]
+fn parse_show_compact_status_no_semicolon() {
+    let stmt = parse("SHOW COMPACT STATUS").unwrap();
+    assert!(matches!(stmt, Statement::ShowCompactStatus));
+}
+
 // ── STATS ──
 
 #[test]

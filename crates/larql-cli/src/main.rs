@@ -87,6 +87,9 @@ enum Commands {
     /// Build a custom model from a Vindexfile (declarative: FROM + PATCH + INSERT).
     Build(build_cmd::BuildArgs),
 
+    /// Compile vindex patches into model weights (AOT compilation).
+    Compile(compile_cmd::CompileArgs),
+
     /// Convert between model formats (GGUF → vindex, safetensors → vindex).
     Convert(convert_cmd::ConvertArgs),
 
@@ -241,6 +244,7 @@ fn main() {
         Commands::FfnThroughput(args) => ffn_throughput_cmd::run(args),
         Commands::ExtractIndex(args) => extract_index_cmd::run(args),
         Commands::Build(args) => build_cmd::run(args),
+        Commands::Compile(args) => compile_cmd::run(args),
         Commands::Convert(args) => convert_cmd::run(args),
         Commands::Hf(args) => hf_cmd::run(args),
         Commands::Verify(args) => verify_cmd::run(args),

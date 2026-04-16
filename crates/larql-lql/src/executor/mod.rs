@@ -90,14 +90,20 @@ pub struct Session {
     /// hijacking their prior install's target (observed as "H" on
     /// every template query after Hyrule→Hateno install).
     #[allow(dead_code)]
-    pub(crate) installed_facts: Vec<InstalledFact>,
+    pub(crate) installed_edges: Vec<InstalledEdge>,
+    /// LSM epoch counter — advances on every mutation (INSERT/DELETE/UPDATE).
+    pub(crate) epoch: u64,
+    /// Mutations since last minor compaction (L0 → L1).
+    pub(crate) mutations_since_minor: usize,
+    /// Mutations since last major compaction (L1 → L2).
+    pub(crate) mutations_since_major: usize,
 }
 
 /// Metadata for an installed fact. Populated at INSERT time, used by
 /// subsequent INSERTs' cross-fact balance check.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct InstalledFact {
+pub(crate) struct InstalledEdge {
     pub layer: usize,
     pub feature: usize,
     pub canonical_prompt: String,
@@ -125,7 +131,10 @@ impl Session {
             auto_patch: false,
             decoy_residual_cache: std::collections::HashMap::new(),
             raw_install_residuals: std::collections::HashMap::new(),
-            installed_facts: Vec::new(),
+            installed_edges: Vec::new(),
+            epoch: 0,
+            mutations_since_minor: 0,
+            mutations_since_major: 0,
         }
     }
 
@@ -187,6 +196,7 @@ impl Session {
                 self.exec_show_entities(*layer, *limit)
             }
             Statement::ShowModels => self.exec_show_models(),
+            Statement::ShowCompactStatus => self.exec_show_compact_status(),
             Statement::Extract { model, output, components, layers, extract_level } => {
                 self.exec_extract(model, output, components.as_deref(), layers.as_ref(), *extract_level)
             }
@@ -204,6 +214,7 @@ impl Session {
                     entity, relation, target,
                     *layer, *confidence, *alpha, *mode,
                 )?);
+                self.advance_epoch();
                 Ok(out)
             }
             Statement::Infer { prompt, top, compare } => {
@@ -212,11 +223,13 @@ impl Session {
             Statement::Delete { conditions } => {
                 let mut out = self.ensure_patch_session();
                 out.extend(self.exec_delete(conditions)?);
+                self.advance_epoch();
                 Ok(out)
             }
             Statement::Update { set, conditions } => {
                 let mut out = self.ensure_patch_session();
                 out.extend(self.exec_update(set, conditions)?);
+                self.advance_epoch();
                 Ok(out)
             }
             Statement::Merge { source, target, conflict } => {
@@ -492,6 +505,12 @@ impl Session {
     /// tokenizer + relation classifier the synthetic test fixtures don't
     /// carry). Returns `None` if no vindex is loaded. Production code
     /// should go through `INSERT`/`DELETE`/`UPDATE` statements instead.
+    pub(crate) fn advance_epoch(&mut self) {
+        self.epoch += 1;
+        self.mutations_since_minor += 1;
+        self.mutations_since_major += 1;
+    }
+
     pub fn patched_overlay_mut(&mut self) -> Option<&mut larql_vindex::PatchedVindex> {
         match &mut self.backend {
             Backend::Vindex { patched, .. } => Some(patched),

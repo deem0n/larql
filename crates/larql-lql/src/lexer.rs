@@ -137,6 +137,8 @@ pub enum Keyword {
     Max,
     Until,
     Converged,
+    Compact,
+    Status,
 }
 
 impl Keyword {
@@ -331,6 +333,8 @@ impl Keyword {
             "MAX" => Some(Self::Max),
             "UNTIL" => Some(Self::Until),
             "CONVERGED" => Some(Self::Converged),
+            "COMPACT" => Some(Self::Compact),
+            "STATUS" => Some(Self::Status),
             _ => None,
         }
     }

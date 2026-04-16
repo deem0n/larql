@@ -15,6 +15,7 @@ pub mod extract;
 pub mod format;
 pub mod index;
 pub mod patch;
+pub mod storage;
 pub mod mmap_util;
 pub mod vindexfile;
 
@@ -68,6 +69,9 @@ pub use format::weights::{write_model_weights, load_model_weights, WeightSource,
 pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};
 pub use patch::knn_store::{KnnStore, KnnEntry};
 pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};
+
+// Storage engine
+pub use storage::{StorageEngine, Epoch, CompactStatus};
 
 // Vindexfile
 pub use vindexfile::{Vindexfile, VindexfileDirective, VindexfileStage, parse_vindexfile, build_from_vindexfile};

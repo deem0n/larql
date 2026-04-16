@@ -145,6 +145,7 @@ pub enum Statement {
     Stats {
         vindex: Option<String>,
     },
+    ShowCompactStatus,
 
     // ── Patch ──
     BeginPatch {
