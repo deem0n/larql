@@ -86,6 +86,42 @@ as before; prefill paths get the parallel speedup.
 
 `cargo bench -p larql-vindex --bench vindex_ops -- gate_knn_batch`
 
+## CPU vs GPU comparison (2026-04-26, M3 Max)
+
+Side-by-side at production gate-matrix shapes. Same operation, same
+inputs, both backends. CPU goes through Apple Accelerate (BLAS);
+Metal goes through `larql-compute`'s shaders (`f32_gemv_force` for
+decode, `matmul_transb` MPS path for prefill, `q4_matvec` for the
+Q4-decode hot path).
+
+| Op | Shape | CPU (Accelerate) | Metal | Speedup |
+|---|---|---|---|---|
+| f32 gemv (decode) | gemma-3-4b 10240×2560 | 2.09 ms | **525 µs** | **4.0×** |
+| f32 gemv (decode) | llama-3-8b 14336×4096 | 3.08 ms | **878 µs** | **3.5×** |
+| f32 matmul (seq64 prefill) | gemma-3-4b 10240×2560 | 4.06 ms | **3.11 ms** | **1.3×** |
+| f32 matmul (seq64 prefill) | llama-3-8b 14336×4096 | 9.63 ms | **5.55 ms** | **1.7×** |
+| Q4 matvec (decode, production hot path) | gemma-3-4b 10240×2560 | 1.17 ms | **496 µs** | **2.4×** |
+| Q4 matvec (decode, production hot path) | llama-3-8b 14336×4096 | 2.86 ms | **850 µs** | **3.4×** |
+
+Notes:
+- **Metal wins everywhere on single-position decode** — the Apple
+  Silicon GPU's bandwidth advantage compounds with the dispatch
+  cost being amortised across many large matvec calls per token.
+- **Prefill speedup is smaller** because Accelerate's GEMM is already
+  near memory-bandwidth-bound at seq_len=64 — the GPU still wins
+  but by a smaller margin.
+- **Q4 decode is the production path for `larql-inference`** —
+  `q4k_matmul_transb` streams Q4_K bytes from mmap straight into
+  Metal shaders. The 2.4–3.4× margin matches the older
+  Q4-Metal-vs-f32-BLAS numbers in the "Q4 Gate KNN" table below
+  but with newer kernels (Metal Q4 Gemma 4B was 0.96 ms in
+  2026-04-19; now 496 µs — a further 1.9× from kernel tuning).
+- Scaling bench is **CPU-only**. The dedicated `vindex_scaling.rs`
+  bench measures CPU through the full `gate_knn` pipeline; this
+  bench measures the raw compute kernel both ways.
+
+`cargo bench -p larql-vindex --features metal --bench cpu_vs_gpu`
+
 ## End-to-end decode (2026-04-25, real Q4K Gemma 3 4B)
 
 `larql bench /path/to/gemma3-4b-q4k-streaming.vindex --tokens 30

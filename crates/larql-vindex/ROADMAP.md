@@ -2,9 +2,10 @@
 
 ## Current state (as of 2026-04-25)
 
-- **331 tests passing** on `larql-vindex` (180 unit + 151 integration);
+- **338 tests passing** on `larql-vindex` (187 unit + 151 integration);
   211 on `larql-models`. Workspace builds clean. 0 clippy warnings
-  under `--lib --all-targets`.
+  under `--lib --all-targets`. Coverage: **61 % lines / 57 % functions**
+  (cargo-llvm-cov; new W2 files at 95–100 %).
 - **Folder layout decomposed**:
   - `index/{storage,compute,mutate}/` — substores, KNN dispatch, mutation
   - `format/{huggingface,weights,filenames,fp4_codec,…}/`

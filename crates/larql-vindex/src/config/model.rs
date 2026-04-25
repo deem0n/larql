@@ -91,3 +91,93 @@ fn default_router_type() -> String {
     "top_k_softmax".to_string()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_model_config() -> VindexModelConfig {
+        VindexModelConfig {
+            model_type: "gemma3".into(),
+            head_dim: 256,
+            num_q_heads: 8,
+            num_kv_heads: 4,
+            rope_base: 10000.0,
+            sliding_window: None,
+            moe: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            partial_rotary_factor: None,
+            sliding_window_pattern: None,
+            layer_types: None,
+            attention_k_eq_v: false,
+            num_kv_shared_layers: None,
+            per_layer_embed_dim: None,
+            rope_local_base: None,
+            query_pre_attn_scalar: None,
+            final_logit_softcapping: None,
+        }
+    }
+
+    #[test]
+    fn model_config_serde_round_trip() {
+        let cfg = minimal_model_config();
+        let j = serde_json::to_string(&cfg).unwrap();
+        let back: VindexModelConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.model_type, "gemma3");
+        assert_eq!(back.head_dim, 256);
+        assert_eq!(back.num_q_heads, 8);
+        assert_eq!(back.num_kv_heads, 4);
+    }
+
+    #[test]
+    fn optional_fields_absent_in_json_when_none() {
+        let cfg = minimal_model_config();
+        let j = serde_json::to_string(&cfg).unwrap();
+        assert!(!j.contains("global_head_dim"), "None optional should be omitted");
+        assert!(!j.contains("sliding_window_pattern"), "None optional should be omitted");
+    }
+
+    #[test]
+    fn model_config_with_softcap_round_trips() {
+        let mut cfg = minimal_model_config();
+        cfg.final_logit_softcapping = Some(30.0);
+        let j = serde_json::to_string(&cfg).unwrap();
+        let back: VindexModelConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.final_logit_softcapping, Some(30.0));
+    }
+
+    #[test]
+    fn model_config_with_moe() {
+        let mut cfg = minimal_model_config();
+        cfg.moe = Some(MoeConfig {
+            num_experts: 8,
+            top_k: 2,
+            shared_expert: false,
+            router_type: "top_k_softmax".into(),
+            moe_intermediate_size: Some(2048),
+            hybrid: false,
+        });
+        let j = serde_json::to_string(&cfg).unwrap();
+        let back: VindexModelConfig = serde_json::from_str(&j).unwrap();
+        let moe = back.moe.unwrap();
+        assert_eq!(moe.num_experts, 8);
+        assert_eq!(moe.top_k, 2);
+    }
+
+    #[test]
+    fn moe_config_default_router_type_via_serde() {
+        let json = r#"{"num_experts":4,"top_k":1,"shared_expert":false}"#;
+        let moe: MoeConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(moe.router_type, "top_k_softmax");
+        assert!(!moe.hybrid);
+    }
+
+    #[test]
+    fn moe_shared_expert_default_false() {
+        let json = r#"{"num_experts":4,"top_k":2,"router_type":"custom"}"#;
+        let moe: MoeConfig = serde_json::from_str(json).unwrap();
+        assert!(!moe.shared_expert);
+        assert!(!moe.hybrid);
+    }
+}
+

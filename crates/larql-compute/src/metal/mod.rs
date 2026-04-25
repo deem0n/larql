@@ -150,7 +150,7 @@ impl MetalBackend {
             .map_err(|e| eprintln!("[metal] shader compile error: {e}"))
             .ok()?;
 
-        use kernel::{ShaderKernel, get_shader_pipeline};
+        use kernel::get_shader_pipeline;
 
         let f32_ops = F32Ops {
             sgemm_pipeline: get_shader_pipeline::<shaders::sgemm::Kernel>(&device, &library)?,

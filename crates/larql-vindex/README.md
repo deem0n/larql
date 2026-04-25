@@ -423,10 +423,84 @@ parallelises per-position top-K extraction when `seq_len ≥ 16` — no
 caller change needed. Production prefill at seq_len=256 sees -24 % vs
 the serial path.
 
+## Recommended setup for `larql-server`
+
+`larql-server` exposes a vindex over HTTP/gRPC for `larql-router`-driven
+multi-shard grids. It's a long-running daemon — startup latency, RSS
+ceilings, and per-request KNN tail latency all matter.
+
+### Single-host serve (one shard, full model)
+
+```bash
+larql-server <vindex.path> --port 9180
+```
+
+Out of the box, `larql-server` mmaps the whole vindex, exposes
+`/knn`, `/walk`, `/infer`, etc. Production decode auto-selects the
+Metal backend on Apple Silicon — full-K matmul through
+`q4k_matmul_transb` is 2.4–4× faster than CPU on Gemma 4B
+10240×2560 (see the CPU-vs-GPU table in `PERFORMANCE.md`).
+
+For interp-style endpoints (`/walk`, `/knn` per layer), opt in to
+HNSW + parallel warmup — typical 34-layer Gemma 4B startup goes
+from ~2.6 s lazy to ~700 ms eager:
+
+```bash
+larql-server <vindex.path> --port 9180 --hnsw --hnsw-ef-search 200 --warmup-hnsw
+```
+
+`--warmup-hnsw` triggers `warmup_hnsw_all_layers()` at boot (3.6×
+speedup vs lazy build); requires `--hnsw`.
+
+### Multi-shard grid (`larql-router` + N × `larql-server`)
+
+Each shard owns a layer range. Recommended extract + run:
+
+```bash
+# Build the vindex once with feature-major down so each shard avoids
+# the ~840 MB heap cache ceiling on its slice.
+larql extract-index <model> -o <vindex> --quant q4k --feature-major-down
+
+# Per shard — same vindex path, distinct port, distinct layer range.
+larql-server <vindex.path> --port 9181 --layers 0-16 --no-infer \
+  --max-q4k-cache-layers 1
+larql-server <vindex.path> --port 9182 --layers 17-33 --no-infer \
+  --max-q4k-cache-layers 1
+
+# Router on top.
+larql-router --shards 0-16=http://127.0.0.1:9181,17-33=http://127.0.0.1:9182 \
+             --port 9190
+```
+
+Why each flag matters:
+- `--feature-major-down` (extract-time) — emits `down_features_q4k.bin`.
+  Per-feature down decode reads one row from the new file instead of
+  dequantising the whole layer + transposing through the cache.
+  Deletes the binding RSS constraint on per-shard memory budget. See
+  [docs/adr/009](docs/adr/009-feature-major-down.md) for the
+  architectural decision.
+- `--max-q4k-cache-layers 1` — caps the legacy `q4k_ffn_layer` cache
+  at one layer. With feature-major down loaded the cache is barely
+  used; this just bounds it. (Set to 0 to disable entirely once
+  every vindex on the grid has feature-major down.)
+- `--no-infer` — shards typically don't run the decode loop; the
+  router orchestrates. Skipping inference setup saves a chunk of
+  GPU buffer allocation per shard.
+- `--layers <range>` — server reads + answers queries only for its
+  range. The mmaps are demand-paged so unowned layers stay
+  paged-out.
+
+### Bench discipline on grid hosts
+
+The `vindex_scaling` and `cpu_vs_gpu` benches refuse to run while
+`larql-server` or `larql-router` is on the same host (3× run-to-run
+swing observed in the 2026-04-25 audit). To bench against a live
+grid intentionally, set `LARQL_BENCH_ALLOW_DAEMONS=1`.
+
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 331 tests (180 unit + 151 integration; all green as of 2026-04-25)
+cargo test -p larql-vindex                                                      # 338 tests (187 unit + 151 integration; all green as of 2026-04-25)
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -589,7 +663,8 @@ pinned layers skip PCIe transfers and the gradient steepens.
 ## Status
 
 ```
-Tests:      331 passing (180 unit + 151 integration; clippy clean as of 2026-04-25)
+Tests:      338 passing (187 unit + 151 integration; clippy clean as of 2026-04-25)
+Coverage:   61% lines / 57% functions (cargo-llvm-cov; W2 files 95–100%)
 Warnings:   0 (build), 0 (clippy --all-targets)
 Formats:    f32, Q8_0, Q4_K, Q6_K, Q4_0, FP4, FP8
 Models:     Gemma 2/3/4, Llama, Mistral, Mixtral, Qwen, Phi, DeepSeek, Granite, StarCoder2, GPT-OSS, GPT-2

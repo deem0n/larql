@@ -223,3 +223,47 @@ impl VectorIndex {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::index::core::VectorIndex;
+
+    /// Locks in the W2 footgun fix: `q4k_ffn_row_scaled_add` rejects
+    /// `component == 2` (down) up-front. Down on disk is
+    /// `[hidden, intermediate]` so `feat`-th row is hidden-dim wide,
+    /// not a single feature's down vector — calling this function
+    /// with `component == 2` would have silently produced wrong
+    /// values. The dispatch in `ffn_row_scaled_add` routes
+    /// `component == 2` to either `q4k_down_feature_scaled_add` (W2)
+    /// or `q4k_ffn_row_scaled_add_via_cache` (legacy); this raw entry
+    /// point must refuse the coordinate explicitly.
+    #[test]
+    fn q4k_ffn_row_scaled_add_rejects_component_2() {
+        let index = VectorIndex::empty(1, 256);
+        let mut out = vec![0.0f32; 256];
+        for component in [2usize, 3, 4, 99] {
+            let ok = index.q4k_ffn_row_scaled_add(0, component, 0, 1.0, &mut out);
+            assert!(!ok, "component {component} must be rejected");
+        }
+    }
+
+    /// Mismatched output buffer size is rejected up-front — the
+    /// scaled-add API contract is `out.len() == hidden_size`.
+    #[test]
+    fn q4k_ffn_row_scaled_add_rejects_wrong_out_len() {
+        let index = VectorIndex::empty(1, 256);
+        let mut bad = vec![0.0f32; 128]; // half-width
+        let ok = index.q4k_ffn_row_scaled_add(0, 0, 0, 1.0, &mut bad);
+        assert!(!ok, "out.len() != hidden_size must be rejected");
+    }
+
+    /// `q4k_down_feature_scaled_add` returns `false` when no feature-major
+    /// down file is loaded — caller's responsibility to fall back to the
+    /// cache path. The dispatch in `ffn_row_scaled_add` does exactly that.
+    #[test]
+    fn q4k_down_feature_scaled_add_returns_false_when_unloaded() {
+        let index = VectorIndex::empty(1, 256);
+        let mut out = vec![0.0f32; 256];
+        assert!(!index.q4k_down_feature_scaled_add(0, 0, 1.0, &mut out));
+    }
+}

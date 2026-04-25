@@ -114,6 +114,16 @@ struct Cli {
     #[arg(long, default_value = "200")]
     hnsw_ef_search: usize,
 
+    /// Eager-build the HNSW index for every owned layer at startup
+    /// (rayon-parallel across layers). One-shot; trades ~700 ms of boot
+    /// time for first-query latency that would otherwise pay ~76 ms /
+    /// layer × N lazy builds spread across the first request volume.
+    /// Recommended when this server will see traffic on every layer
+    /// (e.g. `larql-router` shards behind a steady-state interp pipeline).
+    /// Requires `--hnsw`.
+    #[arg(long, requires = "hnsw")]
+    warmup_hnsw: bool,
+
     /// Ask the kernel to drop resident mmap pages after each walk-ffn
     /// request (calls `madvise(MADV_DONTNEED)` on every mapping). On
     /// Linux RSS drops immediately; on Darwin the kernel may defer.
@@ -204,6 +214,7 @@ fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn load_single_vindex(
     path_str: &str,
     no_infer: bool,
@@ -213,6 +224,7 @@ fn load_single_vindex(
     max_gate_cache_layers: usize,
     max_q4k_cache_layers: usize,
     hnsw: Option<usize>,
+    warmup_hnsw: bool,
     release_mmap_after_request: bool,
     expert_filter: Option<(usize, usize)>,
 ) -> Result<LoadedModel, BoxError> {
@@ -242,6 +254,11 @@ fn load_single_vindex(
     if let Some(ef) = hnsw {
         index.enable_hnsw(ef);
         info!("  HNSW gate KNN: enabled (ef_search={ef})");
+        if warmup_hnsw {
+            let t0 = std::time::Instant::now();
+            index.warmup_hnsw_all_layers();
+            info!("  HNSW warmup: built {} layers in {:.2?}", config.num_layers, t0.elapsed());
+        }
     }
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
 
@@ -408,14 +425,14 @@ async fn main() -> Result<(), BoxError> {
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
             let hnsw = if cli.hnsw { Some(cli.hnsw_ef_search) } else { None };
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.release_mmap_after_request, expert_filter) {
+            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.warmup_hnsw, cli.release_mmap_after_request, expert_filter) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
         let hnsw = if cli.hnsw { Some(cli.hnsw_ef_search) } else { None };
-        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.release_mmap_after_request, expert_filter)?;
+        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.warmup_hnsw, cli.release_mmap_after_request, expert_filter)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());

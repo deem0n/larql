@@ -5,7 +5,7 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 
 ---
 
-## Current state (2026-04-25)
+## Current state (2026-04-26)
 
 ```
 larql-metal  gemma3-4b-q4k-v2   75–77 tok/s   13.0ms/tok
@@ -109,6 +109,7 @@ improvements were adapted to the linear layout.
 | 2026-04-25 | `q6k_matvec` 4-element batching (compile-time hi2 shifts) | 14.7ms | 13.7ms | −1.0ms |
 | 2026-04-25 | Q6K inter-superblock interleaving + X preload + deferred scale | 13.7ms | 11.8ms | −1.9ms |
 | 2026-04-25 | lm_head min-heap top-k (avoids 2MB Vec allocation) | 2.40ms | 2.35ms | −0.05ms |
+| 2026-04-25 | Dispatch fusions (QK-norm Q+K, RoPE Q+K, residual_norm_store, normed QKV) | 72ms | ~13ms | +1–2 tok/s |
 
 ---
 

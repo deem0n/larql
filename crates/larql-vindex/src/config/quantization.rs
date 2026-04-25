@@ -138,3 +138,74 @@ impl Fp4Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quant_format_default_is_none() {
+        assert_eq!(QuantFormat::default(), QuantFormat::None);
+    }
+
+    #[test]
+    fn quant_format_display() {
+        assert_eq!(QuantFormat::None.to_string(), "none");
+        assert_eq!(QuantFormat::Q4K.to_string(), "q4k");
+    }
+
+    #[test]
+    fn quant_format_serde_round_trip() {
+        let j = serde_json::to_string(&QuantFormat::Q4K).unwrap();
+        let back: QuantFormat = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, QuantFormat::Q4K);
+    }
+
+    #[test]
+    fn precision_display_all_variants() {
+        assert_eq!(Precision::Fp4.to_string(), "fp4");
+        assert_eq!(Precision::Fp8.to_string(), "fp8");
+        assert_eq!(Precision::F16.to_string(), "f16");
+        assert_eq!(Precision::F32.to_string(), "f32");
+    }
+
+    #[test]
+    fn precision_serde_snake_case() {
+        let j = serde_json::to_string(&Precision::Fp4).unwrap();
+        assert_eq!(j, "\"fp4\"");
+        let back: Precision = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, Precision::Fp4);
+    }
+
+    #[test]
+    fn fp4_config_v1_defaults_block_geometry() {
+        let cfg = Fp4Config::v1_defaults(Fp4Config::option_b_default().projections);
+        assert_eq!(cfg.fp4_format_version, 1);
+        assert_eq!(cfg.block_elements, 256);
+        assert_eq!(cfg.sub_block_elements, 32);
+        assert_eq!(cfg.sub_block_scale_dtype, "fp8_e4m3");
+        assert_eq!(cfg.block_scale_dtype, "fp8_e4m3");
+        assert_eq!(cfg.value_encoding, "fp4_e2m1_mxfp4_nibble_order");
+    }
+
+    #[test]
+    fn fp4_config_option_b_projection_precisions() {
+        let cfg = Fp4Config::option_b_default();
+        assert_eq!(cfg.projections.gate.precision, Precision::Fp4);
+        assert_eq!(cfg.projections.up.precision, Precision::Fp4);
+        assert_eq!(cfg.projections.down.precision, Precision::Fp8);
+    }
+
+    #[test]
+    fn fp4_config_compliance_gate_defaults() {
+        let cfg = Fp4Config::option_b_default();
+        assert_eq!(cfg.compliance_gate.fallback_precision, Precision::Fp8);
+        assert!(cfg.compliance_gate.min_compliant_fraction > 0.0);
+    }
+
+    #[test]
+    fn fp4_config_compliance_report_filename() {
+        let cfg = Fp4Config::option_b_default();
+        assert_eq!(cfg.compliance_report, "fp4_compliance.json");
+    }
+}
+

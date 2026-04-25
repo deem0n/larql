@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "q4k_cache"
 harness = false
+
+[[bench]]
+name = "cpu_vs_gpu"
+harness = false

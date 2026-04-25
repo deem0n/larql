@@ -9,8 +9,10 @@
 //! lm_head` to get logits — see `crate::forward::hidden_to_raw_logits`.
 
 pub mod accuracy;
+pub mod apollo;
 pub mod markov_residual;
 pub mod profiler;
+pub mod turbo_quant;
 pub mod unlimited_context;
 
 use ndarray::Array2;
@@ -114,6 +116,8 @@ pub trait KvEngine: Send {
 pub enum EngineKind {
     MarkovResidual { window_size: Option<usize> },
     UnlimitedContext { window_size: usize },
+    TurboQuant { bits: u8 },
+    Apollo { injection_layer: usize, inject_coefficient: f32, top_k: usize },
 }
 
 impl EngineKind {
@@ -128,14 +132,28 @@ impl EngineKind {
             "unlimited" | "unlimited-context" | "unlimited_context" => {
                 Some(EngineKind::UnlimitedContext { window_size: 512 })
             }
+            "turbo-quant" | "turbo_quant" | "turboquant" | "tq4" => {
+                Some(EngineKind::TurboQuant { bits: 4 })
+            }
+            "tq3" => Some(EngineKind::TurboQuant { bits: 3 }),
+            "apollo" => {
+                let cfg = apollo::entry::InjectionConfig::default();
+                Some(EngineKind::Apollo {
+                    injection_layer: cfg.injection_layer,
+                    inject_coefficient: cfg.inject_coefficient,
+                    top_k: cfg.top_k,
+                })
+            }
             _ => None,
         }
     }
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            EngineKind::MarkovResidual { .. } => "markov-rs",
+            EngineKind::MarkovResidual { .. }  => "markov-rs",
             EngineKind::UnlimitedContext { .. } => "unlimited-context",
+            EngineKind::TurboQuant { .. }       => "turbo-quant",
+            EngineKind::Apollo { .. }           => "apollo",
         }
     }
 
@@ -153,6 +171,14 @@ impl EngineKind {
             }
             EngineKind::UnlimitedContext { window_size } => {
                 Box::new(unlimited_context::UnlimitedContextEngine::with_backend(window_size, backend))
+            }
+            EngineKind::TurboQuant { bits } => {
+                Box::new(turbo_quant::TurboQuantEngine::with_backend(bits, backend))
+            }
+            EngineKind::Apollo { injection_layer, inject_coefficient, top_k } => {
+                Box::new(apollo::ApolloEngine::new(
+                    apollo::InjectionConfig { injection_layer, inject_coefficient, top_k }
+                ))
             }
         }
     }

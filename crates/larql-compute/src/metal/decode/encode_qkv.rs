@@ -276,7 +276,7 @@ impl MetalBackend {
     fn encode_normed_q4k_q6k_qkv(
         &self,
         enc: &ComputeCommandEncoderRef,
-        layer: &FullPipelineLayer,
+        _layer: &FullPipelineLayer,
         bufs: &QkvBufs<'_>,
         dims: QkvDims,
     ) {

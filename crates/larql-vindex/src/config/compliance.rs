@@ -107,3 +107,91 @@ impl LayerBands {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma3_34_layer_bands() {
+        let b = LayerBands::for_family("gemma3", 34).unwrap();
+        assert_eq!(b.syntax, (0, 13));
+        assert_eq!(b.knowledge, (14, 27));
+        assert_eq!(b.output, (28, 33));
+    }
+
+    #[test]
+    fn llama_32_layer_bands() {
+        let b = LayerBands::for_family("llama", 32).unwrap();
+        assert_eq!(b.syntax, (0, 12));
+        assert_eq!(b.knowledge, (13, 25));
+        assert_eq!(b.output, (26, 31));
+    }
+
+    #[test]
+    fn unknown_family_with_sufficient_layers_uses_fallback() {
+        let b = LayerBands::for_family("custom_model", 20);
+        assert!(b.is_some(), "should fall back to fraction-based estimate");
+        let b = b.unwrap();
+        // Bands partition [0, 19] into syntax/knowledge/output
+        assert!(b.syntax.1 < b.knowledge.0);
+        assert!(b.knowledge.1 < b.output.0);
+        assert_eq!(b.output.1, 19);
+    }
+
+    #[test]
+    fn too_few_layers_returns_none() {
+        assert!(LayerBands::for_family("gpt2", 4).is_none());
+        assert!(LayerBands::for_family("tiny", 1).is_none());
+    }
+
+    #[test]
+    fn band_for_layer_gemma3() {
+        let b = LayerBands::for_family("gemma3", 34).unwrap();
+        assert_eq!(b.band_for_layer(0), "syntax");
+        assert_eq!(b.band_for_layer(13), "syntax");
+        assert_eq!(b.band_for_layer(14), "knowledge");
+        assert_eq!(b.band_for_layer(27), "knowledge");
+        assert_eq!(b.band_for_layer(28), "output");
+        assert_eq!(b.band_for_layer(33), "output");
+    }
+
+    #[test]
+    fn band_for_layer_out_of_range_is_unknown() {
+        let b = LayerBands { syntax: (0, 5), knowledge: (6, 10), output: (11, 15) };
+        assert_eq!(b.band_for_layer(99), "unknown");
+    }
+
+    #[test]
+    fn layer_bands_serde_round_trip() {
+        let b = LayerBands::for_family("gemma3", 34).unwrap();
+        let j = serde_json::to_string(&b).unwrap();
+        let back: LayerBands = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.syntax, b.syntax);
+        assert_eq!(back.knowledge, b.knowledge);
+        assert_eq!(back.output, b.output);
+    }
+
+    #[test]
+    fn compliance_gate_serde_round_trip() {
+        use crate::config::quantization::Precision;
+        let gate = ComplianceGate {
+            threshold_ratio: 16.0,
+            min_compliant_fraction: 0.99,
+            fallback_precision: Precision::Fp8,
+        };
+        let j = serde_json::to_string(&gate).unwrap();
+        let back: ComplianceGate = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.threshold_ratio, 16.0);
+        assert_eq!(back.min_compliant_fraction, 0.99);
+        assert_eq!(back.fallback_precision, Precision::Fp8);
+    }
+
+    #[test]
+    fn gpt2_12_layer_bands() {
+        let b = LayerBands::for_family("gpt2", 12).unwrap();
+        assert_eq!(b.syntax, (0, 4));
+        assert_eq!(b.knowledge, (5, 9));
+        assert_eq!(b.output, (10, 11));
+    }
+}
+

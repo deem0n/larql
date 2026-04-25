@@ -737,3 +737,67 @@ where
     out.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::top_k_by_abs;
+    use ndarray::Array1;
+
+    #[test]
+    fn top_k_by_abs_basic_ordering() {
+        let scores: Vec<f32> = vec![0.1, -0.9, 0.5, 0.3];
+        let result = top_k_by_abs(scores, 2);
+        assert_eq!(result.len(), 2);
+        // Top-2 by |val|: index 1 (|-0.9|=0.9) then index 2 (|0.5|=0.5).
+        assert_eq!(result[0].0, 1);
+        assert!((result[0].1 - (-0.9)).abs() < 1e-6);
+        assert_eq!(result[1].0, 2);
+    }
+
+    #[test]
+    fn top_k_by_abs_negative_values_selected_by_magnitude() {
+        let scores: Vec<f32> = vec![1.0, -2.0, 0.5];
+        let result = top_k_by_abs(scores, 1);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1); // |-2.0| is largest
+    }
+
+    #[test]
+    fn top_k_by_abs_k_larger_than_input() {
+        let scores: Vec<f32> = vec![1.0, 2.0];
+        let result = top_k_by_abs(scores, 10);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn top_k_by_abs_k_zero_returns_empty() {
+        let scores: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let result = top_k_by_abs(scores, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn top_k_by_abs_empty_input_returns_empty() {
+        let result = top_k_by_abs(std::iter::empty::<f32>(), 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn top_k_by_abs_result_sorted_descending() {
+        let scores: Vec<f32> = vec![0.3, 0.1, 0.9, 0.5, 0.7];
+        let result = top_k_by_abs(scores, 3);
+        assert_eq!(result.len(), 3);
+        for w in result.windows(2) {
+            assert!(w[0].1.abs() >= w[1].1.abs(), "not sorted: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn top_k_from_scores_via_array1() {
+        use crate::index::VectorIndex;
+        let arr = Array1::from_vec(vec![0.1f32, -0.9, 0.5]);
+        let result = VectorIndex::top_k_from_scores(&arr, 2);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 1); // |-0.9| largest
+    }
+}

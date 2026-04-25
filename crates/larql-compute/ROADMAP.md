@@ -263,17 +263,12 @@ fusion was attempted but regressed due to GELU-tanh recomputation cost
 From the 2026-04-25 codebase review. Most ship in the same time
 window as the perf wins above; some unblock cleaner perf work.
 
-### #6 — Magic-string kernel names on non-tiled shaders (open)
+### #6 — Magic-string kernel names on non-tiled shaders (DONE)
 
-`metal/mod.rs` has **27 raw `library.get_function("...")` calls**
-for shaders without `KernelHandle`-style row-tiling (sgemm, geglu,
-rope, rms_norm, layer_norm, kv_attention, etc.). They don't need
-geometry tracking, but the *kernel name string* still drifts —
-renaming a shader silently breaks runtime binding.
-
-Add a `KernelName` trait (sibling of `TiledKernel`) that exports
-`KERNEL_NAME` per shader file. Then `library.get_function(<shader>::NAME, …)`
-reads the constant. ~30 LOC per shader file, mechanical.
+Added `ShaderKernel` trait + `get_shader_pipeline::<T>()` to
+`kernel/traits.rs`; 31 magic strings eliminated. Each shader now
+exports a compile-time `NAME` constant — renaming a shader causes a
+compile error rather than a silent runtime panic.
 
 ### #7 — `QuantFormat` pattern-match spread (open)
 
@@ -287,12 +282,11 @@ QuantFormat::*` confined to one constructor in
 `metal/stages/quant_matvec.rs`. Callers receive the opaque route.
 Adding FP4 = one match arm.
 
-### #8 — `Pipelines` struct asymmetry (open)
+### #8 — `Pipelines` struct asymmetry (DONE)
 
-`metal/stages/quant_matvec.rs::Pipelines` mixes `&KernelHandle`
-(only `q4_matvec`) with bare `&ComputePipelineState` (q4k_matvec,
-q4kf_proj, q6k_matvec). Markers exist for all of them — migrate to
-uniform `KernelHandle` storage. Mechanical, ~100 LOC across
+All fields in `metal/stages/quant_matvec.rs::Pipelines` now use
+`&KernelHandle`; geometry drift is now a compile error rather than
+a silent dispatch mismatch. ~100 LOC mechanical migration across
 callsites.
 
 ### #9 — `FullPipelineLayer` 63 pub fields (open)

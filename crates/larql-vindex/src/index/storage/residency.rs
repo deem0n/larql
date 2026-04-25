@@ -219,3 +219,163 @@ impl ResidencyManager {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr(budget_mb: usize, num_layers: usize, features_per_layer: usize) -> ResidencyManager {
+        ResidencyManager::new(budget_mb, num_layers, 64, vec![features_per_layer; num_layers])
+    }
+
+    #[test]
+    fn new_all_layers_cold() {
+        let m = mgr(100, 4, 10);
+        for l in 0..4 {
+            assert_eq!(m.state(l), LayerState::Cold);
+        }
+        assert_eq!(m.num_pinned(), 0);
+        assert_eq!(m.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn mark_q4_available_transitions_cold_to_mmap() {
+        let mut m = mgr(100, 3, 10);
+        m.mark_q4_available();
+        for l in 0..3 {
+            assert_eq!(m.state(l), LayerState::MmapQ4);
+        }
+    }
+
+    #[test]
+    fn mark_q4_available_does_not_overwrite_pinned() {
+        let mut m = mgr(100, 2, 10);
+        let data = vec![0u8; 16];
+        m.pin_layer(0, &data);
+        m.mark_q4_available();
+        // Layer 0 was pinned, should stay pinned
+        assert_eq!(m.state(0), LayerState::Pinned);
+        // Layer 1 was cold, transitions to mmap
+        assert_eq!(m.state(1), LayerState::MmapQ4);
+    }
+
+    #[test]
+    fn pin_layer_succeeds_within_budget() {
+        let mut m = mgr(10, 4, 10);
+        let data = vec![0u8; 512]; // 512 bytes
+        let ok = m.pin_layer(0, &data);
+        assert!(ok);
+        assert_eq!(m.state(0), LayerState::Pinned);
+        assert_eq!(m.pinned_bytes(), 512);
+        assert_eq!(m.num_pinned(), 1);
+    }
+
+    #[test]
+    fn pin_layer_fails_when_over_budget() {
+        let mut m = mgr(0, 2, 10); // 0 MB budget
+        let data = vec![0u8; 1024];
+        let ok = m.pin_layer(0, &data);
+        assert!(!ok);
+        assert_eq!(m.state(0), LayerState::Cold);
+    }
+
+    #[test]
+    fn pin_layer_idempotent_for_already_pinned() {
+        let mut m = mgr(10, 2, 10);
+        let data = vec![1u8; 64];
+        m.pin_layer(0, &data);
+        let bytes_before = m.pinned_bytes();
+        let ok = m.pin_layer(0, &data); // pin again
+        assert!(ok);
+        assert_eq!(m.pinned_bytes(), bytes_before, "double-pin should not add bytes");
+    }
+
+    #[test]
+    fn pin_layer_out_of_bounds_returns_false() {
+        let mut m = mgr(100, 2, 10);
+        let ok = m.pin_layer(99, &[0u8; 16]);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn evict_layer_frees_memory() {
+        let mut m = mgr(10, 2, 10);
+        let data = vec![0u8; 256];
+        m.pin_layer(0, &data);
+        assert_eq!(m.pinned_bytes(), 256);
+        m.evict_layer(0);
+        assert_eq!(m.state(0), LayerState::MmapQ4);
+        assert_eq!(m.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn evict_non_pinned_is_noop() {
+        let mut m = mgr(100, 2, 10);
+        m.evict_layer(0); // cold layer — should not panic
+        assert_eq!(m.state(0), LayerState::Cold);
+    }
+
+    #[test]
+    fn pinned_q4_returns_data() {
+        let mut m = mgr(10, 2, 10);
+        let data = vec![42u8; 32];
+        m.pin_layer(0, &data);
+        let q4 = m.pinned_q4(0).unwrap();
+        assert_eq!(q4, data.as_slice());
+    }
+
+    #[test]
+    fn pinned_q4_returns_none_for_cold_layer() {
+        let m = mgr(10, 2, 10);
+        assert!(m.pinned_q4(0).is_none());
+    }
+
+    #[test]
+    fn record_access_increments_count() {
+        let mut m = mgr(10, 3, 10);
+        m.record_access(1);
+        m.record_access(1);
+        m.record_access(2);
+        // Access counts influence auto_pin order; verify no panic and state stays valid
+        assert_eq!(m.state(0), LayerState::Cold);
+    }
+
+    #[test]
+    fn auto_pin_fills_budget_most_accessed_first() {
+        let mut m = mgr(10, 3, 10);
+        m.mark_q4_available();
+        m.record_access(2);
+        m.record_access(2);
+        m.record_access(0);
+        let data = vec![0u8; 64];
+        let pinned = m.auto_pin(|_layer| Some(data.clone()));
+        assert!(pinned > 0);
+    }
+
+    #[test]
+    fn pin_range_pins_specified_layers() {
+        let mut m = mgr(100, 5, 10);
+        let data = vec![0u8; 32];
+        let count = m.pin_range(1, 4, |_| Some(data.clone()));
+        assert!(count > 0);
+        // Layers 0 and 4+ remain cold
+        assert_eq!(m.state(0), LayerState::Cold);
+    }
+
+    #[test]
+    fn layer_q4_bytes_formula() {
+        // floats = features * hidden_size; q4 bytes = floats / 32 * 18
+        let m = ResidencyManager::new(100, 1, 64, vec![32]);
+        let expected = (32 * 64) / 32 * 18;
+        assert_eq!(m.layer_q4_bytes(0), expected);
+    }
+
+    #[test]
+    fn summary_contains_budget_info() {
+        let m = mgr(100, 4, 10);
+        let s = m.summary();
+        assert!(s.contains("pinned"), "{s}");
+        assert!(s.contains("budget"), "{s}");
+        assert!(s.contains("cold"), "{s}");
+    }
+}

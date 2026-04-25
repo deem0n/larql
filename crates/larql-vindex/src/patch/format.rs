@@ -229,3 +229,185 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, VindexError> {
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── base64 encoding ─────────────────────────────────────────────────
+
+    #[test]
+    fn encode_decode_round_trip_single_float() {
+        let vec = vec![1.0f32];
+        let b64 = encode_gate_vector(&vec);
+        let back = decode_gate_vector(&b64).unwrap();
+        assert_eq!(back, vec);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_multi_float() {
+        let vec: Vec<f32> = vec![0.0, 1.0, -1.0, 3.25, f32::MAX, f32::MIN_POSITIVE];
+        let b64 = encode_gate_vector(&vec);
+        let back = decode_gate_vector(&b64).unwrap();
+        for (a, b) in vec.iter().zip(back.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "bit-exact round-trip required");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_unaligned_bytes() {
+        // "YWJj" is base64 for the 3 bytes b"abc".
+        // 3 bytes % 4 != 0, so decode_gate_vector must reject it.
+        let result = decode_gate_vector("YWJj");
+        assert!(result.is_err(), "3-byte payload should fail alignment check");
+    }
+
+    #[test]
+    fn decode_rejects_invalid_char() {
+        let result = decode_gate_vector("!!!!");
+        assert!(result.is_err());
+    }
+
+    // ── PatchOp::key ─────────────────────────────────────────────────────
+
+    #[test]
+    fn patch_op_key_insert() {
+        let op = PatchOp::Insert {
+            layer: 3,
+            feature: 42,
+            relation: None,
+            entity: "France".into(),
+            target: "Paris".into(),
+            confidence: None,
+            gate_vector_b64: None,
+            down_meta: None,
+        };
+        assert_eq!(op.key(), Some((3, 42)));
+    }
+
+    #[test]
+    fn patch_op_key_update() {
+        let op = PatchOp::Update { layer: 5, feature: 7, gate_vector_b64: None, down_meta: None };
+        assert_eq!(op.key(), Some((5, 7)));
+    }
+
+    #[test]
+    fn patch_op_key_delete() {
+        let op = PatchOp::Delete { layer: 1, feature: 0, reason: None };
+        assert_eq!(op.key(), Some((1, 0)));
+    }
+
+    #[test]
+    fn patch_op_key_insert_knn_is_none() {
+        let op = PatchOp::InsertKnn {
+            layer: 0,
+            entity: "e".into(),
+            relation: "r".into(),
+            target: "t".into(),
+            target_id: 1,
+            confidence: None,
+            key_vector_b64: encode_gate_vector(&[1.0, 0.0]),
+        };
+        assert_eq!(op.key(), None);
+    }
+
+    #[test]
+    fn patch_op_key_delete_knn_is_none() {
+        let op = PatchOp::DeleteKnn { entity: "e".into() };
+        assert_eq!(op.key(), None);
+    }
+
+    // ── VindexPatch counts / len / is_empty ──────────────────────────────
+
+    fn make_patch(ops: Vec<PatchOp>) -> VindexPatch {
+        VindexPatch {
+            version: 1,
+            base_model: "test".into(),
+            base_checksum: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            description: None,
+            author: None,
+            tags: vec![],
+            operations: ops,
+        }
+    }
+
+    #[test]
+    fn empty_patch_counts() {
+        let p = make_patch(vec![]);
+        assert_eq!(p.len(), 0);
+        assert!(p.is_empty());
+        assert_eq!(p.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn patch_counts_mixed_ops() {
+        let ops = vec![
+            PatchOp::Insert { layer: 0, feature: 0, relation: None, entity: "A".into(), target: "B".into(), confidence: None, gate_vector_b64: None, down_meta: None },
+            PatchOp::Insert { layer: 0, feature: 1, relation: None, entity: "C".into(), target: "D".into(), confidence: None, gate_vector_b64: None, down_meta: None },
+            PatchOp::Update { layer: 0, feature: 2, gate_vector_b64: None, down_meta: None },
+            PatchOp::Delete { layer: 0, feature: 3, reason: None },
+        ];
+        let p = make_patch(ops);
+        assert_eq!(p.len(), 4);
+        assert!(!p.is_empty());
+        assert_eq!(p.counts(), (2, 1, 1));
+    }
+
+    #[test]
+    fn patch_counts_knn_ops() {
+        let kv = encode_gate_vector(&[1.0]);
+        let ops = vec![
+            PatchOp::InsertKnn { layer: 0, entity: "e".into(), relation: "r".into(), target: "t".into(), target_id: 1, confidence: None, key_vector_b64: kv },
+            PatchOp::DeleteKnn { entity: "e".into() },
+        ];
+        let p = make_patch(ops);
+        // InsertKnn → insert counter, DeleteKnn → delete counter
+        assert_eq!(p.counts(), (1, 0, 1));
+    }
+
+    // ── Save / load round-trip ────────────────────────────────────────────
+
+    #[test]
+    fn save_load_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.vlp");
+
+        let ops = vec![
+            PatchOp::Insert {
+                layer: 2,
+                feature: 100,
+                relation: Some("capital".into()),
+                entity: "France".into(),
+                target: "Paris".into(),
+                confidence: Some(0.95),
+                gate_vector_b64: None,
+                down_meta: None,
+            },
+        ];
+        let patch = VindexPatch {
+            version: 1,
+            base_model: "gemma3-4b".into(),
+            base_checksum: Some("abc123".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            description: Some("test patch".into()),
+            author: Some("test".into()),
+            tags: vec!["geography".into()],
+            operations: ops,
+        };
+
+        patch.save(&path).unwrap();
+        let loaded = VindexPatch::load(&path).unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.base_model, "gemma3-4b");
+        assert_eq!(loaded.tags, vec!["geography"]);
+        assert_eq!(loaded.operations.len(), 1);
+    }
+
+    #[test]
+    fn load_missing_file_returns_error() {
+        let result = VindexPatch::load(std::path::Path::new("/nonexistent/path.vlp"));
+        assert!(result.is_err());
+    }
+}
