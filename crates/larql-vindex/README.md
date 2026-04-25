@@ -387,8 +387,9 @@ cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      
 
 | Bench | Operation | Time |
 |---|---|---|
-| `extract_throughput` | streaming extract, f32 | ~37 ms |
-| `extract_throughput` | streaming extract, **Q4K** | ~22 ms (1.67× faster; output is ~3× smaller so disk I/O dominates) |
+| `extract_throughput` | streaming extract, f32 | ~49 ms |
+| `extract_throughput` | streaming extract, **Q4K** | ~33 ms (1.5× faster; output is ~3× smaller so disk I/O dominates) |
+| `extract_throughput` | streaming extract, **Q4K + resume after gate** | ~28 ms (gate-phase auto-skip; ~15% saved on single-layer fixture, scales with layer count) |
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 

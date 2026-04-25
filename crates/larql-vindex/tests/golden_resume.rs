@@ -234,11 +234,21 @@ fn resume_after_gate_complete_matches_full_run() {
     run_extract(&model.0, &resume_dir.0);
 
     let resume_shas = snapshot_dir(&resume_dir.0);
-    // Same artifacts, same bytes.
+    // Same artifacts, same bytes — except `index.json` carries a fresh
+    // `extracted_at` timestamp every run. Compare that one structurally
+    // with the timestamp masked.
     for (name, ref_sha) in &ref_shas {
         let got = resume_shas
             .get(name)
             .unwrap_or_else(|| panic!("resume run missing {name}"));
+        if name == "index.json" {
+            assert_eq!(
+                index_without_timestamp(&ref_dir.0),
+                index_without_timestamp(&resume_dir.0),
+                "index.json (less timestamp) differs between fresh run and resume run",
+            );
+            continue;
+        }
         assert_eq!(
             got, ref_sha,
             "{name} differs between fresh run and resume run",
@@ -246,6 +256,15 @@ fn resume_after_gate_complete_matches_full_run() {
     }
     // Resume run also clears the checkpoint at the end.
     assert!(!resume_dir.0.join(".extract_checkpoint.json").exists());
+}
+
+fn index_without_timestamp(dir: &Path) -> serde_json::Value {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    if let Some(map) = v.as_object_mut() {
+        map.remove("extracted_at");
+    }
+    v
 }
 
 #[test]
@@ -282,6 +301,15 @@ fn incompatible_checkpoint_is_discarded() {
         let got = stale_shas
             .get(name)
             .unwrap_or_else(|| panic!("stale-checkpoint run missing {name}"));
+        if name == "index.json" {
+            assert_eq!(
+                index_without_timestamp(&ref_dir.0),
+                index_without_timestamp(&stale.0),
+                "index.json (less timestamp) differs from clean run \
+                 despite stale checkpoint being discarded",
+            );
+            continue;
+        }
         assert_eq!(
             got, ref_sha,
             "{name} differs from clean run despite stale checkpoint being discarded",

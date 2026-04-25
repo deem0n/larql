@@ -144,6 +144,78 @@ fn bench_extract_throughput(c: &mut Criterion) {
         });
     }
 
+    // ── Auto-resume case (round-3): time the resumed run vs the
+    //    fresh Q4K case above. Produce a "reference" extract once,
+    //    then per-iteration plant a checkpoint that says the gate
+    //    phase is already done and rerun.
+    let ref_dir = bench_root.join("out_q4k_resume_ref");
+    let _ = std::fs::remove_dir_all(&ref_dir);
+    {
+        let mut cb = SilentBuildCallbacks;
+        build_vindex_streaming(
+            &model_dir,
+            &tokenizer,
+            "bench/extract",
+            &ref_dir,
+            5,
+            ExtractLevel::All,
+            StorageDtype::F32,
+            QuantFormat::Q4K,
+            larql_vindex::WriteWeightsOptions::default(),
+            larql_vindex::Q4kWriteOptions::default(),
+            false,
+            &mut cb,
+        )
+        .expect("reference extract for resume bench");
+    }
+    let ref_idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ref_dir.join("index.json")).unwrap()).unwrap();
+    let layers = ref_idx["layers"].clone();
+    let checkpoint_json = serde_json::json!({
+        "version": 1,
+        "model_dir": model_dir.display().to_string(),
+        "model_name": "bench/extract",
+        "num_layers": num_layers,
+        "completed": ["gate"],
+        "last_update": "2026-04-25T00:00:00Z",
+        "gate_layer_infos": layers,
+    });
+    let checkpoint_text = serde_json::to_string_pretty(&checkpoint_json).unwrap();
+
+    let resume_dir = bench_root.join("out_q4k_resume");
+    group.bench_function("q4k_resume_after_gate", |b| {
+        b.iter(|| {
+            let _ = std::fs::remove_dir_all(&resume_dir);
+            std::fs::create_dir_all(&resume_dir).unwrap();
+            std::fs::copy(
+                ref_dir.join("gate_vectors.bin"),
+                resume_dir.join("gate_vectors.bin"),
+            )
+            .unwrap();
+            std::fs::write(
+                resume_dir.join(".extract_checkpoint.json"),
+                &checkpoint_text,
+            )
+            .unwrap();
+            let mut cb = SilentBuildCallbacks;
+            build_vindex_streaming(
+                &model_dir,
+                &tokenizer,
+                "bench/extract",
+                &resume_dir,
+                5,
+                ExtractLevel::All,
+                StorageDtype::F32,
+                QuantFormat::Q4K,
+                larql_vindex::WriteWeightsOptions::default(),
+                larql_vindex::Q4kWriteOptions::default(),
+                false,
+                &mut cb,
+            )
+            .expect("resumed extract");
+        });
+    });
+
     group.finish();
 
     // Leave the fixture in place; criterion's auto-cleanup isn't
