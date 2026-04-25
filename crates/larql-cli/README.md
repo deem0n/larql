@@ -23,6 +23,14 @@ cargo run --release -p larql-cli -- repl
 
 # Serve over HTTP/gRPC
 cargo run --release -p larql-cli -- serve --dir output/ --port 8080
+
+# Quantise an existing vindex (FP4 or GGML Q4_K_M) — see docs/specs/quantize-cli-spec.md
+cargo run --release -p larql-cli -- convert quantize fp4 \
+    --input  output/gemma3-4b.vindex \
+    --output output/gemma3-4b-fp4.vindex
+cargo run --release -p larql-cli -- convert quantize q4k \
+    --input  output/gemma3-4b.vindex \
+    --output output/gemma3-4b-q4k.vindex
 ```
 
 See [`docs/cli.md`](../../docs/cli.md) for the full command reference.
