@@ -5,18 +5,17 @@
 //! Pure dispatch and KNN compute live in `crate::index::compute`;
 //! mutation paths live in `crate::index::mutate`.
 
-pub mod accessors;
+pub mod gate_accessors;
 pub mod attn;
-pub mod ffn_data;
 pub mod ffn_store;
-pub mod fp4_storage;
+pub mod fp4_store;
 pub mod gate_store;
 pub mod lm_head;
 pub mod metadata_store;
 pub mod projection_store;
 pub mod residency;
 
-pub use ffn_data::FfnStore;
+pub use ffn_store::FfnStore;
 pub use gate_store::GateStore;
 pub use metadata_store::MetadataStore;
 pub use projection_store::ProjectionStore;

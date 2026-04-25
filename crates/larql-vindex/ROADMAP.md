@@ -18,6 +18,24 @@
 - `make coverage` + `make coverage-summary` ready (`cargo-llvm-cov`
   install required)
 
+## Round 2 cleanup — landed 2026-04-25
+
+Most of the second-audit punch list is done in this session. Headlines:
+
+| Item | Status |
+|---|---|
+| Add 8 missing filename constants | ✅ Done |
+| Migrate 20 unmigrated `Q4_K`/`Q6_K` dispatch sites | ✅ Done |
+| Replace 2× `unwrap_or("Q4_K")` silent fallbacks | ✅ Done |
+| Rename top-level `vindex/src/storage/` → `engine/` | ✅ Done (back-compat alias kept) |
+| Rename duplicate `fp4_storage.rs` files | ✅ Done — `format/fp4_codec.rs` + `index/storage/fp4_store.rs` |
+| Merge `ffn_data.rs` into `ffn_store.rs` | ✅ Done |
+| Inline `gate_trait.rs` (198 L pass-through) | ✅ Done — moved into `index/core.rs` |
+| Rename `accessors.rs` → `gate_accessors.rs` | ✅ Done |
+| Split `config/types.rs` (624 L) | ⏸ **Deferred to next session** — needs careful inter-type reference mapping |
+
+321 vindex tests + 232 inference tests pass; whole workspace builds.
+
 ## P0: Round 2 cleanup (2026-04-25 second audit)
 
 The first audit shipped (registry, filenames module, substores, file

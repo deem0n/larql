@@ -538,8 +538,18 @@ pub fn predict_q4k_metal(
         let [(gate_bytes, gate_fmt), (up_bytes, up_fmt), (down_bytes, down_fmt)] =
             index.interleaved_q4k_layer_data(layer)
                 .expect("ffn Q4K slices missing for layer");
+        // Translate registry tag → `larql_compute::QuantFormat`. Two
+        // enum systems cross here (vindex registry vs compute pipeline),
+        // and the previous `_ => Q4_K` default silently hid every
+        // other format. Be explicit.
         fn to_format(s: &str) -> QuantFormat {
-            match s { "Q6_K" => QuantFormat::Q6_K, _ => QuantFormat::Q4_K }
+            match s {
+                "Q4_K" => QuantFormat::Q4_K,
+                "Q6_K" => QuantFormat::Q6_K,
+                other => panic!(
+                    "q4k_forward: registry tag {other:?} has no compute::QuantFormat mapping"
+                ),
+            }
         }
         let gate = larql_compute::QuantWeight { data: gate_bytes, scales: None, format: to_format(gate_fmt) };
         let up   = larql_compute::QuantWeight { data: up_bytes,   scales: None, format: to_format(up_fmt) };
@@ -652,18 +662,16 @@ pub fn q4k_ffn_forward_layer(
 ///
 /// The on-disk layout (`rows × cols` elements) must be stored contiguously
 /// row-major and padded to a multiple of 256 elements per the k-quant
-/// super-block size. Formats other than `Q4_K`/`Q6_K` panic — callers have
-/// already dispatched on format so the default arm is unreachable.
+/// super-block size. Unknown formats panic — callers have already
+/// dispatched on format via `larql_vindex::quant::registry`, so the
+/// `None` arm is unreachable in well-formed inputs.
 fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Array2<f32> {
     let n = rows * cols;
     let padded = n.div_ceil(256) * 256;
-    let floats = match format {
-        "Q4_K" => larql_models::quant::ggml::dequantize_q4_k(bytes, padded)
-            .expect("Q4_K dequant failed"),
-        "Q6_K" => larql_models::quant::ggml::dequantize_q6_k(bytes, padded)
-            .expect("Q6_K dequant failed"),
-        other => panic!("unsupported quant format in vindex: {other}"),
-    };
+    let info = larql_vindex::quant::registry::lookup(format)
+        .unwrap_or_else(|| panic!("unsupported quant format in vindex: {format}"));
+    let floats = (info.dequantize)(bytes, padded)
+        .unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
     let truncated = if floats.len() > n { floats[..n].to_vec() } else { floats };
     Array2::from_shape_vec((rows, cols), truncated)
         .expect("shape mismatch dequantising Q4K matrix")

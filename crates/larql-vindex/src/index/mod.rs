@@ -12,7 +12,6 @@
 
 pub mod types;
 pub mod core;
-mod gate_trait;
 #[cfg(test)]
 mod ffn_dispatch_tests;
 pub mod compute;
@@ -32,5 +31,5 @@ pub use compute::router;
 pub use storage::residency;
 pub use storage::attn;
 pub use storage::lm_head;
-pub use storage::accessors;
-pub use storage::fp4_storage;
+pub use storage::gate_accessors;
+pub use storage::fp4_store as fp4_storage;

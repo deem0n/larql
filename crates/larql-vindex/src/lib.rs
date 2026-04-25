@@ -34,7 +34,12 @@ pub mod format;
 pub mod index;
 pub mod patch;
 pub mod quant;
-pub mod storage;
+pub mod engine;
+// Back-compat alias — the top-level lifecycle dir was renamed
+// `storage/` → `engine/` in the 2026-04-25 round-2 cleanup. The name
+// `storage` was confusing because `index/storage/` held the actual
+// data substores. Drop this alias once external callers migrate.
+pub use engine as storage;
 pub mod mmap_util;
 pub mod vindexfile;
 
@@ -98,8 +103,8 @@ pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};
 pub use patch::knn_store::{KnnStore, KnnEntry};
 pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};
 
-// Storage engine
-pub use storage::{
+// Storage engine — `engine` (preferred); `storage` still available as alias.
+pub use engine::{
     memit_solve, CompactStatus, Epoch, MemitCycle, MemitFact, MemitSolveResult, MemitStore,
     StorageEngine,
 };

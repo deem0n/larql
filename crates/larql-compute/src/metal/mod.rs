@@ -89,6 +89,11 @@ pub struct MetalBackend {
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
     pub q4k_geglu_silu_down_pipeline: KernelHandle,
     pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
+    /// Fused GEGLU activation + Q6_K down projection — production
+    /// FFN path on Gemma 3/4 / Llama 2 / Mistral (Ollama convention
+    /// is Q4_K gate/up + Q6_K down). Mirrors the Q4_K twins above.
+    pub q6k_geglu_silu_down_pipeline: KernelHandle,
+    pub q6k_geglu_gelu_tanh_down_pipeline: KernelHandle,
     pub q6k_matvec_pipeline: KernelHandle,
     #[allow(dead_code)]
     rope_pipeline: ComputePipelineState,
@@ -202,6 +207,8 @@ impl MetalBackend {
         // Fused activation+down (KernelHandle).
         let q4k_geglu_silu_down_pipeline = KernelHandle::from_kernel::<shaders::q4k_geglu_down::SiluKernel>(&device, &library)?;
         let q4k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<shaders::q4k_geglu_down::GeluTanhKernel>(&device, &library)?;
+        let q6k_geglu_silu_down_pipeline = KernelHandle::from_kernel::<shaders::q6k_geglu_down::SiluKernel>(&device, &library)?;
+        let q6k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<shaders::q6k_geglu_down::GeluTanhKernel>(&device, &library)?;
 
         // Fused Q8 QKV projection (KernelHandle).
         let q8_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q8_attn_proj::QkvKernel>(&device, &library)?;
@@ -283,6 +290,7 @@ impl MetalBackend {
             q4k_matvec_pipeline, q4k_ffn_gate_up_pipeline,
             q4kf_ffn_gate_up_pipeline,
             q4k_geglu_silu_down_pipeline, q4k_geglu_gelu_tanh_down_pipeline,
+            q6k_geglu_silu_down_pipeline, q6k_geglu_gelu_tanh_down_pipeline,
             q6k_matvec_pipeline,
             rope_pipeline, rope_at_pos_pipeline, rope_at_pos_batched_pipeline,
             q4k_qkv_proj_pipeline, q4k_q6k_qkv_proj_pipeline, q4k_proj_pipeline,

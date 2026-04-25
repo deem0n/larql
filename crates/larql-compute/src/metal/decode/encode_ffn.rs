@@ -180,10 +180,20 @@ impl MetalBackend {
             // buffer write/read. Verified parity against the
             // separated path in `test_kernel_q4k_geglu_down.rs`.
             //
-            // Slow path: down is Q4_KF / Q6_K / Q4_0 → separated
-            // GEGLU then format-aware down dispatch (Gemma 3/4 ship
-            // Q6_K down, so this is the hot path on those models;
-            // the fused kernel is skipped).
+            // **Q6_K fusion is NOT engaged here.** The Q6_K fused
+            // kernel `q6k_geglu_silu_down` is built and parity-
+            // tested but routing it on production gemma3-4b-q4k-v2
+            // showed a ~8 % regression (67.9 → 62.2 tok/s). Q6_K
+            // decode is memory-bound at hidden=2560; the fused
+            // kernel reads gate[i] *and* up[i] per inner iteration
+            // (vs `q6k_matvec`'s single read of pre-computed
+            // `act[i]`), and the extra bandwidth costs more than
+            // the saved dispatch + buffer round-trip. To re-enable,
+            // first add threadgroup-memory caching of gate/up per
+            // superblock — see ROADMAP P0 #1.
+            //
+            // Slow path: Q6_K / Q4_KF / Q4_0 / Q8_0 → separated
+            // GEGLU then format-aware down dispatch.
             if layer.down.format == crate::QuantFormat::Q4_K {
                 self.encode_q4k_fused_geglu_down(
                     enc, layer, bufs, hidden, inter_padded, hidden_val, inter_padded_val,
@@ -332,6 +342,51 @@ impl MetalBackend {
             crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
             _ => &self.q4k_geglu_silu_down_pipeline,
         };
+        Self::dispatch_fused_geglu_down(
+            enc, kernel, bufs, hidden, hidden_val, inter_padded_val,
+        );
+    }
+
+    /// Twin of `encode_q4k_fused_geglu_down` for Q6_K down weights.
+    /// **Currently not routed** — empirical regression on the
+    /// production gemma3-4b-q4k-v2 path (see encode_q4k_ffn for the
+    /// analysis). Kept here so the routing can be re-enabled once
+    /// the Q6_K shader gains threadgroup-memory caching for gate/up
+    /// (ROADMAP P0 #1).
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn encode_q6k_fused_geglu_down(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        layer: &FullPipelineLayer,
+        bufs: &FfnBufs<'_>,
+        hidden: usize,
+        _inter_padded: usize,
+        hidden_val: u32,
+        inter_padded_val: u32,
+    ) {
+        let kernel = match layer.activation {
+            crate::Activation::GeluTanh => &self.q6k_geglu_gelu_tanh_down_pipeline,
+            _ => &self.q6k_geglu_silu_down_pipeline,
+        };
+        Self::dispatch_fused_geglu_down(
+            enc, kernel, bufs, hidden, hidden_val, inter_padded_val,
+        );
+    }
+
+    /// Shared dispatch body for the Q4_K / Q6_K fused activation+down
+    /// kernels. Both kernel families share the same buffer signature
+    /// `(W_down, gate, up, out, N, K)` and per-row simdgroup geometry
+    /// — only the dequantisation and the activation differ. Pulled
+    /// out so adding a future format (FP4? Q3_K?) is one new
+    /// `encode_X_fused_geglu_down` thunk.
+    fn dispatch_fused_geglu_down(
+        enc: &ComputeCommandEncoderRef,
+        kernel: &crate::metal::kernel::KernelHandle,
+        bufs: &FfnBufs<'_>,
+        hidden: usize,
+        hidden_val: u32,
+        inter_padded_val: u32,
+    ) {
         let n_tgs_down = (hidden as u64).div_ceil(kernel.rows_per_tg);
         enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(bufs.down_w), 0);

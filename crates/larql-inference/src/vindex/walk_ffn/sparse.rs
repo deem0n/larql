@@ -151,11 +151,15 @@ impl<'a> WalkFfn<'a> {
             if let Some(down_arc) = down_cache_local.as_ref().filter(|_| parallelisable) {
                 let down_data: &[f32] = down_arc.as_slice();
                 let up_slices = self.index.interleaved_q4k_layer_data(layer);
-                let up_q4k_bytes: Option<&[u8]> = match (up_native.as_ref(), up_slices) {
-                    (Some(_), _) => None,
-                    (None, Some(s)) if s[1].1 == "Q4_K" => Some(s[1].0),
-                    _ => None,
-                };
+                // Resolve up via the registry — accepts Q4_K, Q6_K, and
+                // any future K-quant rather than hardcoding Q4_K-only.
+                let up_q4k: Option<(&[u8], &larql_vindex::quant::registry::QuantFormatInfo)> =
+                    match (up_native.as_ref(), up_slices) {
+                        (Some(_), _) => None,
+                        (None, Some(s)) => larql_vindex::quant::registry::lookup(s[1].1)
+                            .map(|info| (s[1].0, info)),
+                        _ => None,
+                    };
                 let n_threads = rayon::current_num_threads().max(1);
                 let chunk_size = hits.len().div_ceil(n_threads);
                 let up_native_ref = up_native.as_ref();
@@ -167,13 +171,13 @@ impl<'a> WalkFfn<'a> {
                         for &(feat, gate_score) in chunk {
                             let up_score = if let Some(up_view) = up_native_ref {
                                 up_view.row(feat).dot(&x_row)
-                            } else if let Some(up_bytes) = up_q4k_bytes {
-                                let bytes_per_row = (hidden / 256) * 144;
+                            } else if let Some((up_bytes, info)) = up_q4k {
+                                let row_dot = info.row_dot.expect("registry: row_dot");
+                                let bytes_per_row = info.bytes_per_row(hidden)
+                                    .expect("registry: bytes_per_row aligned");
                                 let start = feat * bytes_per_row;
                                 let end = start + bytes_per_row;
-                                larql_models::quant::ggml::q4k_row_dot(
-                                    &up_bytes[start..end], x_slice,
-                                ).unwrap_or(0.0)
+                                row_dot(&up_bytes[start..end], x_slice).unwrap_or(0.0)
                             } else {
                                 0.0
                             };

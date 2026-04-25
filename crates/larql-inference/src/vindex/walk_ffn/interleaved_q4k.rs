@@ -29,12 +29,10 @@ impl<'a> WalkFfn<'a> {
 
         let dequant = |bytes: &[u8], fmt: &str, rows: usize, cols: usize| -> Array2<f32> {
             let padded = rows * cols;
-            let flat = match fmt {
-                "Q6_K" => larql_models::quant::ggml::dequantize_q6_k(bytes, padded)
-                    .expect("q6k dequant"),
-                _ => larql_models::quant::ggml::dequantize_q4_k(bytes, padded)
-                    .expect("q4k dequant"),
-            };
+            let info = larql_vindex::quant::registry::lookup(fmt)
+                .unwrap_or_else(|| panic!("unknown quant format: {fmt}"));
+            let flat = (info.dequantize)(bytes, padded)
+                .unwrap_or_else(|e| panic!("{fmt} dequant: {e}"));
             Array2::from_shape_vec((rows, cols), flat[..rows * cols].to_vec())
                 .expect("dequant shape mismatch")
         };

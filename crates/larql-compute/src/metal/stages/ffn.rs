@@ -25,16 +25,21 @@ pub enum Activation {
     GeluTanh,
 }
 
-/// Optional fused activation+down kernels. When `down_format == Q4_K`
-/// and the matching kernel is supplied, [`encode_gated`] skips the
-/// separate GEGLU dispatch and dispatches the fused kernel —
-/// eliminates one dispatch + the inter-sized activation buffer
-/// write/read per position.
+/// Optional fused activation+down kernels. When `down_format` matches
+/// (`Q4_K` → `q4k`, `Q6_K` → `q6k`) and the matching kernel is
+/// supplied, [`encode_gated`] skips the separate GEGLU dispatch and
+/// the inter-sized activation buffer write/read per position.
 pub struct FusedGegluDown<'a> {
-    /// `q4k_geglu_silu_down` — Llama, Mistral, Qwen (SiLU activation).
-    pub silu: Option<&'a crate::metal::kernel::KernelHandle>,
-    /// `q4k_geglu_gelu_tanh_down` — Gemma, GPT-2, Phi.
-    pub gelu_tanh: Option<&'a crate::metal::kernel::KernelHandle>,
+    /// `q4k_geglu_silu_down` — Q4_K down + SiLU (Llama-style).
+    pub q4k_silu: Option<&'a crate::metal::kernel::KernelHandle>,
+    /// `q4k_geglu_gelu_tanh_down` — Q4_K down + GELU-tanh.
+    pub q4k_gelu_tanh: Option<&'a crate::metal::kernel::KernelHandle>,
+    /// `q6k_geglu_silu_down` — Q6_K down + SiLU (production
+    /// Llama 2 / Mistral with Ollama-convention extracts).
+    pub q6k_silu: Option<&'a crate::metal::kernel::KernelHandle>,
+    /// `q6k_geglu_gelu_tanh_down` — Q6_K down + GELU-tanh
+    /// (production Gemma 3 / 4 with Ollama-convention extracts).
+    pub q6k_gelu_tanh: Option<&'a crate::metal::kernel::KernelHandle>,
 }
 
 /// Gated FFN (Llama / Gemma / Qwen): `down(act(gate) * up)`.
@@ -89,16 +94,20 @@ pub fn encode_gated(
     }
 
     // Fast path: Q4_K down + supplied fused kernel → skip GEGLU
-    // dispatch entirely, fuse activation into down. Otherwise, fall
-    // through to the separated path.
-    let fused_kernel = if down_format == crate::QuantFormat::Q4_K {
-        match activation {
-            Activation::SiLU => fused_down.silu,
-            Activation::GeluTanh => fused_down.gelu_tanh,
-        }
-    } else {
-        None
+    // dispatch entirely, fuse activation into down.
+    //
+    // Q6_K fields on `FusedGegluDown` are present (kernels built and
+    // parity-tested) but **deliberately not routed here**: empirical
+    // regression on production gemma3-4b-q4k-v2 (~8 %) — see decode/
+    // encode_ffn.rs for the full analysis. Re-enable once the Q6_K
+    // shader gains threadgroup-memory caching of gate/up per
+    // superblock (ROADMAP P0 #1).
+    let fused_kernel = match (down_format, activation) {
+        (crate::QuantFormat::Q4_K, Activation::SiLU)      => fused_down.q4k_silu,
+        (crate::QuantFormat::Q4_K, Activation::GeluTanh)  => fused_down.q4k_gelu_tanh,
+        _ => None,
     };
+    let _ = (fused_down.q6k_silu, fused_down.q6k_gelu_tanh); // silence unused-field warnings
 
     if let Some(kernel) = fused_kernel {
         for pos in 0..seq_len {

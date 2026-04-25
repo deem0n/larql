@@ -1,6 +1,163 @@
 # Roadmap — larql-compute
 
-## Current: 117 tok/s (34L, Q4_KF) | Ollama: 98 tok/s | **17% FASTER**
+## Current state (2026-04-25, M3 Max, real vindex)
+
+| Engine | tok/s | ms/tok | Notes |
+|---|---|---|---|
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **67.9** | 14.72 | production extract; Q6_K geglu+down NOT fused |
+| **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
+| **Ollama** gemma3:4b | **101.2** | 9.89 | reference |
+| **Gap** | LARQL is 1.44–1.52× slower | +4–5ms/tok | per-stage decomposition below |
+
+GPU forward dominates (85%); FFN is 87% of GPU forward. Per-stage
+breakdown in the diagnostic write-up below.
+
+The "117 tok/s" historical number was synthetic-weight Q4_KF without
+real vindex load. Production extracts use Q6_K down (Ollama
+convention); the q4_KF fast-path doesn't apply to those.
+
+---
+
+## P0: Production gap closers (open)
+
+These are the optimizations from the 2026-04-25 diagnostic — ranked
+by leverage. Lands sequentially; #1 alone closes ~half the gap.
+
+### #1 — Q6_K fused activation+down with TG-memory caching (open)
+
+**Status:** shaders shipped, parity-tested, **not routed**.
+Empirical 8 % regression at production shape — root cause
+identified, fix scoped.
+
+`q6k_geglu_silu_down` / `q6k_geglu_gelu_tanh_down` shaders +
+KernelHandle wiring + parity tests all landed (2026-04-25). Routing
+them on `gemma3-4b-q4k-v2` (Q6_K down, GELU-tanh) regressed decode
+67.9 → 62.2 tok/s. **Diagnosis:** Q6_K decode at hidden=2560 is
+memory-bound; the fused inner loop reads `gate[i]` *and* `up[i]`
+from device memory per element where `q6k_matvec`'s separated path
+reads only the pre-computed `act[i]`. The extra bandwidth costs
+more than the saved dispatch + buffer round-trip.
+
+(Q4_K fusion wins because its inner-loop dequant is heavier,
+amortising the extra reads. Q6_K dequant is differently shaped —
+heavier per cell but more memory-traffic-sensitive.)
+
+**Fix:** add threadgroup-memory caching of `gate` and `up` per
+super-block in the Q6_K shaders. All 4 simdgroups in a TG read the
+same 256-element gate/up window for each super-block (different
+output rows, same input). One TG-coordinated load + 32× shared
+read per super-block replaces 32× per-lane device reads. ~30 LOC
+per kernel. Once parity holds, re-enable the routing in
+`encode_q4k_ffn` and `stages/ffn.rs::encode_gated`.
+
+**Estimated gain after fix: ~1.5–2 ms/tok / ~10–14 % / +8–10 tok/s
+on production extracts.**
+
+### #2 — Coalesce per-layer command encoders (open)
+
+**Estimated gain: ~1.0ms/tok / ~7% / +5 tok/s.** Per-layer dispatch
+count is ~11 (input norm, QKV, QK-norm, RoPE, KV-append + attend, O,
+post-attn fused, gate+up, GEGLU, down, post-FFN). With ~5-8µs Metal
+command-encoder overhead per dispatch, ×34 layers = **1.9-3ms** of
+pure encoder overhead per token.
+
+Ollama groups consecutive ops into the same encoder when possible.
+Refactor `decode_token_with_moe_fn` to issue ONE encoder per layer
+(or even per-token where MoE doesn't interleave CPU work), instead
+of one per stage. Medium-effort change in `metal/decode/mod.rs`.
+
+### #3 — Fused `rms_norm + Q4_K matvec` for QKV input (open)
+
+**Estimated gain: ~0.4ms/tok / ~3%.** Today's Q4_K attention path
+runs `rms_norm` then `q4k_qkv_proj` as separate dispatches. Q8 path
+already has `rms_norm_q8` (fused) — Q4_K never got the equivalent.
+A `rms_norm_q4k_qkv` shader saves one dispatch per layer × 34.
+Effort: ~100 LOC MSL.
+
+### #4 — LM head wrapper overhead (open)
+
+**Estimated gain: ~0.3ms/tok / ~2%.** Criterion shows the kernel
+runs at 1.55ms; observed end-to-end is 2.34ms. The 0.79ms gap is
+roughly: CPU `quantize_to_q8(query)` ~50µs, GPU dispatch+commit+wait
+~200µs, buffer readback (1 MB) ~150µs, partial-sort 262k → top-k
+~300µs. Move quantize to GPU, async readback, smaller heap-based
+top-k.
+
+### #5 — `q6k_matvec` shader optimization (open)
+
+**Estimated gain: unclear.** Current Q6_K Metal at prefill_10240:
+**79 GE/s**. Q4_K at same shape: **105 GE/s**. The 25% gap is
+plausible for Q6_K's heavier dequant, but Ollama's Q6_K matvec is
+likely closer to parity with their Q4_K. Profile and tune.
+
+---
+
+## P0: Structural cleanup (open)
+
+From the 2026-04-25 codebase review. Most ship in the same time
+window as the perf wins above; some unblock cleaner perf work.
+
+### #6 — Magic-string kernel names on non-tiled shaders (open)
+
+`metal/mod.rs` has **27 raw `library.get_function("...")` calls**
+for shaders without `KernelHandle`-style row-tiling (sgemm, geglu,
+rope, rms_norm, layer_norm, kv_attention, etc.). They don't need
+geometry tracking, but the *kernel name string* still drifts —
+renaming a shader silently breaks runtime binding.
+
+Add a `KernelName` trait (sibling of `TiledKernel`) that exports
+`KERNEL_NAME` per shader file. Then `library.get_function(<shader>::NAME, …)`
+reads the constant. ~30 LOC per shader file, mechanical.
+
+### #7 — `QuantFormat` pattern-match spread (open)
+
+14 files independently `match QuantFormat::*`. Adding FP4 / FP8 /
+BF16 = 14 file edits.
+
+Introduce a `FormatRoute` enum computed once per layer
+(`F32Input { fused_down: Option<&KernelHandle> }`,
+`Q8Input { norm_q8: …, qkv_q8: … }`, etc.) with the `match
+QuantFormat::*` confined to one constructor in
+`metal/stages/quant_matvec.rs`. Callers receive the opaque route.
+Adding FP4 = one match arm.
+
+### #8 — `Pipelines` struct asymmetry (open)
+
+`metal/stages/quant_matvec.rs::Pipelines` mixes `&KernelHandle`
+(only `q4_matvec`) with bare `&ComputePipelineState` (q4k_matvec,
+q4kf_proj, q6k_matvec). Markers exist for all of them — migrate to
+uniform `KernelHandle` storage. Mechanical, ~100 LOC across
+callsites.
+
+### #9 — `FullPipelineLayer` 63 pub fields (open)
+
+Constructing one for tests is 30 lines of `field: junk`. Split into
+`LayerWeights { wq, wk, wv, wo, gate, up, down }` +
+`LayerNorms { input_norm, post_attn_norm, … }` +
+`LayerArchParams { eps, attn_scale, head_dim, … }` + optional
+`MoeBlock` (already exists). Tests construct just the relevant
+subset. ~200 LOC of restructuring + caller updates.
+
+### #10 — `dispatch_full_pipeline` 30+ params (open)
+
+Even after stage extraction the signature is unreadable. Same
+`Pipelines`-struct treatment as `stages/quant_matvec.rs` — bundle
+the pipelines and norms into a `FullPipelineRefs<'_>` context.
+
+### #11 — `compare_*.rs` examples consolidation (open)
+
+5 `compare_*.rs` files (~1400 LOC) overlap heavily. Particularly
+`compare_decode` (195) and `compare_pipeline` (240). Consolidate to
+one with subcommand flags.
+
+### #12 — `ProfileTimings` producer (open)
+
+`ProfileTimings` struct + `format_summary` shipped (2026-04-25) but
+no code populates `gate_up_ms` / `down_ms`. Wire commit/wait
+boundaries through `decode_token_with_moe_fn` — completes the
+diagnostic that replaced the deleted 567-LOC `decode_profile.rs`.
+
+---
 
 ## P0: Exceed Ollama — DONE (2026-04-09)
 

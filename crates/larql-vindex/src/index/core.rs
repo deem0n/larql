@@ -13,7 +13,7 @@
 //! `self.gate.gate_mmap_bytes`. A future PR can drop the redundant
 //! `gate_` / `q4k_ffn_` prefixes once all call sites move.
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
 // Re-export all shared types from types.rs.
 pub use super::types::*;
@@ -142,6 +142,208 @@ impl VectorIndex {
     /// Set the owned layer range (used by `load_vindex_with_range`).
     pub(crate) fn set_layer_range(&mut self, range: (usize, usize)) {
         self.layer_range = Some(range);
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// `impl GateIndex for VectorIndex`
+//
+// The trait surface that lets `VectorIndex` plug into anything that
+// takes `&dyn GateIndex` (also implemented by `PatchedVindex` in
+// `crate::patch::overlay_gate_trait`). Each method here is identity
+// forwarding to the `impl VectorIndex { … }` block of the same name —
+// the trait exists for type-erasure, not for behavioural override.
+// Inlined from the former `gate_trait.rs` in the 2026-04-25 round-2
+// cleanup.
+// ══════════════════════════════════════════════════════════════
+
+impl GateIndex for VectorIndex {
+    fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
+        self.gate_knn(layer, residual, top_k)
+    }
+
+    fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
+        self.feature_meta(layer, feature)
+    }
+
+    fn num_features(&self, layer: usize) -> usize {
+        self.num_features(layer)
+    }
+
+    fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
+        self.metadata.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+    }
+
+    fn up_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
+        self.metadata.up_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+    }
+
+    fn has_overrides_at(&self, layer: usize) -> bool {
+        self.metadata.down_overrides.keys().any(|(l, _)| *l == layer)
+            || self.metadata.up_overrides.keys().any(|(l, _)| *l == layer)
+    }
+
+    fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
+        self.gate_knn_batch(layer, x, top_k)
+    }
+
+    fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
+        self.down_feature_vector(layer, feature)
+    }
+
+    fn has_down_features(&self) -> bool {
+        self.ffn.down_features_mmap.is_some()
+    }
+
+    fn gate_knn_q4(
+        &self,
+        layer: usize,
+        residual: &ndarray::Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Vec<(usize, f32)>> {
+        // Delegate to VectorIndex's existing gate_knn_q4 method
+        VectorIndex::gate_knn_q4(self, layer, residual, top_k, backend)
+    }
+
+    fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.down_layer_matrix(layer)
+    }
+
+    fn gate_scores_batch(&self, layer: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
+        self.gate_scores_batch(layer, x)
+    }
+
+    fn gate_scores_batch_backend(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+        backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> Option<Array2<f32>> {
+        self.gate_scores_batch_backend(layer, x, backend)
+    }
+
+    fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.up_layer_matrix(layer)
+    }
+
+    fn has_full_mmap_ffn(&self) -> bool {
+        self.has_full_mmap_ffn()
+    }
+
+    fn has_interleaved(&self) -> bool {
+        self.has_interleaved()
+    }
+
+    fn interleaved_gate(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.interleaved_gate(layer)
+    }
+
+    fn interleaved_up(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.interleaved_up(layer)
+    }
+
+    fn interleaved_down(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.interleaved_down(layer)
+    }
+
+    fn prefetch_interleaved_layer(&self, layer: usize) {
+        self.prefetch_interleaved_layer(layer)
+    }
+
+    fn has_interleaved_q4(&self) -> bool {
+        self.has_interleaved_q4()
+    }
+
+    fn interleaved_q4_gate(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
+        self.interleaved_q4_gate(layer)
+    }
+
+    fn interleaved_q4_up(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
+        self.interleaved_q4_up(layer)
+    }
+
+    fn interleaved_q4_down(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
+        self.interleaved_q4_down(layer)
+    }
+
+    fn prefetch_interleaved_q4_layer(&self, layer: usize) {
+        self.prefetch_interleaved_q4_layer(layer)
+    }
+
+    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
+        self.ffn.interleaved_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+    }
+
+    fn has_interleaved_q4k(&self) -> bool {
+        self.has_interleaved_q4k()
+    }
+
+    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
+        self.ffn.interleaved_q4k_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+    }
+
+    fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
+        self.prefetch_interleaved_q4k_layer(layer)
+    }
+
+    fn interleaved_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 3]> {
+        VectorIndex::interleaved_q4k_layer_data(self, layer)
+    }
+
+    fn q4k_ffn_layer(&self, layer: usize, component: usize)
+        -> Option<std::sync::Arc<Vec<f32>>>
+    {
+        VectorIndex::q4k_ffn_layer(self, layer, component)
+    }
+
+    fn q4k_ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
+        VectorIndex::q4k_ffn_row_into(self, layer, component, feat, out)
+    }
+
+    fn q4k_ffn_row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+        VectorIndex::q4k_ffn_row_dot(self, layer, component, feat, x)
+    }
+
+    fn q4k_ffn_row_dot_via_cache(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+        VectorIndex::q4k_ffn_row_dot_via_cache(self, layer, component, feat, x)
+    }
+    fn q4k_ffn_row_scaled_add_via_cache(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        VectorIndex::q4k_ffn_row_scaled_add_via_cache(self, layer, component, feat, alpha, out)
+    }
+
+    fn q4k_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        VectorIndex::q4k_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
+    }
+
+    fn q4k_matmul_transb(
+        &self,
+        layer: usize,
+        component: usize,
+        x: &[f32],
+        x_rows: usize,
+        backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> Option<Vec<f32>> {
+        VectorIndex::q4k_matmul_transb(self, layer, component, x, x_rows, backend)
+    }
+
+    // ── FP4 / FP8 FFN storage (exp 26) ─────────────────────────────────────
+
+    fn has_fp4_storage(&self) -> bool {
+        VectorIndex::has_fp4_storage(self)
+    }
+
+    fn fp4_ffn_row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+        VectorIndex::fp4_ffn_row_dot(self, layer, component, feat, x)
+    }
+
+    fn fp4_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        VectorIndex::fp4_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
+    }
+
+    fn fp4_ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
+        VectorIndex::fp4_ffn_row_into(self, layer, component, feat, out)
     }
 }
 

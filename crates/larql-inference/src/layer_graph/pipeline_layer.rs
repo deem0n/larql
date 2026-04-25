@@ -169,8 +169,16 @@ pub fn resolve_attn_weights<'a>(
     index: &'a larql_vindex::VectorIndex,
     layer: usize,
 ) -> Option<(QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>)> {
+    // Registry tag → compute::QuantFormat. Explicit so a typo or new
+    // tag fails loudly rather than silently aliasing to Q4_K.
     fn to_format(s: &str) -> QuantFormat {
-        match s { "Q6_K" => QuantFormat::Q6_K, _ => QuantFormat::Q4_K }
+        match s {
+            "Q4_K" => QuantFormat::Q4_K,
+            "Q6_K" => QuantFormat::Q6_K,
+            other => panic!(
+                "resolve_attn_weights: registry tag {other:?} has no compute::QuantFormat mapping"
+            ),
+        }
     }
 
     if let Some([q, k, v, o]) = index.attn_q4k_layer_data(layer) {
@@ -205,12 +213,19 @@ pub fn resolve_ffn_weights<'a>(
     q4_ffn_per_matrix: usize,
     ffn_format: QuantFormat,
 ) -> (QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>) {
+    // Registry tag → compute::QuantFormat. The fallback exists for the
+    // legacy uniform-stride path (`build_q4k_weights.rs` writer didn't
+    // emit per-matrix tags); pass an explicit fallback rather than
+    // silently aliasing unknown tags to Q4_K.
     fn str_to_format(s: &str, fallback: QuantFormat) -> QuantFormat {
         match s {
-            "Q6_K" => QuantFormat::Q6_K,
             "Q4_K" => QuantFormat::Q4_K,
+            "Q6_K" => QuantFormat::Q6_K,
             "Q4_0" => QuantFormat::Q4_0,
-            _ => fallback,
+            "" => fallback,
+            other => panic!(
+                "resolve_ffn_weights: registry tag {other:?} has no compute::QuantFormat mapping"
+            ),
         }
     }
 

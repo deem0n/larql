@@ -293,17 +293,25 @@ fn synthesize_gate_from_q4k(
         })?;
         let offset = gate_entry["offset"].as_u64().unwrap_or(0) as usize;
         let length = gate_entry["length"].as_u64().unwrap_or(0) as usize;
-        let format = gate_entry["format"].as_str().unwrap_or("");
-        if format != "Q4_K" {
-            return Err(VindexError::Parse(format!(
-                "expected Q4_K gate at layer {}, got `{format}`",
+        let format = gate_entry["format"].as_str().ok_or_else(|| {
+            VindexError::Parse(format!(
+                "interleaved_q4k_manifest gate entry at layer {} missing `format`",
                 info.layer
-            )));
-        }
+            ))
+        })?;
+        // Route through the registry so a future Q6_K (or other K-quant)
+        // gate slice would dequantise the same way without another
+        // string-compare here.
+        let format_info = crate::quant::registry::lookup(format).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "interleaved_q4k_manifest layer {}: unknown format tag {format:?}",
+                info.layer
+            ))
+        })?;
         let q_bytes = &iq4_mmap[offset..offset + length];
         let n = info.num_features * hidden_size;
         let padded = n.div_ceil(256) * 256;
-        let gate_f32 = larql_models::quant::ggml::dequantize_q4_k(q_bytes, padded)
+        let gate_f32 = (format_info.dequantize)(q_bytes, padded)
             .map_err(|e| VindexError::Parse(format!("dequantize layer {}: {e}", info.layer)))?;
         let gate_f16_bytes = larql_models::quant::half::encode_f16(&gate_f32[..n]);
 

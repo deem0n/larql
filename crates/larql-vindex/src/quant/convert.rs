@@ -34,7 +34,7 @@ use crate::config::types::{
 };
 use crate::format::filenames::*;
 use crate::error::VindexError;
-use crate::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
+use crate::format::fp4_codec::{write_fp4_projection, write_fp8_projection};
 
 use super::scan::{scan_vindex, Dtype, ScanConfig, VindexComplianceReport};
 
