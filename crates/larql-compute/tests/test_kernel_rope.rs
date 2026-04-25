@@ -1,10 +1,10 @@
 //! Per-kernel tests for the three RoPE shader variants
 //! (`metal/shaders/rope.rs`):
 //!
-//! 1. `rope_apply`         — multi-position, used by Metal prefill.
-//! 2. `rope_at_pos`        — single vector at a fixed absolute position.
-//! 3. `rope_at_pos_batched`— all heads at one position, used by Metal
-//!                           KV-cached decode.
+//! 1. `rope_apply` — multi-position, used by Metal prefill.
+//! 2. `rope_at_pos` — single vector at a fixed absolute position.
+//! 3. `rope_at_pos_batched` — all heads at one position, used by
+//!    Metal KV-cached decode.
 //!
 //! ## Why this file
 //!

@@ -41,19 +41,19 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only the activated feature vectors are read per token.
         let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.down_features_mmap = Some(Arc::new(mmap));
+        self.ffn.down_features_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     /// Whether feature-major down vectors are loaded.
     pub fn has_down_features(&self) -> bool {
-        self.down_features_mmap.is_some()
+        self.ffn.down_features_mmap.is_some()
     }
 
     /// Get a feature's contiguous down vector from the mmap'd feature-major file.
     /// Returns `[hidden_size]` f32 slice — zero-copy from mmap.
     pub fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        let mmap = self.down_features_mmap.as_ref()?;
+        let mmap = self.ffn.down_features_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 || feature >= intermediate { return None; }
 
@@ -74,7 +74,7 @@ impl VectorIndex {
 
     /// Get the full down matrix for a layer: [intermediate, hidden] zero-copy view.
     pub fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.down_features_mmap.as_ref()?;
+        let mmap = self.ffn.down_features_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 { return None; }
 
@@ -102,13 +102,13 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only activated feature vectors are read per token.
         let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.up_features_mmap = Some(Arc::new(mmap));
+        self.ffn.up_features_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     /// Get the full up matrix for a layer: [intermediate, hidden] zero-copy view.
     pub fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.up_features_mmap.as_ref()?;
+        let mmap = self.ffn.up_features_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 { return None; }
         let floats_per_layer = intermediate * self.hidden_size;
@@ -125,7 +125,7 @@ impl VectorIndex {
 
     /// Whether both up and down feature-major mmaps are loaded.
     pub fn has_full_mmap_ffn(&self) -> bool {
-        self.down_features_mmap.is_some() && self.up_features_mmap.is_some()
+        self.ffn.down_features_mmap.is_some() && self.ffn.up_features_mmap.is_some()
     }
 
     // ── Interleaved FFN data: gate+up+down packed per layer ──
@@ -142,18 +142,18 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: per-layer prefetch issued at query time via prefetch_interleaved_layer.
         let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.interleaved_mmap = Some(Arc::new(mmap));
+        self.ffn.interleaved_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     /// Whether interleaved FFN data is loaded.
     pub fn has_interleaved(&self) -> bool {
-        self.interleaved_mmap.is_some()
+        self.ffn.interleaved_mmap.is_some()
     }
 
     /// Get gate matrix for a layer from the interleaved file: [intermediate, hidden].
     pub fn interleaved_gate(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.interleaved_mmap.as_ref()?;
+        let mmap = self.ffn.interleaved_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 { return None; }
         let matrix_floats = intermediate * self.hidden_size;
@@ -171,7 +171,7 @@ impl VectorIndex {
 
     /// Get up matrix for a layer from the interleaved file: [intermediate, hidden].
     pub fn interleaved_up(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.interleaved_mmap.as_ref()?;
+        let mmap = self.ffn.interleaved_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 { return None; }
         let matrix_floats = intermediate * self.hidden_size;
@@ -189,7 +189,7 @@ impl VectorIndex {
 
     /// Get down matrix for a layer from the interleaved file: [intermediate, hidden].
     pub fn interleaved_down(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.interleaved_mmap.as_ref()?;
+        let mmap = self.ffn.interleaved_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 { return None; }
         let matrix_floats = intermediate * self.hidden_size;
@@ -208,7 +208,7 @@ impl VectorIndex {
     /// Prefetch next layer's interleaved data into page cache.
     pub fn prefetch_interleaved_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.interleaved_mmap {
+        if let Some(ref mmap) = self.ffn.interleaved_mmap {
             let intermediate = self.num_features(layer);
             if intermediate == 0 { return; }
             let matrix_bytes = intermediate * self.hidden_size * 4;
@@ -233,12 +233,12 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.interleaved_q4_mmap = Some(Arc::new(mmap));
+        self.ffn.interleaved_q4_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     pub fn has_interleaved_q4(&self) -> bool {
-        self.interleaved_q4_mmap.is_some()
+        self.ffn.interleaved_q4_mmap.is_some()
     }
 
     /// Load Q4_K/Q6_K interleaved FFN data (Ollama-compatible, matches attn format).
@@ -258,7 +258,7 @@ impl VectorIndex {
         // Demand-paged: the q4k forward walk reads only the activated features'
         // byte ranges per layer, not the entire 13 GB file.
         let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.interleaved_q4k_mmap = Some(Arc::new(mmap));
+        self.ffn.interleaved_q4k_mmap = Some(Arc::new(mmap));
 
         let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
         if manifest_path.exists() {
@@ -277,13 +277,13 @@ impl VectorIndex {
                     (offset, length, format)
                 })
                 .collect();
-            self.interleaved_q4k_manifest = Some(entries);
+            self.ffn.interleaved_q4k_manifest = Some(entries);
         }
         Ok(())
     }
 
     pub fn has_interleaved_q4k(&self) -> bool {
-        self.interleaved_q4k_mmap.is_some()
+        self.ffn.interleaved_q4k_mmap.is_some()
     }
 
     /// Per-layer Q4_K/Q6_K FFN slices — [gate, up, down] with formats.
@@ -293,8 +293,8 @@ impl VectorIndex {
     /// manifest has 3 entries for `layer`; downstream kernels dispatch on
     /// the format string (`"Q4_K"` or `"Q6_K"`).
     pub fn interleaved_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 3]> {
-        let mmap = self.interleaved_q4k_mmap.as_ref()?;
-        let manifest = self.interleaved_q4k_manifest.as_ref()?;
+        let mmap = self.ffn.interleaved_q4k_mmap.as_ref()?;
+        let manifest = self.ffn.interleaved_q4k_manifest.as_ref()?;
         let base = layer * 3;
         if base + 2 >= manifest.len() {
             return None;
@@ -310,7 +310,7 @@ impl VectorIndex {
     /// Dequantize one matrix from Q4 interleaved file → f32 Array2.
     /// component: 0=gate, 1=up, 2=down
     fn dequant_q4_matrix(&self, layer: usize, component: usize) -> Option<ndarray::Array2<f32>> {
-        let mmap = self.interleaved_q4_mmap.as_ref()?;
+        let mmap = self.ffn.interleaved_q4_mmap.as_ref()?;
         let intermediate = self.num_features(layer);
         if intermediate == 0 { return None; }
 
@@ -333,7 +333,7 @@ impl VectorIndex {
     /// path on Metal does NOT — it streams Q4_K bytes through
     /// `q4k_matmul_transb`). Returns `(populated_slots, bytes)`.
     pub fn q4k_ffn_cache_stats(&self) -> (usize, usize) {
-        let cache = self.q4k_ffn_cache.lock().unwrap();
+        let cache = self.ffn.q4k_ffn_cache.lock().unwrap();
         let mut slots = 0usize;
         let mut bytes = 0usize;
         for slot in cache.iter() {
@@ -354,11 +354,11 @@ impl VectorIndex {
     /// down-leg ceiling). Metal-backed runs do not need this — the
     /// full-K fast path bypasses the cache entirely.
     pub fn set_q4k_ffn_cache_max_layers(&self, max_layers: usize) {
-        self.q4k_ffn_cache_max_layers
+        self.ffn.q4k_ffn_cache_max_layers
             .store(max_layers, std::sync::atomic::Ordering::Relaxed);
         if max_layers > 0 {
-            let mut cache = self.q4k_ffn_cache.lock().unwrap();
-            let mut lru = self.q4k_ffn_cache_lru.lock().unwrap();
+            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
+            let mut lru = self.ffn.q4k_ffn_cache_lru.lock().unwrap();
             while lru.len() > max_layers {
                 if let Some(evict) = lru.pop_back() {
                     if evict < cache.len() {
@@ -379,13 +379,12 @@ impl VectorIndex {
         just_inserted: bool,
         cache: &mut [[Option<std::sync::Arc<Vec<f32>>>; 3]],
     ) {
-        let max = self
-            .q4k_ffn_cache_max_layers
+        let max = self.ffn.q4k_ffn_cache_max_layers
             .load(std::sync::atomic::Ordering::Relaxed);
         if max == 0 {
             return;
         }
-        let mut lru = self.q4k_ffn_cache_lru.lock().unwrap();
+        let mut lru = self.ffn.q4k_ffn_cache_lru.lock().unwrap();
         if let Some(pos) = lru.iter().position(|&l| l == layer) {
             lru.remove(pos);
         }
@@ -416,7 +415,7 @@ impl VectorIndex {
     {
         if component > 2 { return None; }
         {
-            let mut cache = self.q4k_ffn_cache.lock().unwrap();
+            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
             if let Some(slot) = cache.get(layer) {
                 if let Some(ref arc) = slot[component] {
                     let arc = arc.clone();
@@ -456,7 +455,7 @@ impl VectorIndex {
         };
         let arc = std::sync::Arc::new(final_data);
         {
-            let mut cache = self.q4k_ffn_cache.lock().unwrap();
+            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
             if let Some(slot) = cache.get_mut(layer) {
                 slot[component] = Some(arc.clone());
             }
@@ -535,7 +534,7 @@ impl VectorIndex {
     /// Prefetch next layer's Q4 data.
     pub fn prefetch_interleaved_q4_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.interleaved_q4_mmap {
+        if let Some(ref mmap) = self.ffn.interleaved_q4_mmap {
             let intermediate = self.num_features(layer);
             if intermediate == 0 { return; }
             let q4_bytes_per_matrix = intermediate * self.hidden_size / 32 * 18;
@@ -562,10 +561,10 @@ impl VectorIndex {
     /// matrices) — matches the build_q4k_weights writer.
     pub fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.interleaved_q4k_mmap {
+        if let Some(ref mmap) = self.ffn.interleaved_q4k_mmap {
             let intermediate = self.num_features(layer);
             if intermediate == 0 { return; }
-            let (start, len) = if let Some(ref manifest) = self.interleaved_q4k_manifest {
+            let (start, len) = if let Some(ref manifest) = self.ffn.interleaved_q4k_manifest {
                 let base = layer * 3;
                 if base + 2 >= manifest.len() { return; }
                 let s = manifest[base].0;
@@ -624,20 +623,20 @@ impl VectorIndex {
             offset += q4_bytes;
         }
 
-        self.gate_q4_mmap = Some(Arc::new(mmap));
-        self.gate_q4_slices = slices;
+        self.gate.gate_q4_mmap = Some(Arc::new(mmap));
+        self.gate.gate_q4_slices = slices;
         Ok(())
     }
 
     /// Whether Q4 gate vectors are loaded.
     pub fn has_gate_q4(&self) -> bool {
-        self.gate_q4_mmap.is_some()
+        self.gate.gate_q4_mmap.is_some()
     }
 
     /// Get Q4 data slice for a layer's gate vectors. Returns the raw Q4_0 bytes.
     pub fn gate_q4_data(&self, layer: usize) -> Option<&[u8]> {
-        let mmap = self.gate_q4_mmap.as_ref()?;
-        let slice = self.gate_q4_slices.get(layer)?;
+        let mmap = self.gate.gate_q4_mmap.as_ref()?;
+        let slice = self.gate.gate_q4_slices.get(layer)?;
         if slice.byte_len == 0 { return None; }
         let end = slice.byte_offset + slice.byte_len;
         if end > mmap.len() { return None; }
@@ -664,13 +663,13 @@ impl VectorIndex {
             layer_features,
             config.hidden_size,
         )?;
-        self.fp4_storage = Some(std::sync::Arc::new(storage));
+        self.ffn.fp4_storage = Some(std::sync::Arc::new(storage));
         Ok(())
     }
 
     /// Whether FP4/FP8 FFN storage is attached.
     pub fn has_fp4_storage(&self) -> bool {
-        self.fp4_storage.is_some()
+        self.ffn.fp4_storage.is_some()
     }
 
     /// Fused dequant + dot for one FFN feature when FP4/FP8 storage is
@@ -686,7 +685,7 @@ impl VectorIndex {
         feat: usize,
         x: &[f32],
     ) -> Option<f32> {
-        let fp4 = self.fp4_storage.as_ref()?;
+        let fp4 = self.ffn.fp4_storage.as_ref()?;
         fp4.row_dot(layer, component, feat, x)
     }
 
@@ -700,7 +699,7 @@ impl VectorIndex {
         alpha: f32,
         out: &mut [f32],
     ) -> bool {
-        let Some(fp4) = self.fp4_storage.as_ref() else { return false; };
+        let Some(fp4) = self.ffn.fp4_storage.as_ref() else { return false; };
         fp4.row_scaled_add(layer, component, feat, alpha, out)
     }
 
@@ -714,7 +713,7 @@ impl VectorIndex {
         feat: usize,
         out: &mut [f32],
     ) -> bool {
-        let Some(fp4) = self.fp4_storage.as_ref() else { return false; };
+        let Some(fp4) = self.ffn.fp4_storage.as_ref() else { return false; };
         fp4.dequant_row_into(layer, component, feat, out)
     }
 }

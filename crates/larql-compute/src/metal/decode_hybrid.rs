@@ -123,7 +123,7 @@ impl MetalBackend {
             enc_a.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
 
             let total_rows = (q_dim + kv_dim + kv_dim) as u32;
-            enc_a.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline);
+            enc_a.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline.state);
             enc_a.set_buffer(0, Some(&wq_buf), 0);
             enc_a.set_buffer(1, Some(&wk_buf), 0);
             enc_a.set_buffer(2, Some(&wv_buf), 0);

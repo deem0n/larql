@@ -143,22 +143,18 @@ pub fn dispatch_full_pipeline(
     // Local aliases to keep the orchestration body readable. Using
     // shared references means the body's existing `wq_bufs[l]` etc.
     // resolve through `Vec<Buffer>` indexing unchanged.
-    let wq_bufs        = &lb.wq;
-    let wq_scale_bufs  = &lb.wq_scale;
-    let wk_bufs        = &lb.wk;
-    let wk_scale_bufs  = &lb.wk_scale;
-    let wv_bufs        = &lb.wv;
-    let wv_scale_bufs  = &lb.wv_scale;
+    // Q/K/V weight & scale buffers are consumed inside the
+    // input-norm + QKV stage helper (`stages::encode_input_norm_and_qkv`)
+    // — the helper reads them off `lb` directly. The rest of the body
+    // only needs `wo` (for o_proj).
     let wo_bufs        = &lb.wo;
     let gate_bufs      = &lb.gate;
     let up_bufs        = &lb.up;
     let down_bufs      = &lb.down;
-    let input_norm_bufs    = &lb.input_norm;
     let post_attn_norm_bufs = &lb.post_attn_norm;
     let pre_ffn_norm_bufs  = &lb.pre_ffn_norm;
     let post_ffn_norm_bufs = &lb.post_ffn_norm;
     let h_bufs         = &lb.h;
-    let norm_outs      = &lb.norm_out;
     let q_outs         = &lb.q_out;
     let k_outs         = &lb.k_out;
     let v_outs         = &lb.v_out;
@@ -194,105 +190,50 @@ pub fn dispatch_full_pipeline(
         let has_post_norms = layers[l].has_post_norms;
 
         // ── 1+3. Input norm + Q/K/V projections (format-aware) ──
-        let attn_format = layers[l].wq.format;
-        let uses_f32_input = attn_format == crate::QuantFormat::Q4_K || attn_format == crate::QuantFormat::Q6_K || attn_format == crate::QuantFormat::Q4_KF;
-
-        // Per-position offsets (bytes). `layer_q_dim` / `layer_kv_dim` are the
-        // **this layer's** actual dimensions — Gemma 4 alternates between
-        // sliding (head_dim=256) and global (head_dim=512) layers so these
-        // differ per layer. Offsets into the per-layer allocated buffers use
-        // the per-layer dims; the function-level `q_dim` / `kv_dim` are only
-        // used as fallback stride for the caller's Q8 staging bucket.
+        //
+        // Per-position offsets (bytes). `layer_q_dim` / `layer_kv_dim`
+        // are the **this layer's** actual dimensions — Gemma 4
+        // alternates sliding (head_dim=256) and global (head_dim=512)
+        // layers so these differ per layer. Offsets into the per-layer
+        // allocated buffers use the per-layer dims; `q_dim` / `kv_dim`
+        // are only used as fallback stride for the Q8 staging bucket.
         let h_off = |p: usize| (p * hidden * 4) as u64;
         let q_off = |p: usize| (p * layer_q_dim * 4) as u64;
-        let kv_off = |p: usize| (p * layer_kv_dim * 4) as u64;
-        let _inter_off = |p: usize| (p * inter * 4) as u64;
         let q8_off = |p: usize| (p * q8_row_max) as u64;
         let q8s_off = |p: usize| (p * q8s_row_bytes) as u64;
-        let _ffn_q8_off = |p: usize| (p * hidden) as u64;
-        let _ffn_q8s_off = |p: usize| (p * hidden.div_ceil(32) * 4) as u64;
-
-        // Stage 1+2: input norm + Q/K/V projection, format-aware, per position.
-        use crate::metal::stages::{input_norm, qkv_proj, quant_matvec};
-        let all_same_format = layers[l].wq.format == layers[l].wk.format
-            && layers[l].wk.format == layers[l].wv.format;
-        let fused_qkv_pipe = q4kf_qkv_proj_pipeline.or(q4k_qkv_proj_pipeline)
-            .filter(|_| all_same_format
-                && matches!(layers[l].wq.format,
-                    crate::QuantFormat::Q4_K | crate::QuantFormat::Q4_KF));
-        let qm_pipes = quant_matvec::Pipelines {
+        let qm_pipes = crate::metal::stages::quant_matvec::Pipelines {
             q4kf_proj: q4kf_proj_pipeline,
             q4k_matvec_fallback: q4k_matvec_pipeline,
             q6k_matvec: q6k_matvec_pipeline,
             q4_matvec: &q4.matvec,
         };
-
-        if uses_f32_input {
-            // Q4_K / Q6_K / Q4_KF: f32 norm output, then either fused or
-            // per-projection QKV matvec.
-            for pos in 0..seq_len {
-                let enc = cmd.new_compute_command_encoder();
-                input_norm::encode_f32(
-                    enc, rms_norm_pipeline,
-                    &h_bufs[l], h_off(pos),
-                    &input_norm_bufs[l],
-                    &norm_outs[l], h_off(pos),
-                    hidden, eps, norm_offset,
-                );
-                if let Some(fused_pipeline) = fused_qkv_pipe {
-                    qkv_proj::encode_fused_f32(
-                        enc, fused_pipeline,
-                        &wq_bufs[l], &wk_bufs[l], &wv_bufs[l],
-                        &norm_outs[l], h_off(pos),
-                        &q_outs[l], q_off(pos),
-                        &k_outs[l], kv_off(pos),
-                        &v_outs[l], kv_off(pos),
-                        layer_q_dim, layer_kv_dim, hidden,
-                    );
-                } else {
-                    qkv_proj::encode_per_proj(
-                        enc, &qm_pipes,
-                        &norm_outs[l], h_off(pos),
-                        // Q8 input unused for f32-input formats — pass the
-                        // norm-out buffer as a harmless placeholder.
-                        &norm_outs[l], 0, &norm_outs[l], 0,
-                        [
-                            qkv_proj::Proj { format: layers[l].wq.format, w_buf: &wq_bufs[l], out_buf: &q_outs[l], out_off: q_off(pos),  rows: layer_q_dim },
-                            qkv_proj::Proj { format: layers[l].wk.format, w_buf: &wk_bufs[l], out_buf: &k_outs[l], out_off: kv_off(pos), rows: layer_kv_dim },
-                            qkv_proj::Proj { format: layers[l].wv.format, w_buf: &wv_bufs[l], out_buf: &v_outs[l], out_off: kv_off(pos), rows: layer_kv_dim },
-                        ],
-                        hidden,
-                    );
-                }
-                enc.end_encoding();
-            }
-        } else {
-            // Q8_0: fused rms_norm+Q8-quantise, then fused Q8 QKV projection.
-            for pos in 0..seq_len {
-                let enc = cmd.new_compute_command_encoder();
-                input_norm::encode_q8(
-                    enc, rms_norm_q8_pipeline,
-                    &h_bufs[l], h_off(pos),
-                    &input_norm_bufs[l],
-                    &q8_bufs[l], q8_off(pos),
-                    &q8s_bufs[l], q8s_off(pos),
-                    hidden, eps, norm_offset,
-                );
-                qkv_proj::encode_fused_q8(
-                    enc, q8_qkv_proj_pipeline,
-                    &wq_bufs[l], &wq_scale_bufs[l],
-                    &wk_bufs[l], &wk_scale_bufs[l],
-                    &wv_bufs[l], &wv_scale_bufs[l],
-                    &q8_bufs[l], q8_off(pos),
-                    &q8s_bufs[l], q8s_off(pos),
-                    &q_outs[l], q_off(pos),
-                    &k_outs[l], kv_off(pos),
-                    &v_outs[l], kv_off(pos),
-                    layer_q_dim, layer_kv_dim, hidden,
-                );
-                enc.end_encoding();
-            }
-        }
+        super::stages::encode_input_norm_and_qkv(
+            cmd.as_ref(),
+            &layers[l], l, seq_len, hidden,
+            &super::stages::LayerCtx {
+                eps, norm_offset,
+                layer_q_dim, layer_kv_dim,
+                q8_row_max, q8s_row_bytes,
+            },
+            &super::stages::InputNormQkvPipes {
+                rms_norm: rms_norm_pipeline,
+                rms_norm_q8: rms_norm_q8_pipeline,
+                q8_qkv_proj: q8_qkv_proj_pipeline,
+                q4kf_qkv_proj: q4kf_qkv_proj_pipeline,
+                q4k_qkv_proj: q4k_qkv_proj_pipeline,
+                qm_pipes,
+            },
+            &lb,
+        );
+        // qm_pipes is recomputed below for the FFN/down stages because
+        // it borrows from local references that were moved into the
+        // helper above.
+        let qm_pipes = crate::metal::stages::quant_matvec::Pipelines {
+            q4kf_proj: q4kf_proj_pipeline,
+            q4k_matvec_fallback: q4k_matvec_pipeline,
+            q6k_matvec: q6k_matvec_pipeline,
+            q4_matvec: &q4.matvec,
+        };
 
         // ── 3 (pre). Optional parameter-free V-norm (Gemma 4). ──
         if layers[l].has_v_norm {

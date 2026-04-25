@@ -137,11 +137,10 @@ impl VectorIndex {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         callbacks.on_file_done("ffn_gate", count, elapsed_ms);
 
-        Ok(VectorIndex {
-            gate_vectors,
-            down_meta: gate_meta,
-            ..VectorIndex::empty(num_layers, hidden_size)
-        })
+        let mut v = VectorIndex::empty(num_layers, hidden_size);
+        v.gate.gate_vectors = gate_vectors;
+        v.metadata.down_meta = gate_meta;
+        Ok(v)
     }
 
     /// Load down-projection token metadata from an NDJSON file (ffn_down.vectors.jsonl).
@@ -205,13 +204,13 @@ impl VectorIndex {
 
             if layer < self.num_layers {
                 // Ensure layer slot exists
-                while self.down_meta.len() <= layer {
-                    self.down_meta.push(None);
+                while self.metadata.down_meta.len() <= layer {
+                    self.metadata.down_meta.push(None);
                 }
-                if self.down_meta[layer].is_none() {
-                    self.down_meta[layer] = Some(Vec::new());
+                if self.metadata.down_meta[layer].is_none() {
+                    self.metadata.down_meta[layer] = Some(Vec::new());
                 }
-                if let Some(ref mut metas) = self.down_meta[layer] {
+                if let Some(ref mut metas) = self.metadata.down_meta[layer] {
                     while metas.len() <= feature {
                         metas.push(None);
                     }

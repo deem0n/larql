@@ -128,6 +128,18 @@ fn qkv_proj_handle_contract() {
     );
 }
 
+/// Fused Q8 QKV projection — tiled simdgroup, the only Q8-family
+/// pipeline that needed migrating to KernelHandle. (Other Q8 paths use
+/// flat dispatch_threads — `q8_matvec` is already a handle, the rest
+/// don't need geometry.)
+#[test]
+fn q8_qkv_proj_handle_contract() {
+    let metal = get_metal();
+    assert_handle_matches_marker::<shaders::q8_attn_proj::QkvKernel>(
+        &metal.q8_qkv_proj_pipeline, "q8_qkv_proj_pipeline",
+    );
+}
+
 /// The fused activation+down family — SiLU and GELU-tanh variants.
 #[test]
 fn geglu_down_handle_contract() {

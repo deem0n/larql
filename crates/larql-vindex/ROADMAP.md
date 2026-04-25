@@ -111,19 +111,24 @@ index/
 └── mutate/            — INSERT / DELETE / heap promotion
 ```
 
-### `VectorIndex` god struct → composed substores
-**Impact**: 35+ Option<Arc<Mmap>> fields collapse to four typed stores
+### `VectorIndex` god struct → composed substores — DONE
+**Impact**: 35+ flat fields collapsed to four typed stores
 **Effort**: Large
-**Status**: Unblocked by P1-1 — still pending. Touching every method
-that reads `self.*_mmap` directly is the hard part; the substore
-shapes themselves are easy. Sequence:
-1. Define `GateStore` / `FfnStore` / `ProjectionStore` /
-   `MetadataStore` in `index/storage/` next to their existing
-   modules.
-2. Embed them on `VectorIndex` and migrate read sites one at a time
-   (gate first, then ffn, then projections — each is an isolated PR).
-3. Slim `VectorIndex::empty` and the Clone impl to delegate.
-4. Update `gate_trait.rs` to delegate through the stores.
+**Status**: ✅ Complete (2026-04-25)
+
+What landed:
+- `GateStore` (storage/gate_store.rs) — gate matrix mmap, decode caches,
+  HNSW index. Owns 13 fields.
+- `FfnStore` (storage/ffn_data.rs) — FFN mmaps, Q4_K dequant cache,
+  FP4 storage. Owns 10 fields.
+- `ProjectionStore` (storage/projection_store.rs) — lm_head + attention
+  weight mmaps. Owns 10 fields.
+- `MetadataStore` (storage/metadata_store.rs) — down_meta, overrides.
+  Owns 4 fields.
+- `VectorIndex` itself now holds 5 shape fields + 4 substores. Each
+  store owns its own `Clone` impl (Arc-shares mmaps, resets caches).
+- 321 tests pass; field names preserved within stores so a future PR
+  can drop redundant `gate_` / `q4k_ffn_` prefixes if desired.
 
 ```rust
 pub struct VectorIndex {

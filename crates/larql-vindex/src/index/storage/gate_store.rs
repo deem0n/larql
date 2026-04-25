@@ -16,10 +16,102 @@
 //! - `gate_knn_mmap_fast`   — zero-copy f32 mmap path used as the
 //!                            `gate_knn` happy path.
 
+use std::sync::{Arc, Mutex, RwLock};
+
 use ndarray::{Array1, Array2, ArrayView2};
 use larql_compute::{ComputeBackend, MatMul};
 
 use crate::index::core::VectorIndex;
+use crate::index::types::{GateLayerSlice, GateQ4Slice};
+
+// ── GateStore — composes all gate-matrix-and-cache state ────────────────
+
+/// Gate matrix storage + decode caches + HNSW index.
+///
+/// Carved out of the monolithic `VectorIndex` god struct in the
+/// 2026-04-25 reorg. Field names match the legacy flat ones so call
+/// sites can be migrated mechanically; a future PR can drop the
+/// redundant `gate_` prefixes.
+pub struct GateStore {
+    /// Per-layer gate vectors (heap mode).
+    pub gate_vectors: Vec<Option<Array2<f32>>>,
+    /// Mmap'd gate vector bytes (zero-copy mode).
+    pub gate_mmap_bytes: Option<Arc<memmap2::Mmap>>,
+    /// Storage dtype for mmap'd data (drives f16 decode).
+    pub gate_mmap_dtype: crate::config::dtype::StorageDtype,
+    /// Per-layer slice info for mmap mode.
+    pub gate_mmap_slices: Vec<GateLayerSlice>,
+    /// Lazy decode cache for f16 gate vectors.
+    pub f16_decode_cache: Mutex<Vec<Option<Vec<f32>>>>,
+    /// LRU queue for `f16_decode_cache`. Back is oldest, front is newest.
+    pub gate_cache_lru: Mutex<std::collections::VecDeque<usize>>,
+    /// Cap on live entries in `f16_decode_cache`. 0 = unlimited.
+    pub gate_cache_max_layers: std::sync::atomic::AtomicUsize,
+    /// Warm-up cache (RwLock — lock-free reads).
+    pub warmed_gates: RwLock<Vec<Option<Vec<f32>>>>,
+    /// Q4_0 gate vectors mmap.
+    pub gate_q4_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Per-layer byte offset + length in `gate_q4_mmap`.
+    pub gate_q4_slices: Vec<GateQ4Slice>,
+    /// HNSW per-layer index, lazily built on first query when enabled.
+    pub hnsw_cache: Mutex<Vec<Option<super::super::hnsw::HnswLayer>>>,
+    /// HNSW master toggle.
+    pub hnsw_enabled: std::sync::atomic::AtomicBool,
+    /// HNSW beam width.
+    pub hnsw_ef_search: std::sync::atomic::AtomicUsize,
+}
+
+impl GateStore {
+    /// Inert default — every Option is None, every cache is empty.
+    pub fn empty(num_layers: usize) -> Self {
+        Self {
+            gate_vectors: vec![None; num_layers],
+            gate_mmap_bytes: None,
+            gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
+            gate_mmap_slices: Vec::new(),
+            f16_decode_cache: Mutex::new(vec![None; num_layers]),
+            gate_cache_lru: Mutex::new(std::collections::VecDeque::new()),
+            gate_cache_max_layers: std::sync::atomic::AtomicUsize::new(0),
+            warmed_gates: RwLock::new(vec![None; num_layers]),
+            gate_q4_mmap: None,
+            gate_q4_slices: Vec::new(),
+            hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
+            hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
+            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
+        }
+    }
+}
+
+impl Clone for GateStore {
+    /// Mmaps + slices + atomics carry over by Arc/copy; mutex-guarded
+    /// caches reset to fresh state per the existing VectorIndex Clone
+    /// contract (caches are working memory, not durable state).
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering;
+        let nl = self.gate_mmap_slices.len().max(self.gate_vectors.len());
+        Self {
+            gate_vectors: self.gate_vectors.clone(),
+            gate_mmap_bytes: self.gate_mmap_bytes.clone(),
+            gate_mmap_dtype: self.gate_mmap_dtype,
+            gate_mmap_slices: self.gate_mmap_slices.clone(),
+            f16_decode_cache: Mutex::new(vec![None; nl]),
+            gate_cache_lru: Mutex::new(std::collections::VecDeque::new()),
+            gate_cache_max_layers: std::sync::atomic::AtomicUsize::new(
+                self.gate_cache_max_layers.load(Ordering::Relaxed),
+            ),
+            warmed_gates: RwLock::new(vec![None; nl]),
+            gate_q4_mmap: self.gate_q4_mmap.clone(),
+            gate_q4_slices: self.gate_q4_slices.clone(),
+            hnsw_cache: Mutex::new((0..nl).map(|_| None).collect()),
+            hnsw_enabled: std::sync::atomic::AtomicBool::new(
+                self.hnsw_enabled.load(Ordering::Relaxed),
+            ),
+            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(
+                self.hnsw_ef_search.load(Ordering::Relaxed),
+            ),
+        }
+    }
+}
 
 // ── BLAS / GPU helpers ──────────────────────────────────────────────────
 
@@ -96,12 +188,12 @@ impl VectorIndex {
     /// gates at ~1.7 GB (at the cost of repeated decode on evicted
     /// layers).
     pub fn set_gate_cache_max_layers(&self, max_layers: usize) {
-        self.gate_cache_max_layers
+        self.gate.gate_cache_max_layers
             .store(max_layers, std::sync::atomic::Ordering::Relaxed);
         // Shrink eagerly if the new cap is below the current cache size.
         if max_layers > 0 {
-            let mut cache = self.f16_decode_cache.lock().unwrap();
-            let mut lru = self.gate_cache_lru.lock().unwrap();
+            let mut cache = self.gate.f16_decode_cache.lock().unwrap();
+            let mut lru = self.gate.gate_cache_lru.lock().unwrap();
             while lru.len() > max_layers {
                 if let Some(evict) = lru.pop_back() {
                     if evict < cache.len() {
@@ -122,13 +214,12 @@ impl VectorIndex {
         just_inserted: bool,
         cache: &mut [Option<Vec<f32>>],
     ) {
-        let max = self
-            .gate_cache_max_layers
+        let max = self.gate.gate_cache_max_layers
             .load(std::sync::atomic::Ordering::Relaxed);
         if max == 0 {
             return;
         }
-        let mut lru = self.gate_cache_lru.lock().unwrap();
+        let mut lru = self.gate.gate_cache_lru.lock().unwrap();
         // Move `layer` to the front (newest). If it's not in the queue
         // yet, push it; otherwise rotate.
         if let Some(pos) = lru.iter().position(|&l| l == layer) {
@@ -153,10 +244,9 @@ impl VectorIndex {
     pub(crate) fn resolve_gate(&self, layer: usize) -> Option<GateData> {
         // 1. Warmed cache
         {
-            let warmed = self.warmed_gates.read().unwrap();
+            let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
-                let nf = self
-                    .gate_mmap_slices
+                let nf = self.gate.gate_mmap_slices
                     .get(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
@@ -170,7 +260,7 @@ impl VectorIndex {
         }
 
         // 2. Heap
-        if let Some(Some(ref matrix)) = self.gate_vectors.get(layer) {
+        if let Some(Some(ref matrix)) = self.gate.gate_vectors.get(layer) {
             return Some(GateData {
                 data: matrix.as_slice().unwrap().to_vec(),
                 num_features: matrix.shape()[0],
@@ -178,12 +268,12 @@ impl VectorIndex {
         }
 
         // 3. Mmap
-        if let Some(ref mmap) = self.gate_mmap_bytes {
-            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                 if slice.num_features == 0 {
                     return None;
                 }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
                 let byte_offset = slice.float_offset * bpf;
                 let byte_count = slice.num_features * self.hidden_size * bpf;
                 let byte_end = byte_offset + byte_count;
@@ -191,7 +281,7 @@ impl VectorIndex {
                     return None;
                 }
 
-                let data = match self.gate_mmap_dtype {
+                let data = match self.gate.gate_mmap_dtype {
                     crate::config::dtype::StorageDtype::F32 => {
                         let float_count = slice.num_features * self.hidden_size;
                         unsafe {
@@ -200,7 +290,7 @@ impl VectorIndex {
                         }
                     }
                     crate::config::dtype::StorageDtype::F16 => {
-                        let mut cache = self.f16_decode_cache.lock().unwrap();
+                        let mut cache = self.gate.f16_decode_cache.lock().unwrap();
                         if cache.len() <= layer {
                             cache.resize(layer + 1, None);
                         }
@@ -233,10 +323,9 @@ impl VectorIndex {
     ) -> Option<Array1<f32>> {
         // Warmed cache (RwLock read — lock-free when no writers).
         {
-            let warmed = self.warmed_gates.read().unwrap();
+            let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
-                let nf = self
-                    .gate_mmap_slices
+                let nf = self.gate.gate_mmap_slices
                     .get(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
@@ -252,9 +341,9 @@ impl VectorIndex {
         }
 
         // f32 mmap zero-copy.
-        if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            if let Some(ref mmap) = self.gate_mmap_bytes {
-                if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
+            if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                     if slice.num_features == 0 {
                         return None;
                     }
@@ -343,7 +432,7 @@ mod gate_cache_lru_tests {
     }
 
     fn resident_layers(idx: &VectorIndex) -> usize {
-        idx.f16_decode_cache
+        idx.gate.f16_decode_cache
             .lock()
             .unwrap()
             .iter()
@@ -352,7 +441,7 @@ mod gate_cache_lru_tests {
     }
 
     fn lru_snapshot(idx: &VectorIndex) -> Vec<usize> {
-        idx.gate_cache_lru
+        idx.gate.gate_cache_lru
             .lock()
             .unwrap()
             .iter()
@@ -386,7 +475,7 @@ mod gate_cache_lru_tests {
         touch(&idx, 2);
         assert_eq!(resident_layers(&idx), 2, "cap of 2 holds");
 
-        let cache = idx.f16_decode_cache.lock().unwrap();
+        let cache = idx.gate.f16_decode_cache.lock().unwrap();
         assert!(cache[0].is_none(), "layer 0 should have been evicted");
         assert!(cache[1].is_some(), "layer 1 still cached");
         assert!(cache[2].is_some(), "layer 2 newly cached");
@@ -405,7 +494,7 @@ mod gate_cache_lru_tests {
         assert_eq!(lru_snapshot(&idx), vec![0, 1]);
 
         touch(&idx, 2);
-        let cache = idx.f16_decode_cache.lock().unwrap();
+        let cache = idx.gate.f16_decode_cache.lock().unwrap();
         assert!(cache[0].is_some(), "layer 0 was promoted on hit, must stay");
         assert!(cache[1].is_none(), "layer 1 was oldest, must be evicted");
         assert!(cache[2].is_some(), "layer 2 newly cached");
@@ -425,7 +514,7 @@ mod gate_cache_lru_tests {
         assert_eq!(resident_layers(&idx), 1);
         assert_eq!(lru_snapshot(&idx).len(), 1);
 
-        let cache = idx.f16_decode_cache.lock().unwrap();
+        let cache = idx.gate.f16_decode_cache.lock().unwrap();
         assert!(cache[3].is_some(), "newest layer should be the survivor");
         for l in 0..3 {
             assert!(cache[l].is_none(), "layer {l} should have been evicted");

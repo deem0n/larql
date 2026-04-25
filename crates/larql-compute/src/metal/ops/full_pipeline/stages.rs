@@ -1,0 +1,140 @@
+//! Per-stage encoders extracted from the `dispatch_full_pipeline`
+//! per-layer body.
+//!
+//! Each stage takes a context bundle so the function signatures stay
+//! readable instead of carrying 20+ parameters. Behaviour mirrors the
+//! inline code byte-for-byte — pure organisation, no logic change.
+
+use metal::{CommandBufferRef, ComputePipelineState};
+
+use super::buffers::LayerBuffers;
+use crate::metal::stages::{input_norm, qkv_proj, quant_matvec};
+use crate::FullPipelineLayer;
+
+/// Per-layer geometry + offsets needed by the input-norm + QKV stage.
+pub(super) struct LayerCtx {
+    pub eps: f32,
+    pub norm_offset: f32,
+    pub layer_q_dim: usize,
+    pub layer_kv_dim: usize,
+    pub q8_row_max: usize,
+    pub q8s_row_bytes: usize,
+}
+
+/// Pipeline references the input-norm + QKV stage may dispatch.
+/// All matvec-side fields are bare `ComputePipelineState`s mirroring
+/// the existing `dispatch_full_pipeline` signature; only `q4_matvec`
+/// flows through the format-aware quant_matvec stage helper which
+/// expects a [`crate::metal::kernel::KernelHandle`].
+#[allow(dead_code)]
+pub(super) struct InputNormQkvPipes<'a> {
+    pub rms_norm: &'a ComputePipelineState,
+    pub rms_norm_q8: &'a ComputePipelineState,
+    pub q8_qkv_proj: &'a ComputePipelineState,
+    pub q4kf_qkv_proj: Option<&'a ComputePipelineState>,
+    pub q4k_qkv_proj: Option<&'a ComputePipelineState>,
+    pub qm_pipes: quant_matvec::Pipelines<'a>,
+}
+
+/// Stage 1+3 — input norm followed by Q/K/V projection. Format-aware
+/// per layer (Q4_K family takes f32 input through a fused or
+/// per-projection shader; Q4_0 family fuses the norm with Q8 quant
+/// then dispatches the fused-Q8-QKV shader).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_input_norm_and_qkv(
+    cmd: &CommandBufferRef,
+    layer: &FullPipelineLayer<'_>,
+    layer_idx: usize,
+    seq_len: usize,
+    hidden: usize,
+    ctx: &LayerCtx,
+    pipes: &InputNormQkvPipes<'_>,
+    lb: &LayerBuffers,
+) {
+    let l = layer_idx;
+    let attn_format = layer.wq.format;
+    let uses_f32_input = matches!(
+        attn_format,
+        crate::QuantFormat::Q4_K | crate::QuantFormat::Q6_K | crate::QuantFormat::Q4_KF
+    );
+
+    let h_off = |p: usize| (p * hidden * 4) as u64;
+    let q_off = |p: usize| (p * ctx.layer_q_dim * 4) as u64;
+    let kv_off = |p: usize| (p * ctx.layer_kv_dim * 4) as u64;
+    let q8_off = |p: usize| (p * ctx.q8_row_max) as u64;
+    let q8s_off = |p: usize| (p * ctx.q8s_row_bytes) as u64;
+
+    let all_same_format = layer.wq.format == layer.wk.format
+        && layer.wk.format == layer.wv.format;
+    let fused_qkv_pipe = pipes.q4kf_qkv_proj.or(pipes.q4k_qkv_proj)
+        .filter(|_| all_same_format
+            && matches!(layer.wq.format, crate::QuantFormat::Q4_K | crate::QuantFormat::Q4_KF));
+
+    if uses_f32_input {
+        // Q4_K / Q6_K / Q4_KF: f32 norm output, then either fused or
+        // per-projection QKV matvec.
+        for pos in 0..seq_len {
+            let enc = cmd.new_compute_command_encoder();
+            input_norm::encode_f32(
+                enc, pipes.rms_norm,
+                &lb.h[l], h_off(pos),
+                &lb.input_norm[l],
+                &lb.norm_out[l], h_off(pos),
+                hidden, ctx.eps, ctx.norm_offset,
+            );
+            if let Some(fused_pipeline) = fused_qkv_pipe {
+                qkv_proj::encode_fused_f32(
+                    enc, fused_pipeline,
+                    &lb.wq[l], &lb.wk[l], &lb.wv[l],
+                    &lb.norm_out[l], h_off(pos),
+                    &lb.q_out[l], q_off(pos),
+                    &lb.k_out[l], kv_off(pos),
+                    &lb.v_out[l], kv_off(pos),
+                    ctx.layer_q_dim, ctx.layer_kv_dim, hidden,
+                );
+            } else {
+                let pos_qoff = q_off(pos);
+                let pos_kvoff = kv_off(pos);
+                qkv_proj::encode_per_proj(
+                    enc, &pipes.qm_pipes,
+                    &lb.norm_out[l], h_off(pos),
+                    // Q8 input unused for f32-input formats — placeholder.
+                    &lb.norm_out[l], 0, &lb.norm_out[l], 0,
+                    [
+                        qkv_proj::Proj { format: layer.wq.format, w_buf: &lb.wq[l], out_buf: &lb.q_out[l], out_off: pos_qoff,  rows: ctx.layer_q_dim },
+                        qkv_proj::Proj { format: layer.wk.format, w_buf: &lb.wk[l], out_buf: &lb.k_out[l], out_off: pos_kvoff, rows: ctx.layer_kv_dim },
+                        qkv_proj::Proj { format: layer.wv.format, w_buf: &lb.wv[l], out_buf: &lb.v_out[l], out_off: pos_kvoff, rows: ctx.layer_kv_dim },
+                    ],
+                    hidden,
+                );
+            }
+            enc.end_encoding();
+        }
+    } else {
+        // Q8_0: fused rms_norm+Q8-quantise, then fused Q8 QKV projection.
+        for pos in 0..seq_len {
+            let enc = cmd.new_compute_command_encoder();
+            input_norm::encode_q8(
+                enc, pipes.rms_norm_q8,
+                &lb.h[l], h_off(pos),
+                &lb.input_norm[l],
+                &lb.q8[l], q8_off(pos),
+                &lb.q8s[l], q8s_off(pos),
+                hidden, ctx.eps, ctx.norm_offset,
+            );
+            qkv_proj::encode_fused_q8(
+                enc, pipes.q8_qkv_proj,
+                &lb.wq[l], &lb.wq_scale[l],
+                &lb.wk[l], &lb.wk_scale[l],
+                &lb.wv[l], &lb.wv_scale[l],
+                &lb.q8[l], q8_off(pos),
+                &lb.q8s[l], q8s_off(pos),
+                &lb.q_out[l], q_off(pos),
+                &lb.k_out[l], kv_off(pos),
+                &lb.v_out[l], kv_off(pos),
+                ctx.layer_q_dim, ctx.layer_kv_dim, hidden,
+            );
+            enc.end_encoding();
+        }
+    }
+}

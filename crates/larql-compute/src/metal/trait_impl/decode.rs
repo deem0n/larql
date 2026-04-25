@@ -33,7 +33,7 @@ impl DecodeBackend for MetalBackend {
             &self.q8_quant_pipeline,
             Some(&self.fused_attn_pipeline),
             &self.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline,
+            &self.q8_qkv_proj_pipeline.state,
             &self.q4k_matvec_pipeline.state, &self.q6k_matvec_pipeline.state,
             &self.rms_norm_pipeline, &self.residual_add_pipeline,
             &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
@@ -122,7 +122,7 @@ impl DecodeBackend for MetalBackend {
             &self.q8_quant_pipeline,
             Some(&self.fused_attn_pipeline),
             &self.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline,
+            &self.q8_qkv_proj_pipeline.state,
             &self.q4k_matvec_pipeline.state, &self.q6k_matvec_pipeline.state,
             &self.rms_norm_pipeline, &self.residual_add_pipeline,
             &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
@@ -254,26 +254,21 @@ impl DecodeBackend for MetalBackend {
         num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
         rope_base: f32,
     ) -> (Option<Vec<f32>>, f64, f64, f64) {
-        // Whole-token timing (the per-stage attn / gate+up / down split
-        // used to come from `decode_profile.rs` — a 567-LOC duplicate
-        // decode path. Deleted; the split-stage diagnostic is on the
-        // roadmap as a proper `Profile` decorator that threads timing
-        // hooks into the live decode encoder).
+        // Whole-token timing today; per-stage split (attn vs gate+up vs
+        // down) lands when `Profile` decorator threads commit/wait
+        // boundaries through `decode_token_with_moe_fn` — see
+        // `metal::decode::profile` and ROADMAP P1.
+        use crate::metal::decode::ProfileTimings;
         let t0 = std::time::Instant::now();
         let result = <Self as DecodeBackend>::decode_token(
             self, layers, x, hidden, inter, q_dim, kv_dim,
             num_q_heads, num_kv_heads, head_dim, rope_base,
         );
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let num_layers = layers.len();
-        let per_layer = if num_layers > 0 { total_ms / num_layers as f64 } else { 0.0 };
-        eprintln!(
-            "[profile-split] {num_layers} layers, total={total_ms:.2}ms \
-             ({per_layer:.3}ms/layer). Per-stage attn / gate+up / down \
-             split available once the Profile decorator lands — see ROADMAP.",
-        );
-        // attn / gate+up / down split unavailable in the simple shim;
-        // return the total under `attn_ms` so callers see the cost.
-        (result, total_ms, 0.0, 0.0)
+        // Whole-token cost lives in `attn_ms` until the per-stage
+        // split is wired (see `metal::decode::profile`).
+        let timings = ProfileTimings { attn_ms: total_ms, gate_up_ms: 0.0, down_ms: 0.0 };
+        eprintln!("{}", timings.format_summary(layers.len()));
+        (result, timings.attn_ms, timings.gate_up_ms, timings.down_ms)
     }
 }

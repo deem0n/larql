@@ -22,7 +22,7 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };
-        self.attn_q8_mmap = Some(Arc::new(mmap));
+        self.projections.attn_q8_mmap = Some(Arc::new(mmap));
 
         let manifest_path = dir.join("attn_weights_q8_manifest.json");
         if manifest_path.exists() {
@@ -39,15 +39,15 @@ impl VectorIndex {
                     (offset, vals_len, scales_len)
                 })
                 .collect();
-            self.attn_q8_manifest = Some(entries);
+            self.projections.attn_q8_manifest = Some(entries);
         }
         Ok(())
     }
 
     /// Get per-layer Q8 attention slices: (q_vals, q_scales, k_vals, k_scales, v_vals, v_scales, o_vals, o_scales)
     pub fn attn_q8_layer_data(&self, layer: usize) -> Option<[(&[u8], &[f32]); 4]> {
-        let mmap = self.attn_q8_mmap.as_ref()?;
-        let manifest = self.attn_q8_manifest.as_ref()?;
+        let mmap = self.projections.attn_q8_mmap.as_ref()?;
+        let manifest = self.projections.attn_q8_manifest.as_ref()?;
 
         let base = layer * 4;
         if base + 3 >= manifest.len() { return None; }
@@ -94,16 +94,16 @@ impl VectorIndex {
                     (offset, length, format)
                 })
                 .collect();
-            self.attn_q4k_manifest = Some(entries);
+            self.projections.attn_q4k_manifest = Some(entries);
         }
-        self.attn_q4k_mmap = Some(Arc::new(mmap));
+        self.projections.attn_q4k_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     /// Get per-layer Q4_K/Q6_K attention slices: (data, format) for Q, K, V, O.
     pub fn attn_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 4]> {
-        let mmap = self.attn_q4k_mmap.as_ref()?;
-        let manifest = self.attn_q4k_manifest.as_ref()?;
+        let mmap = self.projections.attn_q4k_mmap.as_ref()?;
+        let manifest = self.projections.attn_q4k_manifest.as_ref()?;
         let base = layer * 4;
         if base + 3 >= manifest.len() { return None; }
 
@@ -123,7 +123,7 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };
-        self.attn_q4_mmap = Some(Arc::new(mmap));
+        self.projections.attn_q4_mmap = Some(Arc::new(mmap));
 
         // Load manifest with per-matrix offsets
         let manifest_path = dir.join("attn_weights_q4_manifest.json");
@@ -140,22 +140,22 @@ impl VectorIndex {
                     (offset, length)
                 })
                 .collect();
-            self.attn_q4_manifest = Some(entries);
+            self.projections.attn_q4_manifest = Some(entries);
         }
         Ok(())
     }
 
     /// Get raw Q4 attention weight bytes (all layers packed).
     pub fn attn_q4_data(&self) -> Option<&[u8]> {
-        self.attn_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+        self.projections.attn_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
     }
 
     /// Get per-layer Q4 attention weight slices (Q, K, V, O) using the manifest.
     /// Returns None if manifest or Q4 attn data is not loaded.
     #[allow(clippy::type_complexity)]
     pub fn attn_q4_layer_slices(&self, layer: usize) -> Option<(&[u8], &[u8], &[u8], &[u8])> {
-        let mmap = self.attn_q4_mmap.as_ref()?;
-        let manifest = self.attn_q4_manifest.as_ref()?;
+        let mmap = self.projections.attn_q4_mmap.as_ref()?;
+        let manifest = self.projections.attn_q4_manifest.as_ref()?;
 
         // Each layer has 4 tensors: Q, K, V, O
         let base = layer * 4;

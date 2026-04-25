@@ -54,13 +54,13 @@ fn cpu_kv_attention(
         let q_off = h * head_dim;
         // Q · K^T over all cached positions.
         let mut scores = vec![0.0f32; t];
-        for ki in 0..t {
+        for (ki, score) in scores.iter_mut().enumerate() {
             let k_off = ki * num_kv * head_dim + kv_h * head_dim;
             let mut dot = 0.0f64;
             for d in 0..head_dim {
                 dot += (q[q_off + d] as f64) * (k_cache[k_off + d] as f64);
             }
-            scores[ki] = (dot as f32) * scale;
+            *score = (dot as f32) * scale;
         }
         // Stable softmax.
         let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -70,9 +70,9 @@ fn cpu_kv_attention(
         // V-weighted sum.
         for d in 0..head_dim {
             let mut acc = 0.0f64;
-            for ki in 0..t {
+            for (ki, &exp) in exps.iter().enumerate() {
                 let v_off = ki * num_kv * head_dim + kv_h * head_dim;
-                acc += (exps[ki] as f64) * (v_cache[v_off + d] as f64);
+                acc += (exp as f64) * (v_cache[v_off + d] as f64);
             }
             out[q_off + d] = acc as f32;
         }

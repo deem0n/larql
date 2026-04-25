@@ -414,22 +414,23 @@ field on `MetalBackend`, and the call sites lose their direct
 `shaders::*::ROWS_PER_TG` imports. Mechanical — same pattern as
 the v4 transformation, just repeated.
 
-#### Q4_0 fast path: add `quant_matvec_q8_input` (open)
+#### Q4_0 fast path: caller migration to `quant_matvec_q8_input` (open)
 
-P1a landed `quant_matvec(format, weights, x, n, k)` as the f32-input
-convenience API. The per-format helpers `q4_matvec`, `q4k_matvec`,
-`q6k_matvec` aren't legacy — they're the pre-quantised-input fast
-path that the four hot decode callers (`lm_head.rs`,
-`gate_knn.rs` ×2, `attention/gpu.rs`) need to avoid re-quantising
-their already-Q8 inputs on every matvec.
-
-What's missing is a unified pre-quantised entry point. Adding
 `quant_matvec_q8_input(format, weights, q8_x, q8_scales, n, k)`
-would let those four callers express their intent through
-[`QuantMatVec`] in a format-aware way (today they hard-code
-`q4_matvec`, which only handles Q4_0; a Q4_K hot path would have to
-add another helper). Once that's there, the per-format helpers can
-become deprecated thin wrappers.
+shipped on `QuantMatVec`. Q4_0/Q8_0 dispatch directly to
+`q4_matvec` (zero overhead); Q4_K/Q4_KF/Q6_K dequantise the Q8 to
+f32 and dispatch the f32-input shader (slower but correct
+fallback).
+
+Pinned by `cpu_quant_matvec_q8_input_q4_0_matches_q4_matvec` —
+bit-for-bit match with the legacy helper.
+
+The remaining work is **caller migration**: the four hot decode
+callers (`lm_head.rs`, `gate_knn.rs` ×2, `attention/gpu.rs`) still
+hard-code `q4_matvec`. Migrating them to `quant_matvec_q8_input`
+would let them handle Q4_K weights too without touching new
+trait methods. Once nothing calls `q4_matvec` directly, mark it
+deprecated.
 
 #### Extract stage helpers from `dispatch_full_pipeline` (open)
 
@@ -461,21 +462,26 @@ per stage; the only missing piece is the timing hook.
 Until then, `instruments`-based profiling on the GPU remains the
 ground-truth tool for "which sub-stage is hot."
 
-#### Plug `benches/quant_matvec` into CI (Make targets shipped, GHA template)
+#### Plug `benches/*` into CI (Make targets shipped, GHA workflow ready)
 
 `make bench-save` records a baseline; `make bench-check` re-runs
-the suite and fails if any cell regresses past Criterion's noise
-threshold. The detection logic lives in `scripts/bench-regress.sh`
-(env-tunable threshold, baseline name, feature flags).
+the suite (quant_matvec + matmul + linalg) and fails if any cell
+regresses past Criterion's noise threshold. The detection logic
+lives in `scripts/bench-regress.sh` (env-tunable threshold, baseline
+name, feature flags, bench subset).
 
-GitHub Actions starter at `.github/workflows/bench-regress.yml` —
-runs on `macos-14` so Metal cells benchmark too, caches baselines
-between runs, treats a cold-cache run as neutral (no false-fail on
-the first PR after CI is stood up).
+GitHub Actions workflow at `.github/workflows/bench-regress.yml` —
+runs on `macos-14` (Apple Silicon, for the Metal cells), uses split
+caches for cargo deps vs criterion baselines so each push to main
+records a fresh baseline, treats cold-cache as neutral (no
+false-fail on the first PR after CI is stood up), uploads the
+criterion HTML report on regression so reviewers see the delta
+without re-running locally.
 
-Open follow-up: actually wire the workflow up once CI infra is
+Open follow-up: actually merge the workflow once CI infra is
 adopted — today the project ships with `make ci` but no automated
-runner. The bench suite is ready; only the trigger is missing.
+runner. The bench suite + workflow + Make targets are all in
+place; only the trigger is missing.
 
 ### `--compact` loader reconstruction — WalkFfn-only today
 

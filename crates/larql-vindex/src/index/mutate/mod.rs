@@ -20,13 +20,13 @@ impl VectorIndex {
     /// Set metadata for a feature. Used by INSERT and UPDATE.
     pub fn set_feature_meta(&mut self, layer: usize, feature: usize, meta: FeatureMeta) {
         // Ensure layer slot exists
-        while self.down_meta.len() <= layer {
-            self.down_meta.push(None);
+        while self.metadata.down_meta.len() <= layer {
+            self.metadata.down_meta.push(None);
         }
-        if self.down_meta[layer].is_none() {
-            self.down_meta[layer] = Some(Vec::new());
+        if self.metadata.down_meta[layer].is_none() {
+            self.metadata.down_meta[layer] = Some(Vec::new());
         }
-        if let Some(ref mut metas) = self.down_meta[layer] {
+        if let Some(ref mut metas) = self.metadata.down_meta[layer] {
             while metas.len() <= feature {
                 metas.push(None);
             }
@@ -39,11 +39,11 @@ impl VectorIndex {
     /// If the index is in mmap mode, promotes this layer to heap first.
     pub fn set_gate_vector(&mut self, layer: usize, feature: usize, vector: &Array1<f32>) {
         // Promote from mmap to heap if needed
-        if self.gate_mmap_bytes.is_some() && self.gate_vectors.get(layer).map(|v| v.is_none()).unwrap_or(true) {
+        if self.gate.gate_mmap_bytes.is_some() && self.gate.gate_vectors.get(layer).map(|v| v.is_none()).unwrap_or(true) {
             self.promote_layer_to_heap(layer);
         }
 
-        if let Some(Some(ref mut matrix)) = self.gate_vectors.get_mut(layer) {
+        if let Some(Some(ref mut matrix)) = self.gate.gate_vectors.get_mut(layer) {
             if feature < matrix.shape()[0] && vector.len() == matrix.shape()[1] {
                 for (j, val) in vector.iter().enumerate() {
                     matrix[[feature, j]] = *val;
@@ -55,7 +55,7 @@ impl VectorIndex {
     /// Set a custom down vector override for a feature.
     /// During sparse FFN, this vector is used instead of the model's down weight row.
     pub fn set_down_vector(&mut self, layer: usize, feature: usize, vector: Vec<f32>) {
-        self.down_overrides.insert((layer, feature), vector);
+        self.metadata.down_overrides.insert((layer, feature), vector);
     }
 
     /// All in-memory down vector overrides keyed by `(layer, feature)`.
@@ -65,14 +65,14 @@ impl VectorIndex {
     /// For a single (layer, feature) lookup, use `down_override_at` —
     /// it has the same shape as `PatchedVindex::overrides_gate_at`.
     pub fn down_overrides(&self) -> &std::collections::HashMap<(usize, usize), Vec<f32>> {
-        &self.down_overrides
+        &self.metadata.down_overrides
     }
 
     /// Down vector override for `(layer, feature)`, if any has been set
     /// via `set_down_vector`. Returns the same data as the
     /// `GateIndex::down_override` trait method.
     pub fn down_override_at(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+        self.metadata.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
     }
 
     /// Set a custom up vector override for a feature. Mirrors
@@ -80,41 +80,41 @@ impl VectorIndex {
     /// `silu(gate · x) * (up · x)` reflects the constellation install
     /// instead of the original weak free-slot up vector.
     pub fn set_up_vector(&mut self, layer: usize, feature: usize, vector: Vec<f32>) {
-        self.up_overrides.insert((layer, feature), vector);
+        self.metadata.up_overrides.insert((layer, feature), vector);
     }
 
     /// All in-memory up vector overrides keyed by `(layer, feature)`.
     /// Parallel to `down_overrides()`. Used by `COMPILE INTO VINDEX` to
     /// bake the overrides into a fresh copy of `up_features.bin`.
     pub fn up_overrides(&self) -> &std::collections::HashMap<(usize, usize), Vec<f32>> {
-        &self.up_overrides
+        &self.metadata.up_overrides
     }
 
     /// Up vector override for `(layer, feature)`, if any has been set
     /// via `set_up_vector`. Same shape as `down_override_at`.
     pub fn up_override_at(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.up_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+        self.metadata.up_overrides.get(&(layer, feature)).map(|v| v.as_slice())
     }
 
     /// Copy a layer's gate vectors from mmap to heap (for mutation).
     fn promote_layer_to_heap(&mut self, layer: usize) {
-        if let Some(ref mmap) = self.gate_mmap_bytes {
-            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                 if slice.num_features > 0 {
-                    let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                    let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
                     let byte_offset = slice.float_offset * bpf;
                     let byte_count = slice.num_features * self.hidden_size * bpf;
                     let byte_end = byte_offset + byte_count;
                     if byte_end <= mmap.len() {
                         let raw = &mmap[byte_offset..byte_end];
-                        let floats = crate::config::dtype::decode_floats(raw, self.gate_mmap_dtype);
+                        let floats = crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype);
                         let matrix = ndarray::Array2::from_shape_vec(
                             (slice.num_features, self.hidden_size), floats
                         ).unwrap();
-                        while self.gate_vectors.len() <= layer {
-                            self.gate_vectors.push(None);
+                        while self.gate.gate_vectors.len() <= layer {
+                            self.gate.gate_vectors.push(None);
                         }
-                        self.gate_vectors[layer] = Some(matrix);
+                        self.gate.gate_vectors[layer] = Some(matrix);
                     }
                 }
             }
@@ -123,7 +123,7 @@ impl VectorIndex {
 
     /// Clear metadata for a feature. Used by DELETE.
     pub fn delete_feature_meta(&mut self, layer: usize, feature: usize) {
-        if let Some(Some(ref mut metas)) = self.down_meta.get_mut(layer) {
+        if let Some(Some(ref mut metas)) = self.metadata.down_meta.get_mut(layer) {
             if feature < metas.len() {
                 metas[feature] = None;
             }
@@ -134,7 +134,7 @@ impl VectorIndex {
     /// If all slots have metadata, returns the weakest feature (lowest c_score).
     pub fn find_free_feature(&self, layer: usize) -> Option<usize> {
         // Mmap path: scan on demand
-        if let Some(ref dm) = self.down_meta_mmap {
+        if let Some(ref dm) = self.metadata.down_meta_mmap {
             let nf = dm.num_features(layer);
             if nf == 0 { return None; }
             // Look for empty slot
@@ -158,7 +158,7 @@ impl VectorIndex {
         }
 
         // Heap path
-        if let Some(Some(ref metas)) = self.down_meta.get(layer) {
+        if let Some(Some(ref metas)) = self.metadata.down_meta.get(layer) {
             for (i, m) in metas.iter().enumerate() {
                 if m.is_none() {
                     return Some(i);
@@ -231,14 +231,14 @@ impl VectorIndex {
     /// JSONL is no longer written — use `larql dump-meta` for human-readable output.
     /// Loading still falls back to JSONL for v1 compat if binary is absent.
     pub fn save_down_meta(&self, dir: &Path) -> Result<usize, VindexError> {
-        let max_top_k = self.down_meta.iter()
+        let max_top_k = self.metadata.down_meta.iter()
             .filter_map(|l| l.as_ref())
             .flat_map(|metas| metas.iter().filter_map(|m| m.as_ref()))
             .map(|m| m.top_k.len())
             .max()
             .unwrap_or(10);
 
-        crate::format::down_meta::write_binary(dir, &self.down_meta, max_top_k)
+        crate::format::down_meta::write_binary(dir, &self.metadata.down_meta, max_top_k)
     }
 
     /// Write gate_vectors.bin back to disk and return updated layer info.
@@ -257,20 +257,20 @@ impl VectorIndex {
 
         for layer in 0..self.num_layers {
             // Try heap first (may have promoted layers), then mmap
-            let data: Option<Vec<f32>> = if let Some(Some(ref matrix)) = self.gate_vectors.get(layer) {
+            let data: Option<Vec<f32>> = if let Some(Some(ref matrix)) = self.gate.gate_vectors.get(layer) {
                 Some(matrix.as_slice().ok_or_else(|| {
                     VindexError::Parse("gate vectors not contiguous".into())
                 })?.to_vec())
-            } else if let Some(ref mmap) = self.gate_mmap_bytes {
-                if let Some(slice) = self.gate_mmap_slices.get(layer) {
+            } else if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                     if slice.num_features > 0 {
-                        let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                        let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
                         let byte_offset = slice.float_offset * bpf;
                         let byte_count = slice.num_features * self.hidden_size * bpf;
                         let byte_end = byte_offset + byte_count;
                         if byte_end <= mmap.len() {
                             Some(crate::config::dtype::decode_floats(
-                                &mmap[byte_offset..byte_end], self.gate_mmap_dtype
+                                &mmap[byte_offset..byte_end], self.gate.gate_mmap_dtype
                             ))
                         } else { None }
                     } else { None }

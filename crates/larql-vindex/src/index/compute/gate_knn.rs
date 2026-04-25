@@ -24,7 +24,7 @@ impl VectorIndex {
         top_k: usize,
     ) -> Vec<(usize, f32)> {
         // HNSW path
-        if self.hnsw_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.gate.hnsw_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(results) = self.gate_knn_hnsw(layer, residual, top_k) {
                 return results;
             }
@@ -62,9 +62,9 @@ impl VectorIndex {
         let _owned: Vec<f32>;
 
         // Try zero-copy f32 mmap first
-        let mmap_slice = if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            self.gate_mmap_bytes.as_ref().and_then(|mmap| {
-                let slice = self.gate_mmap_slices.get(layer)?;
+        let mmap_slice = if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
+            self.gate.gate_mmap_bytes.as_ref().and_then(|mmap| {
+                let slice = self.gate.gate_mmap_slices.get(layer)?;
                 if slice.num_features == 0 { return None; }
                 let byte_offset = slice.float_offset * 4;
                 let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
@@ -118,7 +118,7 @@ impl VectorIndex {
         top_k: usize,
     ) -> Vec<(usize, f32)> {
         // If promoted to heap, use heap path
-        if let Some(Some(ref matrix)) = self.gate_vectors.get(layer) {
+        if let Some(Some(ref matrix)) = self.gate.gate_vectors.get(layer) {
             let end = feat_end.min(matrix.shape()[0]);
             if feat_start >= end { return vec![]; }
             let slice = matrix.slice(ndarray::s![feat_start..end, ..]);
@@ -128,11 +128,11 @@ impl VectorIndex {
             return hits;
         }
 
-        if let Some(ref mmap) = self.gate_mmap_bytes {
-            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                 if slice.num_features == 0 || feat_start >= slice.num_features { return vec![]; }
                 let end = feat_end.min(slice.num_features);
-                let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
 
                 // Compute byte range for just this expert's features
                 let layer_byte_start = slice.float_offset * bpf;
@@ -142,7 +142,7 @@ impl VectorIndex {
 
                 if expert_byte_end > mmap.len() { return vec![]; }
 
-                match self.gate_mmap_dtype {
+                match self.gate.gate_mmap_dtype {
                     crate::config::dtype::StorageDtype::F32 => {
                         let data = unsafe {
                             let ptr = mmap[expert_byte_start..expert_byte_end].as_ptr() as *const f32;
@@ -323,9 +323,9 @@ impl VectorIndex {
     ) -> Option<Array2<f32>> {
         // Warmed cache (f32 heap).
         {
-            let warmed = self.warmed_gates.read().unwrap();
+            let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
-                let nf = self.gate_mmap_slices.get(layer).map(|s| s.num_features).unwrap_or(0);
+                let nf = self.gate.gate_mmap_slices.get(layer).map(|s| s.num_features).unwrap_or(0);
                 if nf > 0 {
                     let view = ArrayView2::from_shape((nf, self.hidden_size), data.as_slice()).unwrap();
                     if let Some(scores) = gate_gemv_gpu(&view, &x.view(), backend) {
@@ -335,9 +335,9 @@ impl VectorIndex {
             }
         }
         // f32 mmap (zero-copy, the production path for f32 gate vectors).
-        if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            if let Some(ref mmap) = self.gate_mmap_bytes {
-                if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
+            if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                     if slice.num_features == 0 { return None; }
                     let byte_offset = slice.float_offset * 4;
                     let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
@@ -358,11 +358,11 @@ impl VectorIndex {
         // an ~18 K × 5376 gate matrix (387 MB f32, 194 MB f16) halving
         // the memory bandwidth is the difference between hitting the
         // CPU-BLAS ceiling and going faster on Metal.
-        if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F16
+        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F16
             && x.shape()[0] == 1 {
-                let slice = self.gate_mmap_slices.get(layer)?;
+                let slice = self.gate.gate_mmap_slices.get(layer)?;
                 if slice.num_features == 0 { return None; }
-                let mmap = self.gate_mmap_bytes.as_ref()?;
+                let mmap = self.gate.gate_mmap_bytes.as_ref()?;
                 let byte_offset = slice.float_offset * 2;
                 let byte_end = byte_offset + slice.num_features * self.hidden_size * 2;
                 if byte_end <= mmap.len() {
@@ -384,9 +384,9 @@ impl VectorIndex {
     fn gate_scores_2d_fast(&self, layer: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
         // Warmed cache
         {
-            let warmed = self.warmed_gates.read().unwrap();
+            let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
-                let nf = self.gate_mmap_slices.get(layer).map(|s| s.num_features).unwrap_or(0);
+                let nf = self.gate.gate_mmap_slices.get(layer).map(|s| s.num_features).unwrap_or(0);
                 if nf > 0 {
                     let view = ArrayView2::from_shape((nf, self.hidden_size), data.as_slice()).unwrap();
                     return Some(gate_matmul(&view, &x.view()));
@@ -394,9 +394,9 @@ impl VectorIndex {
             }
         }
         // f32 mmap
-        if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            if let Some(ref mmap) = self.gate_mmap_bytes {
-                if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
+            if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                     if slice.num_features == 0 { return None; }
                     let byte_offset = slice.float_offset * 4;
                     let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
@@ -413,11 +413,11 @@ impl VectorIndex {
         // f16 mmap — lazy decode into cache, then borrow (no per-call clone).
         // Holding the Mutex for the matmul is fine: forward passes are serial
         // per-layer, and this replaces a 462MB clone with a direct view.
-        if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F16 {
-            let slice = self.gate_mmap_slices.get(layer)?;
+        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F16 {
+            let slice = self.gate.gate_mmap_slices.get(layer)?;
             if slice.num_features == 0 { return None; }
-            let mmap = self.gate_mmap_bytes.as_ref()?;
-            let mut cache = self.f16_decode_cache.lock().unwrap();
+            let mmap = self.gate.gate_mmap_bytes.as_ref()?;
+            let mut cache = self.gate.f16_decode_cache.lock().unwrap();
             if cache.len() <= layer { cache.resize(layer + 1, None); }
             let miss = cache[layer].is_none();
             if miss {
@@ -439,18 +439,18 @@ impl VectorIndex {
     ///
     /// `ef_search`: beam width for search (50-200). Higher = better recall, slower.
     pub fn enable_hnsw(&self, ef_search: usize) {
-        self.hnsw_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.hnsw_ef_search.store(ef_search, std::sync::atomic::Ordering::Relaxed);
+        self.gate.hnsw_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.gate.hnsw_ef_search.store(ef_search, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Disable HNSW, revert to brute-force matmul.
     pub fn disable_hnsw(&self) {
-        self.hnsw_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.gate.hnsw_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether HNSW is currently enabled.
     pub fn is_hnsw_enabled(&self) -> bool {
-        self.hnsw_enabled.load(std::sync::atomic::Ordering::Relaxed)
+        self.gate.hnsw_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the gate vector matrix for a layer as owned contiguous f32.
@@ -462,7 +462,7 @@ impl VectorIndex {
 
     /// Get or build the HNSW index for a layer (lazy).
     fn get_or_build_hnsw(&self, layer: usize) -> bool {
-        let mut cache = self.hnsw_cache.lock().unwrap();
+        let mut cache = self.gate.hnsw_cache.lock().unwrap();
         if cache.len() <= layer { cache.resize_with(layer + 1, || None); }
         if cache[layer].is_some() { return true; }
 
@@ -500,19 +500,19 @@ impl VectorIndex {
     ) -> Option<Vec<(usize, f32)>> {
         if !self.get_or_build_hnsw(layer) { return None; }
 
-        let ef = self.hnsw_ef_search.load(std::sync::atomic::Ordering::Relaxed);
+        let ef = self.gate.hnsw_ef_search.load(std::sync::atomic::Ordering::Relaxed);
         // Oversample so the abs-rank seam below has signed candidates
         // from both tails to choose from.
         let hnsw_k = top_k.saturating_mul(4).max(top_k);
-        let cache = self.hnsw_cache.lock().unwrap();
+        let cache = self.gate.hnsw_cache.lock().unwrap();
         let hnsw = cache[layer].as_ref()?;
 
-        let mut candidates = if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32
-            && self.gate_mmap_bytes.is_some()
+        let mut candidates = if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32
+            && self.gate.gate_mmap_bytes.is_some()
         {
             // Zero-copy view onto f32-mmap.
-            let mmap = self.gate_mmap_bytes.as_ref().unwrap();
-            let slice = self.gate_mmap_slices.get(layer)?;
+            let mmap = self.gate.gate_mmap_bytes.as_ref().unwrap();
+            let slice = self.gate.gate_mmap_slices.get(layer)?;
             if slice.num_features == 0 { return None; }
             let byte_offset = slice.float_offset * 4;
             let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
@@ -599,7 +599,7 @@ impl VectorIndex {
     ) -> Option<Vec<(usize, f32)>> {
         if !backend.has_q4() { return None; }
         let q4_data = self.gate_q4_data(layer)?;
-        let slice = self.gate_q4_slices.get(layer)?;
+        let slice = self.gate.gate_q4_slices.get(layer)?;
         if slice.num_features == 0 { return None; }
 
         let (q8_x, q8_scales) = larql_compute::cpu::q4::quantize_to_q8(residual.as_slice().unwrap());

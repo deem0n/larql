@@ -22,16 +22,16 @@ impl GateIndex for VectorIndex {
     }
 
     fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+        self.metadata.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
     }
 
     fn up_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.up_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+        self.metadata.up_overrides.get(&(layer, feature)).map(|v| v.as_slice())
     }
 
     fn has_overrides_at(&self, layer: usize) -> bool {
-        self.down_overrides.keys().any(|(l, _)| *l == layer)
-            || self.up_overrides.keys().any(|(l, _)| *l == layer)
+        self.metadata.down_overrides.keys().any(|(l, _)| *l == layer)
+            || self.metadata.up_overrides.keys().any(|(l, _)| *l == layer)
     }
 
     fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
@@ -43,7 +43,7 @@ impl GateIndex for VectorIndex {
     }
 
     fn has_down_features(&self) -> bool {
-        self.down_features_mmap.is_some()
+        self.ffn.down_features_mmap.is_some()
     }
 
     fn gate_knn_q4(
@@ -123,7 +123,7 @@ impl GateIndex for VectorIndex {
     }
 
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
-        self.interleaved_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+        self.ffn.interleaved_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
     }
 
     fn has_interleaved_q4k(&self) -> bool {
@@ -131,7 +131,7 @@ impl GateIndex for VectorIndex {
     }
 
     fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
-        self.interleaved_q4k_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+        self.ffn.interleaved_q4k_mmap.as_ref().map(|m| m.as_ref() as &[u8])
     }
 
     fn prefetch_interleaved_q4k_layer(&self, layer: usize) {

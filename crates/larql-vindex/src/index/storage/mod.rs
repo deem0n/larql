@@ -7,10 +7,18 @@
 
 pub mod accessors;
 pub mod attn;
+pub mod ffn_data;
 pub mod ffn_store;
 pub mod fp4_storage;
 pub mod gate_store;
 pub mod lm_head;
+pub mod metadata_store;
+pub mod projection_store;
 pub mod residency;
+
+pub use ffn_data::FfnStore;
+pub use gate_store::GateStore;
+pub use metadata_store::MetadataStore;
+pub use projection_store::ProjectionStore;
 
 pub use residency::{LayerState, ResidencyManager};

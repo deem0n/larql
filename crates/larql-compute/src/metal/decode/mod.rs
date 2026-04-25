@@ -4,6 +4,9 @@ mod diag;
 mod encode_ffn;
 mod encode_qkv;
 mod moe_combine;
+pub mod profile;
+
+pub use profile::ProfileTimings;
 
 impl MetalBackend {
     /// Create a KV cache for decode mode with uniform per-layer dims.

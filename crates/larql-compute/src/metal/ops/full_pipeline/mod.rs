@@ -27,6 +27,7 @@ mod buffers;
 mod dispatch;
 mod dump;
 mod kv_copy;
+mod stages;
 
 // Public re-exports — these names are part of the crate-level API
 // (`prefill.rs` uses the encode helpers, callers reach for

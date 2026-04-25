@@ -21,8 +21,7 @@ impl VectorIndex {
     /// Checks heap first (mutation overrides), then mmap (production read path).
     pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
         // Heap path first — catches mutation overrides (INSERT/UPDATE)
-        if let Some(meta) = self
-            .down_meta
+        if let Some(meta) = self.metadata.down_meta
             .get(layer)
             .and_then(|v| v.as_ref())
             .and_then(|metas| metas.get(feature))
@@ -31,7 +30,7 @@ impl VectorIndex {
             return Some(meta);
         }
         // Mmap path (production — zero heap, no mutations)
-        if let Some(ref dm) = self.down_meta_mmap {
+        if let Some(ref dm) = self.metadata.down_meta_mmap {
             return dm.feature_meta(layer, feature);
         }
         None
@@ -51,27 +50,27 @@ impl VectorIndex {
         // Mirror the walk_ffn routing priority order (see
         // larql-inference::vindex::walk_ffn/mod.rs routing table).
         let mut parts = Vec::new();
-        if self.fp4_storage.is_some() {
-            let fp4 = self.fp4_storage.as_ref().unwrap();
+        if self.ffn.fp4_storage.is_some() {
+            let fp4 = self.ffn.fp4_storage.as_ref().unwrap();
             let g = fp4.manifest.projections.gate.precision;
             let u = fp4.manifest.projections.up.precision;
             let d = fp4.manifest.projections.down.precision;
             parts.push(format!("FP4 sparse (gate={g}, up={u}, down={d})"));
         }
-        if self.interleaved_q4k_mmap.is_some() {
+        if self.ffn.interleaved_q4k_mmap.is_some() {
             parts.push("Q4K interleaved".into());
         }
-        if self.interleaved_q4_mmap.is_some() {
+        if self.ffn.interleaved_q4_mmap.is_some() {
             parts.push("Q4_0 interleaved".into());
         }
-        if self.interleaved_mmap.is_some() {
+        if self.ffn.interleaved_mmap.is_some() {
             parts.push("f32 interleaved".into());
         }
-        if self.up_features_mmap.is_some() && self.down_features_mmap.is_some() {
+        if self.ffn.up_features_mmap.is_some() && self.ffn.down_features_mmap.is_some() {
             parts.push("full mmap (up+down f32)".into());
         }
-        if self.gate_mmap_bytes.is_some() {
-            parts.push(format!("gate KNN ({:?} mmap)", self.gate_mmap_dtype));
+        if self.gate.gate_mmap_bytes.is_some() {
+            parts.push(format!("gate KNN ({:?} mmap)", self.gate.gate_mmap_dtype));
         }
         if parts.is_empty() {
             "weights fallback (safetensors — vindex not wired)".into()
@@ -89,14 +88,14 @@ impl VectorIndex {
     /// sees `num_features == 0` and falls through to the safetensors
     /// weights path, silently bypassing the vindex entirely.
     pub fn num_features(&self, layer: usize) -> usize {
-        if self.gate_mmap_bytes.is_some() {
-            let n = self.gate_mmap_slices
+        if self.gate.gate_mmap_bytes.is_some() {
+            let n = self.gate.gate_mmap_slices
                 .get(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0);
             if n > 0 { return n; }
         }
-        if let Some(n) = self.gate_vectors
+        if let Some(n) = self.gate.gate_vectors
             .get(layer)
             .and_then(|v| v.as_ref())
             .map(|m| m.shape()[0])
@@ -105,7 +104,7 @@ impl VectorIndex {
         }
         // FP4 storage fallback — layer_features is populated from
         // `index.json.layers[]` at load time.
-        if let Some(ref fp4) = self.fp4_storage {
+        if let Some(ref fp4) = self.ffn.fp4_storage {
             if let Some(&n) = fp4.layer_features.get(layer) {
                 return n;
             }
@@ -115,10 +114,10 @@ impl VectorIndex {
 
     /// Total gate vectors loaded across all layers.
     pub fn total_gate_vectors(&self) -> usize {
-        if self.gate_mmap_bytes.is_some() {
-            return self.gate_mmap_slices.iter().map(|s| s.num_features).sum();
+        if self.gate.gate_mmap_bytes.is_some() {
+            return self.gate.gate_mmap_slices.iter().map(|s| s.num_features).sum();
         }
-        self.gate_vectors
+        self.gate.gate_vectors
             .iter()
             .filter_map(|v| v.as_ref())
             .map(|m| m.shape()[0])
@@ -127,10 +126,10 @@ impl VectorIndex {
 
     /// Total down metadata entries loaded across all layers.
     pub fn total_down_meta(&self) -> usize {
-        if let Some(ref dm) = self.down_meta_mmap {
+        if let Some(ref dm) = self.metadata.down_meta_mmap {
             return dm.total_features();
         }
-        self.down_meta
+        self.metadata.down_meta
             .iter()
             .filter_map(|v| v.as_ref())
             .map(|metas| metas.iter().filter(|m| m.is_some()).count())
@@ -139,16 +138,15 @@ impl VectorIndex {
 
     /// Layers that have gate vectors loaded.
     pub fn loaded_layers(&self) -> Vec<usize> {
-        if self.gate_mmap_bytes.is_some() {
-            return self
-                .gate_mmap_slices
+        if self.gate.gate_mmap_bytes.is_some() {
+            return self.gate.gate_mmap_slices
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.num_features > 0)
                 .map(|(i, _)| i)
                 .collect();
         }
-        self.gate_vectors
+        self.gate.gate_vectors
             .iter()
             .enumerate()
             .filter_map(|(i, v)| v.as_ref().map(|_| i))
@@ -157,7 +155,7 @@ impl VectorIndex {
 
     /// Access down metadata for a specific layer.
     pub fn down_meta_at(&self, layer: usize) -> Option<&[Option<FeatureMeta>]> {
-        self.down_meta
+        self.metadata.down_meta
             .get(layer)
             .and_then(|v| v.as_ref())
             .map(|v| v.as_slice())
@@ -166,33 +164,33 @@ impl VectorIndex {
     /// Access gate vectors matrix for a specific layer (heap mode only).
     /// Returns None in mmap mode — use gate_knn() directly instead.
     pub fn gate_vectors_at(&self, layer: usize) -> Option<&Array2<f32>> {
-        self.gate_vectors.get(layer).and_then(|v| v.as_ref())
+        self.gate.gate_vectors.get(layer).and_then(|v| v.as_ref())
     }
 
     /// Extract a single gate vector for a feature. Works in both heap and mmap mode.
     /// Returns the raw f32 vector (hidden_size elements).
     pub fn gate_vector(&self, layer: usize, feature: usize) -> Option<Vec<f32>> {
         // Heap path
-        if let Some(Some(matrix)) = self.gate_vectors.get(layer) {
+        if let Some(Some(matrix)) = self.gate.gate_vectors.get(layer) {
             if feature < matrix.shape()[0] {
                 return Some(matrix.row(feature).to_vec());
             }
             return None;
         }
         // Mmap path
-        if let Some(ref mmap) = self.gate_mmap_bytes {
-            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                 if feature >= slice.num_features {
                     return None;
                 }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
                 let byte_offset = (slice.float_offset + feature * self.hidden_size) * bpf;
                 let byte_count = self.hidden_size * bpf;
                 if byte_offset + byte_count > mmap.len() {
                     return None;
                 }
                 let raw = &mmap[byte_offset..byte_offset + byte_count];
-                return Some(crate::config::dtype::decode_floats(raw, self.gate_mmap_dtype));
+                return Some(crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype));
             }
         }
         None
@@ -203,7 +201,7 @@ impl VectorIndex {
     /// Use for bulk operations (SVD, PCA, numpy export).
     pub fn gate_vectors_flat(&self, layer: usize) -> Option<(Vec<f32>, usize, usize)> {
         // Heap path
-        if let Some(Some(matrix)) = self.gate_vectors.get(layer) {
+        if let Some(Some(matrix)) = self.gate.gate_vectors.get(layer) {
             let (rows, cols) = (matrix.shape()[0], matrix.shape()[1]);
             if let Some(data) = matrix.as_slice() {
                 return Some((data.to_vec(), rows, cols));
@@ -216,19 +214,19 @@ impl VectorIndex {
             return Some((data, rows, cols));
         }
         // Mmap path
-        if let Some(ref mmap) = self.gate_mmap_bytes {
-            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
+            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                 if slice.num_features == 0 {
                     return None;
                 }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
                 let byte_offset = slice.float_offset * bpf;
                 let byte_count = slice.num_features * self.hidden_size * bpf;
                 if byte_offset + byte_count > mmap.len() {
                     return None;
                 }
                 let raw = &mmap[byte_offset..byte_offset + byte_count];
-                let data = crate::config::dtype::decode_floats(raw, self.gate_mmap_dtype);
+                let data = crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype);
                 return Some((data, slice.num_features, self.hidden_size));
             }
         }
@@ -237,8 +235,8 @@ impl VectorIndex {
 
     /// Number of features at a layer (works in both heap and mmap mode).
     pub fn num_features_at(&self, layer: usize) -> usize {
-        if self.gate_mmap_bytes.is_some() {
-            self.gate_mmap_slices
+        if self.gate.gate_mmap_bytes.is_some() {
+            self.gate.gate_mmap_slices
                 .get(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0)
@@ -275,32 +273,32 @@ impl VectorIndex {
         let advise = |m: &memmap2::Mmap| unsafe {
             let _ = m.unchecked_advise(UncheckedAdvice::DontNeed);
         };
-        if let Some(ref m) = self.gate_mmap_bytes { advise(m); }
-        if let Some(ref m) = self.down_features_mmap { advise(m); }
-        if let Some(ref m) = self.up_features_mmap { advise(m); }
-        if let Some(ref m) = self.lm_head_mmap { advise(m); }
-        if let Some(ref m) = self.lm_head_f16_mmap { advise(m); }
-        if let Some(ref m) = self.interleaved_mmap { advise(m); }
-        if let Some(ref m) = self.interleaved_q4_mmap { advise(m); }
-        if let Some(ref m) = self.interleaved_q4k_mmap { advise(m); }
-        if let Some(ref m) = self.gate_q4_mmap { advise(m); }
-        if let Some(ref m) = self.lm_head_q4_mmap { advise(m); }
-        if let Some(ref m) = self.attn_q4k_mmap { advise(m); }
-        if let Some(ref m) = self.attn_q4_mmap { advise(m); }
-        if let Some(ref m) = self.attn_q8_mmap { advise(m); }
+        if let Some(ref m) = self.gate.gate_mmap_bytes { advise(m); }
+        if let Some(ref m) = self.ffn.down_features_mmap { advise(m); }
+        if let Some(ref m) = self.ffn.up_features_mmap { advise(m); }
+        if let Some(ref m) = self.projections.lm_head_mmap { advise(m); }
+        if let Some(ref m) = self.projections.lm_head_f16_mmap { advise(m); }
+        if let Some(ref m) = self.ffn.interleaved_mmap { advise(m); }
+        if let Some(ref m) = self.ffn.interleaved_q4_mmap { advise(m); }
+        if let Some(ref m) = self.ffn.interleaved_q4k_mmap { advise(m); }
+        if let Some(ref m) = self.gate.gate_q4_mmap { advise(m); }
+        if let Some(ref m) = self.projections.lm_head_q4_mmap { advise(m); }
+        if let Some(ref m) = self.projections.attn_q4k_mmap { advise(m); }
+        if let Some(ref m) = self.projections.attn_q4_mmap { advise(m); }
+        if let Some(ref m) = self.projections.attn_q8_mmap { advise(m); }
     }
 
     /// Pre-decode f16 gate vectors to f32 for lock-free access.
     /// For f32 vindexes this is a no-op — the mmap path is already zero-copy.
     pub fn warmup(&self) {
-        if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
+        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
             return;
         }
 
-        let Some(ref mmap) = self.gate_mmap_bytes else {
+        let Some(ref mmap) = self.gate.gate_mmap_bytes else {
             return;
         };
-        let mut warmed = self.warmed_gates.write().unwrap();
+        let mut warmed = self.gate.warmed_gates.write().unwrap();
         if warmed.len() < self.num_layers {
             warmed.resize_with(self.num_layers, || None);
         }
@@ -308,11 +306,11 @@ impl VectorIndex {
             if warmed[layer].is_some() {
                 continue;
             }
-            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
                 if slice.num_features == 0 {
                     continue;
                 }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
                 let byte_offset = slice.float_offset * bpf;
                 let byte_count = slice.num_features * self.hidden_size * bpf;
                 let byte_end = byte_offset + byte_count;

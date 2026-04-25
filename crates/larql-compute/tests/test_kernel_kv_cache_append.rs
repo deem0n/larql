@@ -69,13 +69,13 @@ fn cpu_kv_attention(
         let kv_h = h / reps;
         let q_off = h * head_dim;
         let mut scores = vec![0.0f32; t];
-        for ki in 0..t {
+        for (ki, score) in scores.iter_mut().enumerate() {
             let k_off = ki * num_kv * head_dim + kv_h * head_dim;
             let mut dot = 0.0f64;
             for d in 0..head_dim {
                 dot += (q[q_off + d] as f64) * (k_cache[k_off + d] as f64);
             }
-            scores[ki] = (dot as f32) * scale;
+            *score = (dot as f32) * scale;
         }
         let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
@@ -83,9 +83,9 @@ fn cpu_kv_attention(
         for e in exps.iter_mut() { *e /= sum_exp; }
         for d in 0..head_dim {
             let mut acc = 0.0f64;
-            for ki in 0..t {
+            for (ki, &exp) in exps.iter().enumerate() {
                 let v_off = ki * num_kv * head_dim + kv_h * head_dim;
-                acc += (exps[ki] as f64) * (v_cache[v_off + d] as f64);
+                acc += (exp as f64) * (v_cache[v_off + d] as f64);
             }
             out[q_off + d] = acc as f32;
         }

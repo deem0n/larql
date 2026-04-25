@@ -42,6 +42,32 @@ use kernel::KernelHandle;
 use ops::q4_common::Q4Pipelines;
 
 /// Metal GPU compute backend.
+///
+/// ## Pipeline field convention
+///
+/// Fields fall into two camps:
+///
+/// - **`KernelHandle`** — simdgroup-tiled kernels with hard-coded row
+///   maps (`row_idx = tg_id * ROWS_PER_TG + sg_id`). Geometry travels
+///   with the pipeline; dispatchers read `kernel.rows_per_tg` /
+///   `kernel.threads_per_tg` rather than importing constants from a
+///   shader module. This is the bug class the q4_matvec_v4 75 %-row
+///   drop introduced (see ROADMAP ship log).
+///
+/// - **`ComputePipelineState`** — flat `dispatch_threads` kernels
+///   (one thread per output element / row) or attention-shape
+///   kernels (per-head dispatch). No row-map drift risk because the
+///   dispatcher already specifies the geometry per call.
+///
+/// Twelve simdgroup-tiled fields use `KernelHandle`. The rest stay
+/// bare. Decision per remaining field:
+/// - `geglu_*`, `silu`, `gelu_tanh`, `residual_add`, `scale_vector` →
+///   element-wise, flat dispatch.
+/// - `rms_norm*`, `layer_norm*`, `v_norm*`, `qk_norm`, `residual_norm*`
+///   → per-row reduction, flat dispatch (one threadgroup per row).
+/// - `causal_attn`, `fused_attn`, `kv_attend`, `kv_append` → attention
+///   geometry (per-head/per-position), not row-tiled.
+/// - `rope_*`, `q8_quant` → flat dispatch_threads.
 pub struct MetalBackend {
     queue: CommandQueue,
     bufs: BufferCache,
@@ -57,7 +83,7 @@ pub struct MetalBackend {
     pub q8_matvec_pipeline: KernelHandle,
     pub rms_norm_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
-    q8_qkv_proj_pipeline: ComputePipelineState,
+    pub q8_qkv_proj_pipeline: KernelHandle,
     pub q4k_matvec_pipeline: KernelHandle,
     pub q4k_ffn_gate_up_pipeline: KernelHandle,
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
@@ -177,9 +203,8 @@ impl MetalBackend {
         let q4k_geglu_silu_down_pipeline = KernelHandle::from_kernel::<shaders::q4k_geglu_down::SiluKernel>(&device, &library)?;
         let q4k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<shaders::q4k_geglu_down::GeluTanhKernel>(&device, &library)?;
 
-        // Fused Q8 QKV projection (all 3 in one dispatch)
-        let q8_qkv_fn = library.get_function("q8_qkv_proj", None).ok()?;
-        let q8_qkv_proj_pipeline = device.new_compute_pipeline_state_with_function(&q8_qkv_fn).ok()?;
+        // Fused Q8 QKV projection (KernelHandle).
+        let q8_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q8_attn_proj::QkvKernel>(&device, &library)?;
 
         // Fused ops (norm+quantize, residual+norm, residual+norm+quantize)
         let rms_norm_q8_fn = library.get_function("rms_norm_q8", None).ok()?;

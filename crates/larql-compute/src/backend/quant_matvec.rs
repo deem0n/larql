@@ -17,6 +17,25 @@
 
 use crate::QuantFormat;
 
+/// Reverse the `quantize_to_q8` block layout: each 32-element block
+/// has one f32 scale, multiplied through to recover f32 values.
+fn dequantise_q8(q8_x: &[i8], q8_scales: &[f32]) -> Vec<f32> {
+    let n_blocks = q8_x.len() / 32;
+    debug_assert!(q8_scales.len() >= n_blocks);
+    let mut out = Vec::with_capacity(q8_x.len());
+    for (b, &scale) in q8_scales.iter().take(n_blocks).enumerate() {
+        let off = b * 32;
+        for &q in &q8_x[off..off + 32] {
+            out.push(q as f32 * scale);
+        }
+    }
+    // Tail (if `q8_x.len()` isn't a multiple of 32 — defensive).
+    for &q in &q8_x[n_blocks * 32..] {
+        out.push(q as f32);
+    }
+    out
+}
+
 /// Quantised matvec primitives.
 pub trait QuantMatVec {
     /// Format-dispatched matvec.
@@ -43,6 +62,44 @@ pub trait QuantMatVec {
                 let (q8_x, q8_scales) =
                     crate::cpu::ops::q4_common::quantize_to_q8(x);
                 self.q4_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
+            }
+        }
+    }
+
+    /// Format-aware matvec on **pre-quantised** Q8 input.
+    ///
+    /// `out[N] = W[N, K] · q8_x[K]`. Caller has already quantised `x`
+    /// to Q8 (per-32 f32-scaled int8) and passes the int8 buffer +
+    /// scales directly. Hot decode loops do this once per layer and
+    /// reuse the buffers across many gate/up matvecs — re-quantising
+    /// per call (as `quant_matvec` does) is wasted work.
+    ///
+    /// - For `Q4_0` / `Q8_0` this is a direct call to `q4_matvec` /
+    ///   the Q8-input kernel — zero overhead vs the per-format helper.
+    /// - For `Q4_K` / `Q4_KF` / `Q6_K` the GPU shaders take f32 input,
+    ///   so the default impl dequantises Q8 → f32 then dispatches the
+    ///   f32 path. That's strictly slower than the f32-input
+    ///   `quant_matvec`, but it's the correct fallback when the caller
+    ///   has *only* the Q8 form on hand.
+    ///
+    /// Returns `None` if the backend doesn't implement the format.
+    fn quant_matvec_q8_input(
+        &self,
+        format: QuantFormat,
+        weights: &[u8],
+        q8_x: &[i8],
+        q8_scales: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        match format {
+            QuantFormat::Q4_0 | QuantFormat::Q8_0 => {
+                self.q4_matvec(weights, q8_x, q8_scales, num_rows, hidden)
+            }
+            QuantFormat::Q4_K | QuantFormat::Q4_KF | QuantFormat::Q6_K => {
+                // f32-input shaders — dequantise Q8 first.
+                let x_f32 = dequantise_q8(q8_x, q8_scales);
+                self.quant_matvec(format, weights, &x_f32, num_rows, hidden)
             }
         }
     }

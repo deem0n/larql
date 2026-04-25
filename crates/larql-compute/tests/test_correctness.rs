@@ -120,6 +120,30 @@ fn cpu_backend_capability_truth_table() {
     }
 }
 
+/// `quant_matvec_q8_input` for Q4_0 must equal the legacy `q4_matvec`
+/// helper bit-for-bit — both take pre-quantised Q8 input and dispatch
+/// the same kernel. This pins the migration contract for the four
+/// hot decode callers (lm_head, gate_knn ×2, attention/gpu).
+#[test]
+fn cpu_quant_matvec_q8_input_q4_0_matches_q4_matvec() {
+    use larql_compute::cpu::q4;
+    use larql_compute::QuantFormat;
+
+    let hidden = 256usize;
+    let rows = 128usize;
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin() + 0.5).collect();
+    let matrix: Vec<f32> = (0..rows * hidden).map(|i| (i as f32 * 0.001).cos() + 0.5).collect();
+
+    let q4_0 = quantize_q4_0(&matrix);
+    let (q8_x, q8s) = q4::quantize_to_q8(&x);
+
+    let cpu = cpu_backend();
+    let helper = cpu.q4_matvec(&q4_0, &q8_x, &q8s, rows, hidden).unwrap();
+    let q8_input = cpu.quant_matvec_q8_input(QuantFormat::Q4_0, &q4_0, &q8_x, &q8s, rows, hidden).unwrap();
+
+    assert_eq!(helper, q8_input, "Q4_0 q8_input path must equal q4_matvec helper bit-for-bit");
+}
+
 /// Pin the unified `quant_matvec` dispatch: every supported format on
 /// the CPU backend must produce the same output as its per-format
 /// helper. This is the contract callers depend on when migrating off

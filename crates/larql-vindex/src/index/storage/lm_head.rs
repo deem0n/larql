@@ -30,23 +30,23 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };
-        self.lm_head_q4_mmap = Some(Arc::new(mmap));
+        self.projections.lm_head_q4_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     /// Whether Q4 lm_head is loaded (from file or synthesized from f16 embeddings).
     pub fn has_lm_head_q4(&self) -> bool {
-        self.lm_head_q4_mmap.is_some() || self.lm_head_q4_synth.is_some()
+        self.projections.lm_head_q4_mmap.is_some() || self.projections.lm_head_q4_synth.is_some()
     }
 
     /// Synthesize Q4_0 lm_head in RAM from the f16 embeddings mmap.
     /// No-op if a Q4 source already exists or preconditions are not met.
     pub fn synthesize_lm_head_q4(&mut self) {
-        if self.lm_head_q4_mmap.is_some() || self.lm_head_q4_synth.is_some() { return; }
+        if self.projections.lm_head_q4_mmap.is_some() || self.projections.lm_head_q4_synth.is_some() { return; }
         let vocab = self.vocab_size;
         let hidden = self.hidden_size;
         if vocab == 0 || hidden == 0 || !hidden.is_multiple_of(32) { return; }
-        let f16_mmap = match self.lm_head_f16_mmap.as_ref() {
+        let f16_mmap = match self.projections.lm_head_f16_mmap.as_ref() {
             Some(m) => m.clone(),
             None => return,
         };
@@ -66,7 +66,7 @@ impl VectorIndex {
             let q4 = larql_compute::cpu::q4::quantize_q4_0(&row_f32);
             out.extend_from_slice(&q4);
         }
-        self.lm_head_q4_synth = Some(Arc::new(out));
+        self.projections.lm_head_q4_synth = Some(Arc::new(out));
     }
 
     /// Adopt the vindex's f16 `embeddings.bin` mmap as an f16 view of the
@@ -77,12 +77,12 @@ impl VectorIndex {
     /// When set, `lm_head_knn_backend` prefers `ComputeBackend::f16_gemv`
     /// on the mmap'd bytes, avoiding the 5.6 GB f32 clone on Gemma 4 31B.
     pub fn set_lm_head_f16_mmap(&mut self, mmap: Arc<memmap2::Mmap>) {
-        self.lm_head_f16_mmap = Some(mmap);
+        self.projections.lm_head_f16_mmap = Some(mmap);
     }
 
     /// Whether an f16 mmap view of the LM head is available.
     pub fn has_lm_head_f16(&self) -> bool {
-        self.lm_head_f16_mmap.is_some() && self.vocab_size > 0
+        self.projections.lm_head_f16_mmap.is_some() && self.vocab_size > 0
     }
 
     // ── LM head (output projection) for vindex logits ──
@@ -98,13 +98,13 @@ impl VectorIndex {
         // Detect vocab size from file size: vocab = file_bytes / (hidden_size * 4)
         let vocab = mmap.len() / (self.hidden_size * 4);
         self.vocab_size = vocab;
-        self.lm_head_mmap = Some(Arc::new(mmap));
+        self.projections.lm_head_mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
     /// Whether lm_head is loaded for vindex logits.
     pub fn has_lm_head(&self) -> bool {
-        self.lm_head_mmap.is_some() && self.vocab_size > 0
+        self.projections.lm_head_mmap.is_some() && self.vocab_size > 0
     }
 
     /// KNN against lm_head via a ComputeBackend. Tries paths in order:
@@ -119,9 +119,9 @@ impl VectorIndex {
     ) -> Vec<(u32, f32)> {
         // 1. Q4 path — ~1 ms on Metal (mmap file or synthesized from f16 embeddings).
         if backend.has_q4() {
-            let q4_bytes: Option<&[u8]> = self.lm_head_q4_mmap
+            let q4_bytes: Option<&[u8]> = self.projections.lm_head_q4_mmap
                 .as_ref().map(|m| m.as_ref() as &[u8])
-                .or_else(|| self.lm_head_q4_synth.as_ref().map(|v| v.as_slice()));
+                .or_else(|| self.projections.lm_head_q4_synth.as_ref().map(|v| v.as_slice()));
             if let Some(q4_data) = q4_bytes {
                 let vocab = self.vocab_size;
                 let hidden = self.hidden_size;
@@ -138,7 +138,7 @@ impl VectorIndex {
         }
         // 2. f16 path — tied-embed Gemma, ~2× the bandwidth of Q4 but still
         //    half of f32 and avoids a 5.6 GB heap allocation on 31B.
-        if let Some(ref f16_mmap) = self.lm_head_f16_mmap {
+        if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
             let vocab = self.vocab_size;
             let hidden = self.hidden_size;
             if vocab > 0 {
@@ -177,7 +177,7 @@ impl VectorIndex {
     /// Single BLAS gemv: query[1, hidden] @ lm_head[vocab, hidden]^T → [1, vocab].
     /// Then top-K selection. Returns (token_id, score) sorted by score descending.
     pub fn lm_head_knn(&self, query: &ndarray::Array1<f32>, top_k: usize) -> Vec<(u32, f32)> {
-        let mmap = match self.lm_head_mmap.as_ref() {
+        let mmap = match self.projections.lm_head_mmap.as_ref() {
             Some(m) => m,
             None => return vec![],
         };
@@ -288,7 +288,7 @@ mod tests {
         assert!(index.has_lm_head_q4(), "should have Q4 after synthesis");
 
         // Byte length check.
-        let synth = index.lm_head_q4_synth.as_ref().unwrap();
+        let synth = index.projections.lm_head_q4_synth.as_ref().unwrap();
         let blocks_per_row = hidden / 32;
         let bytes_per_row = blocks_per_row * 18;
         assert_eq!(synth.len(), vocab * bytes_per_row,
@@ -297,7 +297,7 @@ mod tests {
         // Calling again should be a no-op (idempotent).
         let ptr_before = synth.as_ptr();
         index.synthesize_lm_head_q4();
-        let ptr_after = index.lm_head_q4_synth.as_ref().unwrap().as_ptr();
+        let ptr_after = index.projections.lm_head_q4_synth.as_ref().unwrap().as_ptr();
         assert_eq!(ptr_before, ptr_after, "second call should not reallocate");
     }
 }

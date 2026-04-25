@@ -233,7 +233,7 @@ impl MetalBackend {
         let k_rows = layer_kv_dim as u32;
         let v_rows = layer_kv_dim as u32;
         let k_val = hidden as u32;
-        enc.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline);
+        enc.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline.state);
         enc.set_buffer(0, Some(bufs.wq), 0);
         enc.set_buffer(1, Some(bufs.wk), 0);
         enc.set_buffer(2, Some(bufs.wv), 0);
