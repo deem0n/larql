@@ -57,18 +57,26 @@ larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --
 | `--dir <DIR>` | Serve all .vindex directories in folder | — |
 | `--port <PORT>` | Listen port | 8080 |
 | `--host <HOST>` | Bind address | 0.0.0.0 |
-| `--no-infer` | Disable inference (browse-only, saves memory) | false |
+| `--no-infer` | Disable `/v1/infer` (browse-only, saves no memory directly — `walk-ffn` still loads weights lazily; pair with `--warmup-walk-ffn` to pay that cost at boot). | false |
 | `--ffn-only` | Run as an FFN-service endpoint for `RemoteWalkBackend` clients. Skips the f16→f32 gate warmup (10× smaller startup RSS on 31B Q4_K) | false |
 | `--embed-only` | Run as an embed-service endpoint (ADR-0008). Loads only embeddings + lm_head + tokenizer; skips all FFN and attention weights. Enables `/v1/embed`, `/v1/logits`, `/v1/token/*`. Advertises `mode: embed-service`. | false |
-| `--layers <START-END>` | Serve only this layer range. Out-of-range requests return HTTP 400. Pages outside the range are never touched. | all |
+| `--layers <START-END>` | Serve only this layer range (inclusive). Out-of-range requests return HTTP 400. Pages outside the range are never touched. | all |
 | `--max-gate-cache-layers <N>` | LRU cap on decoded f16 gate layers. `0` = unlimited. Each decoded layer is ~433 MB on 31B. | 0 |
+| `--max-q4k-cache-layers <N>` | LRU cap on the legacy `q4k_ffn_layer` whole-layer dequant cache. `0` = unlimited. Recommended `1` (or 0 once the vindex has W2 feature-major down — see `--feature-major-down` at extract time). | 0 |
+| `--hnsw` | Use HNSW for gate KNN instead of brute-force matmul. Approximate (recall 80–95%); wins for high-feature MoE (e.g. 64-expert: ~230 → 60 ms/layer). Net loss for dense ≤ 10K-feature models — leave off. | false |
+| `--hnsw-ef-search <N>` | HNSW beam width. Higher = better recall, slower search. | 200 |
+| `--warmup-hnsw` | Eager-build HNSW for every owned layer at boot (rayon-parallel). Trades ~700 ms of boot for 76 ms × N lazy first-query cost. Requires `--hnsw`. | false |
+| `--warmup-walk-ffn` | Pre-load inference weights + prefetch all owned-layer Q4K mmap pages at boot. Cuts first `/v1/walk-ffn` from ~1.3 s to ~13 ms. Costs ~1.3 s boot delay + 3 GB pre-allocated f32 gate cache. Recommended for grid shards under steady-state load. | false |
 | `--release-mmap-after-request` | `madvise(MADV_DONTNEED)` on all mmaps after each walk-ffn request. Linux: immediate RSS drop. Darwin: advisory. | false |
+| `--join <URL>` | Join a router grid via gRPC (see `larql-router --grid-port`). Comma-separate multiple routers; each gets an independent announce stream. Pair with `--public-url` so the router knows where to send clients. | — |
+| `--grid-key <KEY>` | Shared secret matching the router's `--grid-key`. Required when the router enforces grid auth. Reads `LARQL_GRID_KEY` env. | — |
+| `--public-url <URL>` | HTTP URL clients should use to reach this server, advertised when joining the grid (e.g. `http://shard-a:9181`). Required with `--join`. | — |
 | `--cors` | Enable CORS headers | false |
 | `--api-key <KEY>` | Require Bearer token auth (health exempt) | — |
 | `--rate-limit <SPEC>` | Per-IP rate limit (e.g., "100/min", "10/sec") | — |
 | `--max-concurrent <N>` | Max concurrent requests | 100 |
 | `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results (0 = disabled) | 0 |
-| `--grpc-port <PORT>` | Enable gRPC server on this port | — |
+| `--grpc-port <PORT>` | Enable gRPC server on this port (separate from the router-announce gRPC) | — |
 | `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
 | `--tls-key <PATH>` | TLS private key for HTTPS | — |
 | `--log-level <LEVEL>` | Logging level | info |
@@ -179,7 +187,8 @@ List top tokens across knowledge layers.
 
 #### GET /v1/stats
 
-Model and index statistics.
+Model and index statistics, plus live W2 / Q4K cache state for
+operator verification (see ROADMAP / ADR-009).
 
 ```json
 {
@@ -189,9 +198,62 @@ Model and index statistics.
   "features": 348160,
   "hidden_size": 2560,
   "layer_bands": {"syntax": [0, 13], "knowledge": [14, 27], "output": [28, 33]},
-  "loaded": {"browse": true, "inference": true}
+  "loaded": {"browse": true, "inference": true},
+  "q4k_ffn": {
+    "cache_slots": 0,
+    "cache_bytes": 0,
+    "feature_major_down": true
+  }
 }
 ```
+
+The `q4k_ffn` block lets operators confirm the W2 feature-major
+down path is active (`feature_major_down: true` after extracting
+with `--feature-major-down` or retrofitting via
+`larql convert add-feature-major-down`). The legacy
+`q4k_ffn_layer` cache should stay at `cache_slots: 0` in
+production; non-zero indicates either (a) the W2 file is missing,
+or (b) the workload is hitting the sparse walk path which
+prefers the cache fallback when W2 isn't loaded.
+
+#### POST /v1/warmup
+
+Pre-touch the lazy state that `walk-ffn` would otherwise pay on first
+request. Same code path as the `--warmup-walk-ffn` boot flag, exposed
+over HTTP so operators can re-warm a running server without restart.
+
+```bash
+# default — warm everything (weights + every owned layer's Q4K mmap)
+curl -X POST http://localhost:8080/v1/warmup
+
+# selective — only mmap-prefetch specific layers, skip weights
+curl -X POST http://localhost:8080/v1/warmup \
+     -H 'content-type: application/json' \
+     -d '{"layers": [14, 22, 28], "skip_weights": true}'
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `layers` | every owned layer | Layers to `madvise WILLNEED` |
+| `skip_weights` | false | Skip the `get_or_load_weights` call (only mmap prefetch). Use after the weights are already loaded. |
+| `warmup_hnsw` | false | Eager-build HNSW for every owned layer at this call. Requires `--hnsw` at boot. |
+
+```json
+{
+  "model": "google/gemma-3-4b-it",
+  "weights_loaded": true,
+  "weights_load_ms": 1266,
+  "layers_prefetched": 30,
+  "prefetch_ms": 13,
+  "hnsw_built": false,
+  "hnsw_warmup_ms": 0,
+  "total_ms": 1279
+}
+```
+
+Measured impact (Gemma 26B-A4B, M3 Max): first `/v1/walk-ffn`
+**1247 ms → 12.6 ms (99×)**. Costs ~1.3 s + 3.2 GB pre-allocated f32
+gate cache.
 
 ### Inference Endpoint
 
