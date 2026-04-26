@@ -8,24 +8,27 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 ## Current state (2026-04-26)
 
 ```
-larql-metal  gemma3-4b-q4k-v2   75–79 tok/s   ~13ms/tok
-Ollama       gemma3:4b          98–103 tok/s  ~10ms/tok
-Gap          ~1.30×             ~3ms/tok
+larql-metal  gemma3-4b-q4k-v2     78.7 tok/s   12.7ms/tok  (100-token run, 8 warmup)
+Ollama       gemma3:4b            98–103 tok/s  ~10ms/tok
+Gap          ~1.28×               ~2.7ms/tok
+
+larql-metal  gemma4-26B-A4B         5.1 tok/s  ~194ms/tok  (Phase 1 GPU dispatch; Phase 2 open)
+SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok  (attention + dense FFN only)
 ```
 
-Per-stage (100-token run, 8 warmup):
+Per-stage (Gemma 3 4B, 100-token run, 8 warmup):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | ~11.0ms | 83% |
-| lm_head | ~2.3ms | 17% |
+| GPU fwd | ~10.8ms | 83% |
+| lm_head | ~2.2ms | 17% |
 | embed + norm + detok | ~0.01ms | ~0% |
 
 **Recent changes (2026-04-26):**
 
 | Change | Model | Effect | Notes |
 |---|---|---|---|
-| `q6k_matvec` ROWS_PER_TG 4→2 | Gemma 3 4B | +1-2 tok/s | 64 threads/TG → 2× concurrent TGs |
+| **`q6k_matvec` ROWS_PER_TG=4 correctness fix** | Gemma 3 4B | **78.7 tok/s, GPU fwd 10.8ms** | Silent bug: rows 1282-2559 were zeros; fixed to ROWS_PER_TG=4 everywhere |
 | `f32_gemv_topk1` GPU argmax | any | 0 in bench (KNN fires first) | Saves 0.33ms for top_k=1 non-KNN callers |
 | Q4_K float4 dual-sub-block | Gemma 3 4B | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |
 | Batched MoE prefill | Gemma 4 26B A4B | **+35% tok/s, −31% prefill** | 130 → 26 GPU commits for 5-token prompt |
@@ -195,9 +198,11 @@ improvements were adapted to the linear layout.
 | 2026-04-25 | Q6K inter-superblock interleaving + X preload + deferred scale | 13.7ms | 11.8ms | −1.9ms |
 | 2026-04-25 | lm_head min-heap top-k (avoids 2MB Vec allocation) | 2.40ms | 2.35ms | −0.05ms |
 | 2026-04-25 | Dispatch fusions (QK-norm Q+K, RoPE Q+K, residual_norm_store, normed QKV) | 72ms | ~13ms | +1–2 tok/s |
-| 2026-04-26 | `q6k_matvec` ROWS_PER_TG 4→2 (64 threads/TG, 2× concurrent TGs) | 75.9 tok/s | 75-79 tok/s | −0.2ms GPU fwd |
 | 2026-04-26 | `f32_gemv_topk1` GPU argmax (gemv + argmax, 8KB readback vs 1MB) | — | — | 0.33ms/tok for top_k=1 |
 | 2026-04-26 | Diagnostic: `diag_profile_kernels` (per-kernel GB/s, isolated+batched) | — | — | tooling |
+| 2026-04-26 | **q6k_matvec ROWS_PER_TG=4 correctness fix** (shader+dispatch mismatch; rows 1282-2559 were zeros) | 68-75 tok/s (wrong) | **78.7 tok/s, 10.8ms** | +0.2ms vs wrong fast path; correct output |
+| 2026-04-26 | Batched MoE prefill (dispatch_full_pipeline moe_fn callback) | 2.9 tok/s, 334ms | 3.9 tok/s, 246ms | −31% prefill, +35% decode |
+| 2026-04-26 | Per-layer Q4K expert format + GPU dispatch (Phase 1) | 3.9 tok/s | **5.1 tok/s, 194ms** | +31% decode; Phase 2 open |
 
 ---
 
@@ -228,7 +233,6 @@ improvements were adapted to the linear layout.
 - Metal dispatch overhead: ~5µs per `dispatch_thread_groups` call
 - Current: 374 dispatches/tok ≈ 1.9ms overhead (vs Ollama ~272 = 1.4ms → 0.5ms gap)
 - **Gate+up is ALU-limited at K=2560**: 272 GB/s despite L1-cached input; dequant ops dominate
-- **q6k_matvec is bandwidth-limited at K=10240**: 315 GB/s; ROWS_PER_TG=2 helped (1280 TGs vs 640)
-- Q6_K ROWS_PER_TG=2: 1280 TGs × 64 threads = 81,920 total threads (same as before, but 2× concurrent TGs per CU → better latency hiding)
+- **q6k_matvec is bandwidth-limited at K=10240**: 315 GB/s; ROWS_PER_TG=4 (640 TGs × 128 threads, 4 rows/TG, no overlap) is both correct and fast (78.7 tok/s)
 - `f32_gemv_topk1` GPU argmax: fires for top_k=1 callers; main decode uses KNN lm_head (top_k=5), so bench gain = 0. Value for non-KNN model paths.
 - To close the kernel compute gap: need format-compatible vectorized Q4_K dequant (no solved approach yet)

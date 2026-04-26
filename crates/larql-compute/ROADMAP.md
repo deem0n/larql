@@ -4,7 +4,7 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **75–79** | ~13ms | q6k_matvec ROWS_PER_TG=2, GPU argmax |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **78–79** | ~12.7ms | q6k_matvec ROWS_PER_TG=4 (correctness fix restored perf) |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
 | **Ollama** gemma3:4b | **98–103** | ~10ms | reference (same hardware, same prompt) |
 | **Gap** | LARQL is **~1.30×** slower | ~3ms/tok | per-stage decomposition below |
@@ -49,61 +49,45 @@ convention); the q4_KF fast-path doesn't apply to those.
 
 Remaining gap: **~1.30×** (~77 vs ~100 tok/s, ~3ms/tok).
 
-### Fresh benchmark check (2026-04-26)
+### q6k_matvec ROWS_PER_TG shader/dispatch mismatch — **FIXED (2026-04-26)**
 
-Command:
+**Root cause of the "regression" to 68-70 tok/s:** the shader constant
+`Q6K_ROWS_PER_TG` and the Rust dispatch constant `ROWS_PER_TG` were mismatched:
 
-```
-target/release/larql bench output/gemma3-4b-q4k-v2.vindex \
-  --backends metal --tokens 50 --warmup 15 --profile --verbose
-```
+- **Shader:** `Q6K_ROWS_PER_TG = 2` → `row_idx = tg_id * 2 + sg_id` (sg_id 0..3 = 4 rows per TG)
+- **Rust dispatch (HEAD):** `ROWS_PER_TG = 4` → dispatched ceil(N/4) = 640 TGs
 
-Observed on the current tree: **70.5 tok/s** (14.19ms/tok), below the
-75-79 tok/s target. A longer non-EOS prompt measured **68.4 tok/s**
-(14.62ms/tok). The all-Q4_K down comparison measured **71.5 tok/s**
-(13.98ms/tok), so the regression is not isolated to Q6_K down.
+With this mismatch, maximum covered row = 639 × 2 + 3 = **1281 of 2560**. Rows 1282–2559 received **zeros** — a silent correctness bug in the FFN down projection for dense models. Model output was degraded but simple prompts (e.g. "Paris") survived because the residual stream carried enough signal.
 
-Current stage split:
+The stash that fixed the dispatch to `ROWS_PER_TG = 2` made the output correct but dispatched 1280 TGs — 2× more work than necessary (each row computed by two adjacent simdgroups due to the overlap in the formula).
 
-- GPU fwd: 12.3-12.7ms/tok
-- lm_head: 2.1-2.2ms/tok
-- embed/final_norm/detok: negligible
+**Fix:** set both constants to `4`: shader `Q6K_ROWS_PER_TG = 4` and Rust `ROWS_PER_TG = 4`. Each TG covers 4 non-overlapping rows (sg_id 0..3), dispatches 640 TGs, correct output, optimal throughput.
 
-Action: re-baseline with a stable non-EOS prompt and compare against the
-pre-fix commit. If the 75-79 number was collected on the same hardware,
-focus on shared dense-path overhead first (lm_head and full decode
-dispatch), not only Q6_K.
+**Result:** 78.7 tok/s, GPU fwd 10.8ms — **correct and faster than the broken HEAD**.
 
-### P0 correctness blockers found in review (2026-04-26)
+### P0 correctness blockers — status (2026-04-26)
 
-These must stay ahead of additional perf work because they affect
-production-routed paths or hide regressions:
+1. **✅ q6k_matvec ROWS_PER_TG mismatch** — FIXED. Shader and Rust constants both set
+   to 4. All 2560 rows now covered; dense model back to 78.7 tok/s. See entry above.
 
-1. **Mixed Q4_K/Q6_K QKV fused V path is wrong.**
+2. **Mixed Q4_K/Q6_K QKV fused V path (open).**
    `cargo test -p larql-compute --features metal` fails
-   `q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj` with the
-   Q6_K V output differing by ~147. The non-normed
-   `q4k_q6k_qkv_proj_matches_per_proj_dispatch` also fails V parity.
-   Root issue: the dedicated fused-QKV shader's V branch drifted from
-   the standalone `q6k_matvec` implementation. This is production-routed
-   for Gemma 3/4 Ollama-convention layers (`Q4_K` Q/K + `Q6_K` V), so
+   `q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj` (pre-existing, not introduced
+   by MoE work). The dedicated fused-QKV shader's V branch drifted from the standalone
+   `q6k_matvec` implementation. Production-routed for Gemma 3/4 (`Q4_K` Q/K + `Q6_K` V);
    fix before treating QKV fusion as a closed dispatch win.
-2. **Q4_K MoE GPU dispatch does not pad activation scratch.**
-   `gpu_moe_dispatch` dispatches expert down with `K = inter_padded`
-   but allocates/offsets activation scratch with `inter`. For MoE
-   intermediate sizes that are not multiples of 256, the down projection
-   can read past an expert's activation slice or into the next expert's
-   slice. Allocate `top_k * inter_padded * 4`, zero-fill the padded tail,
-   and offset per expert by `inter_padded`.
-3. **CPU-only test target is broken.**
-   `cargo test -p larql-compute` currently compiles Metal-only integration
-   tests without `--features metal`. Gate kernel test files with
-   `#![cfg(feature = "metal")]` and keep CPU/MoE unit coverage available
-   without Metal so Linux/Windows baseline work is not blocked.
-4. **MoE GPU parity coverage is too thin.**
-   Existing MoE tests cover CPU routing and prefill shape/finite smoke
-   tests, but not `gpu_moe_dispatch` parity for Q4_K experts, padded
-   intermediates, missing expert slices, or `valid_count < top_k`.
+
+3. **MoE GPU dispatch: activation scratch not padded to `inter_padded` (open).**
+   `gpu_moe_dispatch` dispatches expert down with `K = inter_padded` but the activation
+   buffer is sized and offset-indexed with `inter`. For `moe_intermediate_size=704`
+   (`inter_padded=768`), the down projection reads 64 floats beyond each expert's
+   activation slice. Fix: allocate `top_k × inter_padded × 4` bytes, zero-fill padded
+   tail, offset per expert by `inter_padded` (not `inter`).
+
+4. **MoE GPU parity test coverage thin (open).**
+   Existing tests cover CPU routing and prefill shape/finiteness but not
+   `gpu_moe_dispatch` correctness for Q4_K experts, padded intermediates, or
+   `valid_count < top_k`.
 
 | Source | Gap | Status |
 |---|---|---|
@@ -220,14 +204,13 @@ Folded into #6 below with updated size estimate.
 
 ---
 
-### q6k_matvec ROWS_PER_TG=2 (done 2026-04-26, +1-2 tok/s)
+### q6k_matvec ROWS_PER_TG — correctness fix (2026-04-26)
 
-**Gain: ~0.3-0.5ms GPU fwd** (75.9 → 75-79 tok/s range). Halving TG size from
-4 rows/128 threads to 2 rows/64 threads → 2× more concurrent TGs on the GPU CU
-→ better DRAM latency hiding for the bandwidth-bound down projection (K=10240).
-At ROWS_PER_TG=4: 640 TGs × 128 threads = 81,920. At ROWS_PER_TG=2: 1280 TGs
-× 64 threads = 81,920 (same total threads, but 12 vs 6 concurrent TGs per CU
-due to halved register pressure per TG). All tests pass.
+**Corrected to ROWS_PER_TG=4** for both shader and Rust dispatch constant. See "P0
+correctness blockers" entry above for full diagnosis. The previous ROWS_PER_TG=2
+ship note was based on a mismatch that appeared to gain performance by skipping half
+the rows — real performance at correct ROWS_PER_TG=4 is **78.7 tok/s, GPU fwd 10.8ms**,
+better than any previous measurement.
 
 ### f32_gemv_topk1 GPU argmax (done 2026-04-26, infrastructure)
 

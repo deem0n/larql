@@ -579,6 +579,11 @@ cargo run --release -p larql-vindex --example build_up_features -- path/to/vinde
 
 # Server (walk inference over HTTP)
 cargo run --release -p larql-server -- path/to/vindex --port 8080
+cargo run -p larql-server --example server_demo             # synthetic HTTP surface demo
+cargo run -p larql-server --example embed_demo              # synthetic embed/logits/token demo
+cargo run --release -p larql-server --example server_bench  # synthetic server operation benchmark
+cargo run --release -p larql-server --example bench_embed_server -- path/to/vindex
+cargo test -p larql-router                                  # static router + grid route-table checks
 
 # Vindex and LQL demos (synthetic — run in CI)
 cargo run -p larql-vindex --example demo_features                    # vindex feature showcase

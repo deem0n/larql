@@ -331,10 +331,15 @@ mod tests {
         let mut writer = BoundaryWriter::create(path, hidden, 200, 100).expect("create");
         let residual: Vec<f32> = (0..hidden).map(|i| i as f32).collect();
         writer.append(0, 200, &residual).expect("append 0");
-        writer.append(200, 200, &vec![99.0f32; hidden]).expect("append 1");
+        writer
+            .append(200, 200, &vec![99.0f32; hidden])
+            .expect("append 1");
         writer.finish().expect("finish");
         let store = BoundaryStore::open(path).expect("open");
-        (BoundaryWriter::create(path, hidden, 200, 100).unwrap(), store)
+        (
+            BoundaryWriter::create(path, hidden, 200, 100).unwrap(),
+            store,
+        )
     }
 
     // ── BoundaryWriter + BoundaryStore ────────────────────────────────────────
@@ -372,7 +377,9 @@ mod tests {
         let hidden = 4;
         let mut writer = BoundaryWriter::create(&path, hidden, 200, 10).expect("create");
         for i in 0..3 {
-            writer.append(i * 200, 200, &vec![i as f32; hidden]).expect("append");
+            writer
+                .append(i * 200, 200, &vec![i as f32; hidden])
+                .expect("append");
         }
         writer.finish().expect("finish");
 
@@ -382,7 +389,10 @@ mod tests {
         // Each residual should reflect the index used to write it
         for i in 0..3 {
             let r = store.residual(i).expect("residual");
-            assert!((r[0] - i as f32).abs() < 1e-6, "boundary {i} residual mismatch");
+            assert!(
+                (r[0] - i as f32).abs() < 1e-6,
+                "boundary {i} residual mismatch"
+            );
         }
 
         let _ = std::fs::remove_file(&path);
@@ -410,9 +420,20 @@ mod tests {
         writer.finish().expect("finish");
 
         let store = BoundaryStore::open(&path).expect("open");
-        assert_eq!(store.boundary_for_token(50), Some(0), "token 50 in window 0");
-        assert_eq!(store.boundary_for_token(150), Some(1), "token 150 in window 1");
-        assert!(store.boundary_for_token(999).is_none(), "out-of-range token");
+        assert_eq!(
+            store.boundary_for_token(50),
+            Some(0),
+            "token 50 in window 0"
+        );
+        assert_eq!(
+            store.boundary_for_token(150),
+            Some(1),
+            "token 150 in window 1"
+        );
+        assert!(
+            store.boundary_for_token(999).is_none(),
+            "out-of-range token"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

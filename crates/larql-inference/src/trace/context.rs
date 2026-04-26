@@ -496,8 +496,15 @@ mod tests {
         let critical = vec![0usize, 1];
 
         let mut writer = ContextWriter::create(
-            &path, hidden, n_layers, 100, ContextTier::Residual, &critical, 50,
-        ).expect("create");
+            &path,
+            hidden,
+            n_layers,
+            100,
+            ContextTier::Residual,
+            &critical,
+            50,
+        )
+        .expect("create");
 
         let residual = vec![1.0f32, 2.0, 3.0, 4.0];
         writer.append(0, 100, &residual, &[], &[]).expect("append");

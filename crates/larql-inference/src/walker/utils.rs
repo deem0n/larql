@@ -136,9 +136,9 @@ mod tests {
     #[test]
     fn top_entities_returns_top_n_by_count() {
         let mut counts: HashMap<String, (usize, f64)> = HashMap::new();
-        counts.insert("a".into(), (5, 2.5));  // count=5, avg_conf=0.5
+        counts.insert("a".into(), (5, 2.5)); // count=5, avg_conf=0.5
         counts.insert("b".into(), (10, 8.0)); // count=10, avg_conf=0.8
-        counts.insert("c".into(), (2, 1.0));  // count=2, avg_conf=0.5
+        counts.insert("c".into(), (2, 1.0)); // count=2, avg_conf=0.5
         let top = top_entities(&counts, 2);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].0, "b"); // highest count first
@@ -253,12 +253,7 @@ mod tests {
     #[test]
     fn partial_top_k_column_extracts_correct_column() {
         // 4×3 matrix; column 1 values are [2, 5, 1, 8]
-        let data: Vec<f32> = vec![
-            0.0, 2.0, 0.0,
-            0.0, 5.0, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 8.0, 0.0,
-        ];
+        let data: Vec<f32> = vec![0.0, 2.0, 0.0, 0.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 8.0, 0.0];
         let m = Array2::from_shape_vec((4, 3), data).unwrap();
         let top = partial_top_k_column(&m, 1, 2);
         assert_eq!(top.len(), 2);

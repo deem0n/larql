@@ -386,7 +386,27 @@ Tracked in ADR-0003 / ADR-0004:
 
 ---
 
-## 11. Crate Structure
+## 11. Validation
+
+Local correctness checks:
+
+```bash
+cargo test -p larql-router
+cargo test -p larql-server announce
+```
+
+The router test suite covers static shard parsing plus grid route-table behavior:
+inclusive layer ownership, default single-model routing, least-loaded replica
+selection from heartbeat load, deregistration on shard leave, first uncovered
+layer reporting for batched requests, and status response shard/gap reporting.
+
+`larql-server announce` covers the server side of the grid protocol envelope:
+stable vindex identity hash, bearer metadata formatting, announce payloads,
+heartbeats, and dropping notices.
+
+---
+
+## 12. Crate Structure
 
 ```
 crates/larql-router-protocol/       shared proto types (router + server)

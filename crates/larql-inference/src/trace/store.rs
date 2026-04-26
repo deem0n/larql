@@ -318,8 +318,8 @@ use std::io::Seek;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::TraceNode;
+    use super::*;
 
     fn zero_node(layer: i32, position: usize, hidden: usize) -> TraceNode {
         TraceNode {
@@ -364,7 +364,10 @@ mod tests {
         // Residual at token=0, layer=0 (embedding) should be [-1.0, -1.0, -1.0, -1.0]
         let residual = store.residual(0, 0).expect("residual");
         assert_eq!(residual.len(), hidden);
-        assert!((residual[0] - (-1.0_f32)).abs() < 1e-6, "embedding residual = layer -1");
+        assert!(
+            (residual[0] - (-1.0_f32)).abs() < 1e-6,
+            "embedding residual = layer -1"
+        );
 
         // FFN delta at token=0, layer=1 (first transformer layer) should be position=0
         let ffn = store.ffn_delta(0, 1).expect("ffn_delta");
@@ -383,7 +386,10 @@ mod tests {
         let store = TraceStore::open(&path).expect("open");
         assert!(store.residual(99, 0).is_none(), "out-of-range token → None");
         assert!(store.residual(0, 99).is_none(), "out-of-range layer → None");
-        assert!(store.read_vector(0, 0, 99).is_none(), "out-of-range component → None");
+        assert!(
+            store.read_vector(0, 0, 99).is_none(),
+            "out-of-range component → None"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -395,7 +401,9 @@ mod tests {
         let n_layers = 2;
         let mut writer = TraceWriter::create(&path, hidden, n_layers).expect("create");
         for pos in 0..3 {
-            writer.append_chain(&make_chain(n_layers, pos, hidden)).expect("append");
+            writer
+                .append_chain(&make_chain(n_layers, pos, hidden))
+                .expect("append");
         }
         assert_eq!(writer.n_tokens(), 3);
         writer.finish().expect("finish");
@@ -404,7 +412,10 @@ mod tests {
         assert_eq!(store.n_tokens(), 3);
         // Last token (pos=2) FFN delta at embedding layer should reflect position=2
         let ffn = store.ffn_delta(2, 0).expect("ffn_delta for token 2");
-        assert!((ffn[0] - 2.0_f32).abs() < 1e-6, "ffn_delta should encode position 2");
+        assert!(
+            (ffn[0] - 2.0_f32).abs() < 1e-6,
+            "ffn_delta should encode position 2"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -426,7 +437,9 @@ mod tests {
         let hidden = 4;
         let n_layers = 2;
         let mut writer = TraceWriter::create(&path, hidden, n_layers).expect("create");
-        writer.append_chain(&make_chain(n_layers, 0, hidden)).expect("append");
+        writer
+            .append_chain(&make_chain(n_layers, 0, hidden))
+            .expect("append");
         writer.finish().expect("finish");
 
         let store = TraceStore::open(&path).expect("open");

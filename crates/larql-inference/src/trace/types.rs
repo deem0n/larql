@@ -271,7 +271,7 @@ mod tests {
     fn position_trajectory_sorted_ascending_by_layer() {
         let t = make_trace(4, 3);
         let traj = t.position_trajectory(1); // position 1
-        // Should have embedding (-1) + 4 transformer layers = 5 nodes
+                                             // Should have embedding (-1) + 4 transformer layers = 5 nodes
         assert_eq!(traj.len(), 5);
         for w in traj.windows(2) {
             assert!(w[0].layer <= w[1].layer, "trajectory not sorted");

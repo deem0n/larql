@@ -86,6 +86,23 @@ Self-assembling `--grid-port` topology adds a 1–2 ms / request
 indirection vs static (gRPC route lookup); negligible for fan-out
 calls.
 
+## Validation
+
+Grid routing is covered by focused unit tests for:
+
+- inclusive layer-range routing
+- model-specific and default single-model route tables
+- least-loaded replica selection from heartbeat load
+- deregistration on shard leave
+- first uncovered layer reporting for batched requests
+- status response shard and gap reporting
+
+```bash
+cargo test -p larql-router
+```
+
+Current local check: 20 router tests passing, including 7 grid-state tests.
+
 ## See also
 
 - `crates/larql-server/README.md` — shard configuration, recommended

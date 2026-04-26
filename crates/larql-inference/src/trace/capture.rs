@@ -143,9 +143,9 @@ fn run_attention_decomposed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
-    use larql_models::ModelWeights;
     use crate::engines::test_utils::make_test_weights;
+    use larql_models::ModelWeights;
+    use std::sync::OnceLock;
 
     fn weights() -> &'static ModelWeights {
         static W: OnceLock<ModelWeights> = OnceLock::new();
@@ -191,8 +191,12 @@ mod tests {
         let w = weights();
         let t = trace(w, &[0u32, 1], TracePositions::All);
         for node in &t.nodes {
-            assert!(node.residual.iter().all(|v| v.is_finite()),
-                "layer {} pos {} residual has non-finite", node.layer, node.position);
+            assert!(
+                node.residual.iter().all(|v| v.is_finite()),
+                "layer {} pos {} residual has non-finite",
+                node.layer,
+                node.position
+            );
         }
     }
 

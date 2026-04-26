@@ -12,6 +12,12 @@
   `cargo clippy -p larql-server --tests --no-deps -- -D warnings`.
   The dependency-checking form still stops in `larql-vindex`; that is
   tracked outside this server-only pass.
+- Examples and synthetic benchmarks checked on 2026-04-26:
+  `server_demo`, `embed_demo`, `server_bench --release`, and
+  `cargo check -p larql-server --examples` all pass. `bench_embed_server`
+  builds with examples but requires a real vindex path to execute.
+- Grid route-table checks are now covered by `cargo test -p larql-router`
+  (20 tests, including 7 grid-state tests) plus server announce-envelope tests.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
   inclusive layer ranges 0-14 + 15-29).
 - W2 feature-major down retrofittable in-place via
@@ -254,6 +260,17 @@ to add/remove a shard without restarting the router. Pair with
 ---
 
 ## Completed
+
+### 2026-04-26 — examples, synthetic benchmark, grid checks
+
+| Item | Outcome |
+|---|---|
+| `server_demo` | Runs locally with synthetic data; fixed invalid probe-label JSON comma output and updated rate-limit text for `--trust-forwarded-for`. |
+| `embed_demo` | Runs locally with synthetic embed/logits/token responses and binary-wire examples. |
+| `server_bench --release` | Synthetic benchmark completed: `gate_knn` top-5 0.022 ms/op, 8-layer `walk` 0.203 ms/op, single-layer `walk-ffn` 0.032 ms/op, batched 8-layer `walk-ffn` 0.321 ms/op, describe simulation 0.298 ms/op, 512-token embed prefill 0.114 ms/op. |
+| `bench_embed_server` | Example builds under `cargo check -p larql-server --examples`; execution requires a real vindex path. |
+| Grid unit coverage | Added `GridState` tests for inclusive ranges, default single-model routing, least-loaded replica selection, deregistration, batched gap reporting, and status gaps. `cargo test -p larql-router` now runs 20 tests. |
+| Docs | Updated server README examples/benchmarks/testing, router README validation, and router spec validation commands. |
 
 ### 2026-04-26 — coverage round-6 (embed + walk-ffn reachable gaps)
 

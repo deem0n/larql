@@ -391,3 +391,122 @@ impl GridService for GridServiceImpl {
         Ok(Response::new(resp))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        server_id: &str,
+        listen_url: &str,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+    ) -> ServerEntry {
+        ServerEntry {
+            server_id: server_id.into(),
+            listen_url: listen_url.into(),
+            model_id: model_id.into(),
+            layer_start,
+            layer_end,
+            cpu_pct: 0.0,
+            ram_used: 1024,
+            requests_in_flight: 0,
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn route_uses_inclusive_layer_ranges() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 2));
+        state.register(entry("b", "http://b", "model-a", 3, 5));
+
+        assert_eq!(state.route(Some("model-a"), 0).as_deref(), Some("http://a"));
+        assert_eq!(state.route(Some("model-a"), 2).as_deref(), Some("http://a"));
+        assert_eq!(state.route(Some("model-a"), 3).as_deref(), Some("http://b"));
+        assert_eq!(state.route(Some("model-a"), 5).as_deref(), Some("http://b"));
+        assert_eq!(state.route(Some("model-a"), 6), None);
+    }
+
+    #[test]
+    fn route_without_model_uses_any_model_table() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+
+        assert_eq!(state.route(None, 1).as_deref(), Some("http://a"));
+        assert_eq!(state.route(None, 2), None);
+    }
+
+    #[test]
+    fn route_prefers_least_loaded_replica() {
+        let mut state = GridState::default();
+        let mut busy = entry("busy", "http://busy", "model-a", 0, 4);
+        busy.requests_in_flight = 12;
+        let mut idle = entry("idle", "http://idle", "model-a", 0, 4);
+        idle.requests_in_flight = 1;
+
+        state.register(busy);
+        state.register(idle);
+
+        assert_eq!(
+            state.route(Some("model-a"), 3).as_deref(),
+            Some("http://idle")
+        );
+    }
+
+    #[test]
+    fn deregister_removes_server_from_route_table() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 2));
+        state.register(entry("b", "http://b", "model-a", 3, 5));
+
+        state.deregister("a");
+
+        assert_eq!(state.route(Some("model-a"), 1), None);
+        assert_eq!(state.route(Some("model-a"), 4).as_deref(), Some("http://b"));
+    }
+
+    #[test]
+    fn heartbeat_updates_load_without_rebuilding_topology() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 4));
+        state.register(entry("b", "http://b", "model-a", 0, 4));
+
+        state.update_heartbeat("a", 80.0, 2048, 20);
+        state.update_heartbeat("b", 10.0, 1024, 0);
+
+        assert_eq!(state.route(Some("model-a"), 2).as_deref(), Some("http://b"));
+        let a = state.servers.get("a").unwrap();
+        assert_eq!(a.cpu_pct, 80.0);
+        assert_eq!(a.ram_used, 2048);
+        assert_eq!(a.requests_in_flight, 20);
+    }
+
+    #[test]
+    fn route_all_returns_first_uncovered_layer() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+        state.register(entry("b", "http://b", "model-a", 3, 4));
+
+        assert_eq!(state.route_all(Some("model-a"), &[0, 1, 2, 3]), Err(2));
+    }
+
+    #[test]
+    fn status_response_reports_shards_and_gaps() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+        state.register(entry("b", "http://b", "model-a", 3, 4));
+
+        let status = state.status_response();
+
+        assert_eq!(status.servers.len(), 2);
+        assert_eq!(status.models.len(), 1);
+        let model = &status.models[0];
+        assert_eq!(model.model_id, "model-a");
+        assert_eq!(model.shards.len(), 2);
+        assert_eq!(model.gaps.len(), 1);
+        assert_eq!(model.gaps[0].layer_start, 2);
+        assert_eq!(model.gaps[0].layer_end, 2);
+    }
+}

@@ -310,27 +310,29 @@ fn main() {
     println!("  \"edges\": [");
 
     let trace = patched.walk(&query, &[1, 2], 3);
-    let mut edge_idx = 0;
+    let mut edge_lines = Vec::new();
     for (layer, hits) in &trace.layers {
         for hit in hits.iter().take(2) {
             let tok = hit.meta.top_token.trim();
             if tok.len() < 2 {
                 continue;
             }
-            let comma = if edge_idx + 1 < 4 { "," } else { "" };
             if let Some(label) = probe_labels.get(&(*layer, hit.feature)) {
-                println!(
-                    "    {{\"relation\": \"{}\", \"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}, \"source\": \"probe\"}}{}",
-                    label, tok, hit.gate_score, layer, comma
-                );
+                edge_lines.push(format!(
+                    "    {{\"relation\": \"{}\", \"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}, \"source\": \"probe\"}}",
+                    label, tok, hit.gate_score, layer
+                ));
             } else {
-                println!(
-                    "    {{\"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}}}{}",
-                    tok, hit.gate_score, layer, comma
-                );
+                edge_lines.push(format!(
+                    "    {{\"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}}}",
+                    tok, hit.gate_score, layer
+                ));
             }
-            edge_idx += 1;
         }
+    }
+    for (idx, line) in edge_lines.iter().enumerate() {
+        let comma = if idx + 1 < edge_lines.len() { "," } else { "" };
+        println!("{line}{comma}");
     }
     println!("  ]");
     println!("}}");

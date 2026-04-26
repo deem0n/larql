@@ -99,6 +99,50 @@ modes and compose cleanly (`--ffn-only` skips startup warmup,
 `--max-gate-cache-layers` caps decoded heap, `--release-mmap-after-request`
 hints the kernel to drop mmap pages).
 
+## Examples and Benchmarks
+
+All examples compile with:
+
+```bash
+cargo check -p larql-server --examples
+```
+
+Synthetic demos do not require a real vindex:
+
+```bash
+cargo run -p larql-server --example server_demo
+cargo run -p larql-server --example embed_demo
+```
+
+Synthetic release benchmark, current local run on 2026-04-26:
+
+```bash
+cargo run -p larql-server --example server_bench --release
+```
+
+| Operation | Result |
+|---|---:|
+| `gate_knn` L0 top-5 | 0.022 ms/op |
+| `walk` 8 layers top-5 | 0.203 ms/op |
+| `walk-ffn` single layer | 0.032 ms/op |
+| `walk-ffn` batched 8 layers | 0.321 ms/op |
+| `describe` simulation | 0.298 ms/op |
+| `relations` simulation | 0.399 ms/op |
+| `embed` 512-token prefill | 0.114 ms/op |
+| `logits` dot, 1024 vocab × 256 hidden | 0.195 ms/op |
+
+These numbers measure in-process synthetic index operations, not network
+latency or real model weight paging. For a live vindex, use:
+
+```bash
+cargo run --release -p larql-server --example bench_embed_server -- \
+  output/gemma3-4b-q4k-v2.vindex
+
+# Optional logits projection bench:
+cargo run --release -p larql-server --example bench_embed_server -- \
+  output/gemma3-4b-q4k-v2.vindex --logits
+```
+
 ## API Endpoints
 
 ### Knowledge Endpoints (browse-only)
@@ -652,14 +696,20 @@ larql-server/
 ├── README.md
 ├── examples/
 │   ├── server_demo.rs          Synthetic vindex API demo
-│   └── server_bench.rs         Endpoint latency benchmarks
+│   ├── embed_demo.rs           Synthetic embed/logits/token demo
+│   ├── server_bench.rs         Synthetic endpoint latency benchmarks
+│   └── bench_embed_server.rs   Live vindex embed-service benchmark
 ├── proto/
 │   └── vindex.proto            gRPC service definitions
 ├── build.rs                    Proto compilation (bundled protoc)
 ├── tests/
-│   └── test_api.rs             Integration tests (107 tests)
+│   ├── common/                 Shared synthetic vindex/tokenizer fixtures
+│   ├── test_http_*.rs          HTTP route integration tests
+│   ├── test_grpc.rs            Direct gRPC handler tests
+│   └── test_unit_*.rs          Focused unit tests
 └── src/
     ├── main.rs                 CLI parsing, vindex loading, server startup
+    ├── bootstrap.rs            Testable boot/discovery/load helpers
     ├── state.rs                AppState: loaded models, probe labels, lazy weights
     ├── error.rs                ServerError → HTTP status codes
     ├── auth.rs                 API key Bearer token middleware
@@ -706,6 +756,15 @@ cargo run -p larql-server --example server_demo
 
 # Benchmarks (synthetic data)
 cargo run -p larql-server --example server_bench --release
+
+# Embed endpoint demo (synthetic data)
+cargo run -p larql-server --example embed_demo
+
+# Live embed benchmark (requires a real vindex)
+cargo run --release -p larql-server --example bench_embed_server -- output/model.vindex
+
+# Router/grid route-table checks
+cargo test -p larql-router
 ```
 
 ## Deployment
