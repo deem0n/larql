@@ -207,10 +207,11 @@ cargo bench -p larql-models --bench models            # Criterion benchmark suit
 
 The benchmark suite covers the same non-compute hot paths: config detection and
 validation, architecture tensor-key generation, FFN tensor classification,
-synthetic safetensors loading, and GGML Q4_0/Q8_0/Q4_K/Q6_K dequantization.
-Current baseline: validated detection is sub-microsecond for Llama/GPT-OSS,
-~2.6 µs for Gemma 4, synthetic validated safetensors loading is ~156 µs, and
-line coverage is 88.02%.
+synthetic safetensors loading, and GGML Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q6_K
+dequantization. Current baseline: validation is ~24 ns for Llama, ~149 ns for
+Gemma 4, and ~23 ns for GPT-OSS; validated detection is sub-microsecond for
+Llama/GPT-OSS; synthetic validated safetensors loading is ~156 µs; Q4_K
+dequantization is ~3.4 Gelem/s on the synthetic bench; line coverage is 88.02%.
 
 ## Examples
 

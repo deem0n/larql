@@ -140,6 +140,82 @@ fn run_attention_decomposed(
     crate::attention::run_attention_block(weights, h, layer, capture_attention)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use larql_models::ModelWeights;
+    use crate::engines::test_utils::make_test_weights;
+
+    fn weights() -> &'static ModelWeights {
+        static W: OnceLock<ModelWeights> = OnceLock::new();
+        W.get_or_init(make_test_weights)
+    }
+
+    // ── trace (WeightFfn path) ────────────────────────────────────────────────
+
+    #[test]
+    fn trace_all_positions_populates_nodes() {
+        let w = weights();
+        let t = trace(w, &[0u32, 1, 2], TracePositions::All);
+        // Each position has (n_layers + 1) nodes (embedding + transformer layers)
+        let expected = 3 * (w.num_layers + 1);
+        assert_eq!(t.nodes.len(), expected, "expected {expected} nodes");
+        assert_eq!(t.n_layers, w.num_layers);
+        assert_eq!(t.hidden_size, w.hidden_size);
+    }
+
+    #[test]
+    fn trace_last_position_only() {
+        let w = weights();
+        let t = trace(w, &[0u32, 1, 2, 3], TracePositions::Last);
+        // Only last position: (n_layers + 1) nodes
+        assert_eq!(t.nodes.len(), w.num_layers + 1);
+        assert!(t.nodes.iter().all(|n| n.position == 3));
+    }
+
+    #[test]
+    fn trace_specific_positions() {
+        let w = weights();
+        let t = trace(w, &[0u32, 1, 2, 3], TracePositions::Positions(vec![0, 2]));
+        // 2 positions × (n_layers + 1) nodes
+        assert_eq!(t.nodes.len(), 2 * (w.num_layers + 1));
+        let positions: std::collections::HashSet<usize> =
+            t.nodes.iter().map(|n| n.position).collect();
+        assert_eq!(positions.len(), 2);
+        assert!(positions.contains(&0) && positions.contains(&2));
+    }
+
+    #[test]
+    fn trace_nodes_are_finite() {
+        let w = weights();
+        let t = trace(w, &[0u32, 1], TracePositions::All);
+        for node in &t.nodes {
+            assert!(node.residual.iter().all(|v| v.is_finite()),
+                "layer {} pos {} residual has non-finite", node.layer, node.position);
+        }
+    }
+
+    #[test]
+    fn trace_deltas_correct_residual_len() {
+        let w = weights();
+        let t = trace(w, &[0u32], TracePositions::All);
+        for node in &t.nodes {
+            assert_eq!(node.residual.len(), w.hidden_size);
+            assert_eq!(node.attn_delta.len(), w.hidden_size);
+            assert_eq!(node.ffn_delta.len(), w.hidden_size);
+        }
+    }
+
+    #[test]
+    fn trace_embedding_layer_minus_one_present() {
+        let w = weights();
+        let t = trace(w, &[0u32, 1], TracePositions::All);
+        // Each position should have layer -1 (embedding)
+        assert!(t.nodes.iter().any(|n| n.layer == -1));
+    }
+}
+
 fn run_ffn_decomposed(
     weights: &ModelWeights,
     h_post_attn: &Array2<f32>,

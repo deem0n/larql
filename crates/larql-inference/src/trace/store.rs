@@ -315,3 +315,140 @@ impl TraceWriter {
 
 // Need Seek for TraceWriter
 use std::io::Seek;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::types::TraceNode;
+
+    fn zero_node(layer: i32, position: usize, hidden: usize) -> TraceNode {
+        TraceNode {
+            layer,
+            position,
+            residual: vec![layer as f32; hidden],
+            attn_delta: vec![0.0; hidden],
+            ffn_delta: vec![position as f32; hidden],
+        }
+    }
+
+    fn make_chain(n_layers: usize, position: usize, hidden: usize) -> Vec<TraceNode> {
+        // (n_layers + 1) nodes: embedding at layer -1, then 0..n_layers-1
+        let mut chain = vec![zero_node(-1, position, hidden)];
+        for l in 0..n_layers as i32 {
+            chain.push(zero_node(l, position, hidden));
+        }
+        chain
+    }
+
+    // ── TraceWriter + TraceStore roundtrip ────────────────────────────────────
+
+    #[test]
+    fn create_write_read_roundtrip() {
+        let path = std::env::temp_dir().join("larql_trace_test_roundtrip.trac");
+        let hidden = 4;
+        let n_layers = 2;
+
+        // Write one chain
+        let mut writer = TraceWriter::create(&path, hidden, n_layers).expect("create");
+        let chain = make_chain(n_layers, 0, hidden);
+        writer.append_chain(&chain).expect("append");
+        assert_eq!(writer.n_tokens(), 1);
+        writer.finish().expect("finish");
+
+        // Read back
+        let store = TraceStore::open(&path).expect("open");
+        assert_eq!(store.n_tokens(), 1);
+        assert_eq!(store.n_layers(), n_layers);
+        assert_eq!(store.hidden_size(), hidden);
+
+        // Residual at token=0, layer=0 (embedding) should be [-1.0, -1.0, -1.0, -1.0]
+        let residual = store.residual(0, 0).expect("residual");
+        assert_eq!(residual.len(), hidden);
+        assert!((residual[0] - (-1.0_f32)).abs() < 1e-6, "embedding residual = layer -1");
+
+        // FFN delta at token=0, layer=1 (first transformer layer) should be position=0
+        let ffn = store.ffn_delta(0, 1).expect("ffn_delta");
+        assert!((ffn[0] - 0.0_f32).abs() < 1e-6);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn out_of_bounds_returns_none() {
+        let path = std::env::temp_dir().join("larql_trace_test_bounds.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        writer.append_chain(&make_chain(2, 0, 4)).expect("append");
+        writer.finish().expect("finish");
+
+        let store = TraceStore::open(&path).expect("open");
+        assert!(store.residual(99, 0).is_none(), "out-of-range token → None");
+        assert!(store.residual(0, 99).is_none(), "out-of-range layer → None");
+        assert!(store.read_vector(0, 0, 99).is_none(), "out-of-range component → None");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multiple_tokens_roundtrip() {
+        let path = std::env::temp_dir().join("larql_trace_test_multi.trac");
+        let hidden = 4;
+        let n_layers = 2;
+        let mut writer = TraceWriter::create(&path, hidden, n_layers).expect("create");
+        for pos in 0..3 {
+            writer.append_chain(&make_chain(n_layers, pos, hidden)).expect("append");
+        }
+        assert_eq!(writer.n_tokens(), 3);
+        writer.finish().expect("finish");
+
+        let store = TraceStore::open(&path).expect("open");
+        assert_eq!(store.n_tokens(), 3);
+        // Last token (pos=2) FFN delta at embedding layer should reflect position=2
+        let ffn = store.ffn_delta(2, 0).expect("ffn_delta for token 2");
+        assert!((ffn[0] - 2.0_f32).abs() < 1e-6, "ffn_delta should encode position 2");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_chain_length_returns_error() {
+        let path = std::env::temp_dir().join("larql_trace_test_bad_len.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        // n_layers=2 requires n_layers+1=3 nodes; pass only 1 → error
+        let short = vec![zero_node(-1, 0, 4)];
+        let result = writer.append_chain(&short);
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn node_accessor_reconstructs_trace_node() {
+        let path = std::env::temp_dir().join("larql_trace_test_node.trac");
+        let hidden = 4;
+        let n_layers = 2;
+        let mut writer = TraceWriter::create(&path, hidden, n_layers).expect("create");
+        writer.append_chain(&make_chain(n_layers, 0, hidden)).expect("append");
+        writer.finish().expect("finish");
+
+        let store = TraceStore::open(&path).expect("open");
+        let node = store.node(0, 1).expect("node at token=0, store_layer=1");
+        // store layer 1 = transformer layer 0 (store layer 0 = embedding = trace layer -1)
+        assert_eq!(node.layer, 0);
+        assert_eq!(node.position, 0);
+        assert_eq!(node.residual.len(), hidden);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_bad_magic_returns_error() {
+        let path = std::env::temp_dir().join("larql_trace_test_bad_magic.trac");
+        std::fs::write(&path, b"XXXX" + &[0u8; 60][..]).ok();
+        // Actually write a proper 64-byte file with wrong magic
+        let mut bytes = [0u8; 64];
+        bytes[0..4].copy_from_slice(b"XXXX");
+        std::fs::write(&path, &bytes).expect("write");
+        let result = TraceStore::open(&path);
+        assert!(result.is_err(), "bad magic should return error");
+        let _ = std::fs::remove_file(&path);
+    }
+}

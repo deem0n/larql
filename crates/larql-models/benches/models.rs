@@ -119,6 +119,26 @@ fn bench_config_detection(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config_validation(c: &mut Criterion) {
+    let configs = [
+        ("llama", llama_config()),
+        ("gemma4", gemma4_config()),
+        ("gpt_oss", gpt_oss_config()),
+    ];
+    let mut group = c.benchmark_group("config_validation");
+
+    for (name, config) in configs {
+        let arch = detect_from_json(&config);
+        group.bench_with_input(BenchmarkId::from_parameter(name), &arch, |b, arch| {
+            b.iter(|| {
+                black_box(arch.validate().is_ok());
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_tensor_key_generation(c: &mut Criterion) {
     let config = gemma4_config();
     let arch = detect_from_json(&config);
@@ -190,13 +210,19 @@ fn bench_quant_decode(c: &mut Criterion) {
         .collect();
     let q4_0 = ggml::quantize_q4_0(&source);
     let q8_0 = ggml::quantize_q8_0(&source);
-    let q4_k = vec![0u8; ggml::tensor_data_size(ggml::TYPE_Q4_K, QUANT_ELEMENTS).unwrap()];
-    let q6_k = vec![0u8; ggml::tensor_data_size(ggml::TYPE_Q6_K, QUANT_ELEMENTS).unwrap()];
+    let q4_1 = vec![0u8; ggml::tensor_data_size(ggml::TYPE_Q4_1, QUANT_ELEMENTS).unwrap()];
+    let q5_0 = vec![0u8; ggml::tensor_data_size(ggml::TYPE_Q5_0, QUANT_ELEMENTS).unwrap()];
+    let q5_1 = vec![0u8; ggml::tensor_data_size(ggml::TYPE_Q5_1, QUANT_ELEMENTS).unwrap()];
+    let q4_k = synth_q4k_data(QUANT_ELEMENTS, 1000);
+    let q6_k = synth_q6k_data(QUANT_ELEMENTS, 2000);
     let mut group = c.benchmark_group("quant_decode");
     group.throughput(Throughput::Elements(QUANT_ELEMENTS as u64));
 
     for (name, tensor_type, data) in [
         ("q4_0", ggml::TYPE_Q4_0, q4_0.as_slice()),
+        ("q4_1", ggml::TYPE_Q4_1, q4_1.as_slice()),
+        ("q5_0", ggml::TYPE_Q5_0, q5_0.as_slice()),
+        ("q5_1", ggml::TYPE_Q5_1, q5_1.as_slice()),
         ("q8_0", ggml::TYPE_Q8_0, q8_0.as_slice()),
         ("q4_k", ggml::TYPE_Q4_K, q4_k.as_slice()),
         ("q6_k", ggml::TYPE_Q6_K, q6_k.as_slice()),
@@ -211,6 +237,52 @@ fn bench_quant_decode(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+fn synth_q4k_data(elements: usize, seed: u32) -> Vec<u8> {
+    assert!(elements.is_multiple_of(256));
+    let mut data = Vec::with_capacity(elements / 256 * 144);
+    for block_idx in 0..elements / 256 {
+        data.extend_from_slice(&synth_q4k_block(seed + block_idx as u32));
+    }
+    data
+}
+
+fn synth_q4k_block(seed: u32) -> Vec<u8> {
+    let mut block = vec![0u8; 144];
+    let mut state = seed;
+    for byte in &mut block[4..144] {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (state >> 16) as u8;
+    }
+    // d = dmin = 0.0625 as f16. This keeps nonzero synthetic values bounded.
+    block[0] = 0x00;
+    block[1] = 0x2C;
+    block[2] = 0x00;
+    block[3] = 0x2C;
+    block
+}
+
+fn synth_q6k_data(elements: usize, seed: u32) -> Vec<u8> {
+    assert!(elements.is_multiple_of(256));
+    let mut data = Vec::with_capacity(elements / 256 * 210);
+    for block_idx in 0..elements / 256 {
+        data.extend_from_slice(&synth_q6k_block(seed + block_idx as u32));
+    }
+    data
+}
+
+fn synth_q6k_block(seed: u32) -> Vec<u8> {
+    let mut block = vec![0u8; 210];
+    let mut state = seed;
+    for byte in &mut block[..208] {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (state >> 16) as u8;
+    }
+    // d = 0.0625 as f16.
+    block[208] = 0x00;
+    block[209] = 0x2C;
+    block
 }
 
 fn bench_synthetic_safetensors_loading(c: &mut Criterion) {
@@ -351,6 +423,7 @@ fn encode_safetensors(tensors: &[TensorSpec]) -> Vec<u8> {
 criterion_group!(
     benches,
     bench_config_detection,
+    bench_config_validation,
     bench_tensor_key_generation,
     bench_ffn_tensor_classification,
     bench_quant_decode,

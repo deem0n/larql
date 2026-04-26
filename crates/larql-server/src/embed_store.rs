@@ -151,6 +151,28 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "larql-server-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_embeddings(dir: &Path, halves: &[u16]) {
+        let mut file = std::fs::File::create(dir.join(EMBEDDINGS_BIN)).unwrap();
+        for half in halves {
+            file.write_all(&half.to_le_bytes()).unwrap();
+        }
+    }
 
     #[test]
     fn f16_to_f32_zero() {
@@ -176,5 +198,67 @@ mod tests {
         // 3.14 in f16 = 0x4248
         let got = f16_to_f32(0x4248);
         assert!((got - 3.140625).abs() < 0.01, "got {got}");
+    }
+
+    #[test]
+    fn f16_to_f32_subnormal_inf_and_nan() {
+        assert!(f16_to_f32(0x0001) > 0.0);
+        assert_eq!(f16_to_f32(0x7C00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xFC00), f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn open_rejects_missing_file() {
+        let dir = unique_temp_dir("embed-missing");
+        let err = EmbedStoreF16::open(&dir, 1.0, 2, 2, 1).unwrap_err();
+        assert!(err.contains("open"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_rejects_wrong_size() {
+        let dir = unique_temp_dir("embed-size");
+        write_embeddings(&dir, &[0x3C00, 0x4000, 0x4200]);
+        let err = EmbedStoreF16::open(&dir, 1.0, 2, 2, 1).unwrap_err();
+        assert!(err.contains("expected f16 size"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lookup_decodes_scales_and_caches_until_cap() {
+        let dir = unique_temp_dir("embed-lookup");
+        write_embeddings(
+            &dir,
+            &[
+                0x3C00, 0x4000, // token 0: 1, 2
+                0x4200, 0x4400, // token 1: 3, 4
+            ],
+        );
+        let store = EmbedStoreF16::open(&dir, 0.5, 2, 2, 1).unwrap();
+
+        let row0 = store.lookup(0).unwrap();
+        assert_eq!(row0, vec![0.5, 1.0]);
+        assert_eq!(store.l1_len(), 1);
+
+        let row0_again = store.lookup(0).unwrap();
+        assert_eq!(row0_again, row0);
+        assert_eq!(store.l1_len(), 1);
+
+        let row1 = store.lookup(1).unwrap();
+        assert_eq!(row1, vec![1.5, 2.0]);
+        assert_eq!(store.l1_len(), 1, "cap prevents caching second token");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lookup_rejects_out_of_range_token() {
+        let dir = unique_temp_dir("embed-oob");
+        write_embeddings(&dir, &[0x3C00, 0x4000]);
+        let store = EmbedStoreF16::open(&dir, 1.0, 1, 2, 8).unwrap();
+        let err = store.lookup(1).unwrap_err();
+        assert!(err.contains("out of range"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

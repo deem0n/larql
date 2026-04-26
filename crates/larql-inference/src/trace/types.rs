@@ -139,10 +139,10 @@ impl ResidualTrace {
         traj
     }
 
-    pub fn layer_summaries(
-        &self,
-        weights: &ModelWeights,
-        tokenizer: &tokenizers::Tokenizer,
+    pub fn layer_summaries<'a>(
+        &'a self,
+        weights: &'a ModelWeights,
+        tokenizer: &'a tokenizers::Tokenizer,
     ) -> Vec<LayerSummary> {
         let last_pos = self.tokens.len().saturating_sub(1);
         let mut summaries = Vec::new();
@@ -167,5 +167,121 @@ impl ResidualTrace {
             });
         }
         summaries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attention::AttentionWeights;
+
+    fn node(layer: i32, position: usize) -> TraceNode {
+        TraceNode {
+            layer,
+            position,
+            residual: vec![layer as f32, position as f32],
+            attn_delta: vec![0.0, 0.0],
+            ffn_delta: vec![0.0, 0.0],
+        }
+    }
+
+    fn make_trace(n_layers: usize, n_tokens: usize) -> ResidualTrace {
+        let mut nodes = Vec::new();
+        for pos in 0..n_tokens {
+            // embedding layer (-1) + transformer layers 0..n_layers
+            nodes.push(node(-1, pos));
+            for l in 0..n_layers as i32 {
+                nodes.push(node(l, pos));
+            }
+        }
+        ResidualTrace {
+            prompt: "test".into(),
+            tokens: (0..n_tokens).map(|i| format!("t{i}")).collect(),
+            token_ids: (0..n_tokens as u32).collect(),
+            n_layers,
+            hidden_size: 2,
+            nodes,
+            attention: Vec::new(),
+        }
+    }
+
+    // ── node ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn node_found_at_correct_layer_and_position() {
+        let t = make_trace(3, 4);
+        let n = t.node(1, 2).expect("layer 1, pos 2 should exist");
+        assert_eq!(n.layer, 1);
+        assert_eq!(n.position, 2);
+    }
+
+    #[test]
+    fn node_returns_none_for_missing_layer() {
+        let t = make_trace(3, 2);
+        assert!(t.node(99, 0).is_none());
+    }
+
+    #[test]
+    fn node_returns_none_for_missing_position() {
+        let t = make_trace(3, 2);
+        assert!(t.node(0, 99).is_none());
+    }
+
+    #[test]
+    fn embedding_layer_minus_one_accessible() {
+        let t = make_trace(2, 3);
+        assert!(t.node(-1, 0).is_some());
+        assert_eq!(t.node(-1, 0).unwrap().layer, -1);
+    }
+
+    // ── last_node ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn last_node_returns_node_at_last_token() {
+        let t = make_trace(2, 4); // 4 tokens, last pos = 3
+        let n = t.last_node(0).expect("layer 0 last node");
+        assert_eq!(n.position, 3);
+    }
+
+    #[test]
+    fn last_node_returns_none_for_missing_layer() {
+        let t = make_trace(2, 2);
+        assert!(t.last_node(99).is_none());
+    }
+
+    // ── layer_nodes ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn layer_nodes_returns_all_positions_for_layer() {
+        let t = make_trace(3, 5); // 5 tokens
+        let nodes = t.layer_nodes(2);
+        assert_eq!(nodes.len(), 5, "one node per token at layer 2");
+        assert!(nodes.iter().all(|n| n.layer == 2));
+    }
+
+    #[test]
+    fn layer_nodes_returns_empty_for_missing_layer() {
+        let t = make_trace(2, 3);
+        assert!(t.layer_nodes(99).is_empty());
+    }
+
+    // ── position_trajectory ───────────────────────────────────────────────────
+
+    #[test]
+    fn position_trajectory_sorted_ascending_by_layer() {
+        let t = make_trace(4, 3);
+        let traj = t.position_trajectory(1); // position 1
+        // Should have embedding (-1) + 4 transformer layers = 5 nodes
+        assert_eq!(traj.len(), 5);
+        for w in traj.windows(2) {
+            assert!(w[0].layer <= w[1].layer, "trajectory not sorted");
+        }
+        assert_eq!(traj[0].layer, -1);
+    }
+
+    #[test]
+    fn position_trajectory_empty_for_missing_position() {
+        let t = make_trace(2, 2);
+        assert!(t.position_trajectory(99).is_empty());
     }
 }

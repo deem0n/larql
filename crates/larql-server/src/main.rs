@@ -450,6 +450,106 @@ fn discover_vindexes(dir: &PathBuf) -> Vec<PathBuf> {
     paths
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "larql-server-main-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_layer_range_accepts_inclusive_cli_range() {
+        assert_eq!(parse_layer_range("0-19").unwrap(), (0, 20));
+        assert_eq!(parse_layer_range(" 2 - 2 ").unwrap(), (2, 3));
+    }
+
+    #[test]
+    fn parse_layer_range_rejects_bad_shapes() {
+        assert!(parse_layer_range("0").is_err());
+        assert!(parse_layer_range("x-2").is_err());
+        assert!(parse_layer_range("2-x").is_err());
+        assert!(parse_layer_range("3-2").is_err());
+    }
+
+    #[test]
+    fn cli_accepts_serve_alias_and_forwarded_flag() {
+        let cli = Cli::parse_from([
+            "larql-server",
+            "serve",
+            "model.vindex",
+            "--rate-limit",
+            "10/sec",
+            "--trust-forwarded-for",
+            "--layers",
+            "1-3",
+        ]);
+        assert_eq!(cli.vindex_path.as_deref(), Some("serve"));
+
+        let filtered = [
+            "larql-server",
+            "model.vindex",
+            "--rate-limit",
+            "10/sec",
+            "--trust-forwarded-for",
+            "--layers",
+            "1-3",
+        ];
+        let cli = Cli::parse_from(filtered);
+        assert_eq!(cli.vindex_path.as_deref(), Some("model.vindex"));
+        assert_eq!(cli.rate_limit.as_deref(), Some("10/sec"));
+        assert!(cli.trust_forwarded_for);
+        assert_eq!(cli.layers.as_deref(), Some("1-3"));
+    }
+
+    #[test]
+    fn discover_vindexes_returns_sorted_dirs_with_index_json() {
+        let dir = unique_temp_dir("discover");
+        let b = dir.join("b.vindex");
+        let a = dir.join("a.vindex");
+        let ignored = dir.join("ignored.vindex");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(b.join(INDEX_JSON), "{}").unwrap();
+        std::fs::write(a.join(INDEX_JSON), "{}").unwrap();
+
+        let paths = discover_vindexes(&dir);
+        assert_eq!(paths, vec![a, b]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_options_are_copyable() {
+        let opts = LoadVindexOptions {
+            no_infer: true,
+            ffn_only: false,
+            embed_only: false,
+            layer_range: Some((0, 2)),
+            max_gate_cache_layers: 1,
+            max_q4k_cache_layers: 2,
+            hnsw: Some(200),
+            warmup_hnsw: true,
+            release_mmap_after_request: true,
+            expert_filter: Some((3, 4)),
+        };
+        let copied = opts;
+        assert!(copied.no_infer);
+        assert_eq!(copied.layer_range, Some((0, 2)));
+        assert_eq!(copied.expert_filter, Some((3, 4)));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Accept both `larql-server <path>` and `larql-server serve <path>`.
