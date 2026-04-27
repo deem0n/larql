@@ -23,6 +23,34 @@ use crate::forward::{apply_norm, embed_tokens_pub};
 use crate::layer_graph::generate::lm_head_topk as lm_topk;
 use crate::layer_graph::pipeline_layer::build_pipeline_layers;
 
+/// Build `MoeRouterWeights` for one layer from the model's vector store.
+/// Returns None if the required router projection is absent.
+fn build_router<'a>(
+    weights: &'a ModelWeights,
+    arch: &dyn larql_models::ModelArchitecture,
+    layer: usize,
+) -> Option<MoeRouterWeights<'a>> {
+    let router_proj_key = arch.moe_router_key(layer)?;
+    let router_proj = weights.vectors.get(&router_proj_key)?.as_slice();
+    let sl = |k: Option<String>| -> &'a [f32] {
+        k.and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+    Some(MoeRouterWeights {
+        router_proj,
+        router_scale:            sl(arch.moe_router_scale_key(layer)),
+        router_per_expert_scale: sl(arch.moe_router_per_expert_scale_key(layer)),
+        router_norm:             sl(arch.moe_router_norm_key(layer)),
+        router_norm_parameter_free: arch.moe_router_norm_parameter_free(),
+        router_input_scalar: arch.moe_router_input_scalar().unwrap_or(1.0),
+        pre_experts_norm:  sl(arch.moe_pre_experts_norm_key(layer)),
+        post_experts_norm: sl(arch.moe_post_experts_norm_key(layer)),
+        num_experts: arch.num_experts(),
+        top_k:       arch.num_experts_per_token(),
+    })
+}
+
 #[derive(Debug)]
 pub struct GridGenerateResult {
     pub tokens: Vec<String>,
@@ -84,62 +112,84 @@ pub fn generate_with_remote_moe(
     let kv_dim = weights.num_kv_heads * weights.head_dim;
     let rope = arch.rope_base_for_layer(0) as f32;
 
-    // ── Prefill ───────────────────────────────────────────────────────────────
-    // GPU prefill builds the KV cache for prompt tokens.  We run the standard
-    // prefill (which uses local experts) as an approximation — the prefill
-    // residuals are slightly wrong but the KV cache is built correctly for
-    // attention patterns.  Decode uses the remote experts from token 0.
-    backend.reset_kv_cache();
+    // ── Open gRPC streams (one pair for the entire generation) ───────────────
+    //
+    // For gRPC shards (`grpc://` URLs), we open one bidirectional stream per
+    // shard and reuse it for every layer of every token (prefill + decode).
+    // This eliminates the per-layer connection setup cost: each layer pays only
+    // the cost of one proto frame exchange on an existing HTTP/2 connection
+    // (~0.5ms) instead of ~12ms for a new unary call.
+    //
+    // For HTTP shards, `open_streams` returns an empty vec and we fall back to
+    // `forward_moe` (per-layer HTTP calls, as before).
+    let mut streams: Vec<crate::ffn::moe_remote::ShardStream> =
+        if remote.has_grpc_shards() {
+            remote.open_streams().unwrap_or_default()
+        } else {
+            vec![]
+        };
 
-    // Pre-allocate per-layer KV cache for asymmetric attention geometry (Gemma 4 26B).
+    // ── Prefill ───────────────────────────────────────────────────────────────
+    //
+    // Run one `decode_token_with_moe` per prompt token rather than `prefill_q4`.
+    // `prefill_q4` does not correctly apply MoE experts for hybrid-MoE post-norm
+    // models (Gemma 4 26B-A4B), so the first-token prediction and subsequent KV
+    // cache entries are wrong.  Sequential decode builds the KV cache correctly
+    // — each token processes with the proper remote expert contribution.
+    backend.reset_kv_cache();
     {
-        let arch = &*weights.arch;
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
         backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
     }
 
-    let seq_len = prompt_ids.len();
+    let skip_moe = std::env::var("SKIP_MOE").is_ok();
+    let mut last_hidden_vec: Vec<f32> = vec![0.0f32; hidden];
+    let mut current_ids = prompt_ids.clone();
 
-    let h_embed = embed_tokens_pub(weights, &prompt_ids);
-    let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+    for &tok_id in &prompt_ids {
+        let tok_embed = embed_tokens_pub(weights, &[tok_id]);
+        let x_tok: Vec<f32> = tok_embed.as_slice().unwrap_or(&[]).to_vec();
 
-    let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
-    let qk_norm = arch.attn_q_norm_key(0).is_some();
+        let mut step_error: Option<RemoteMoeError> = None;
+        let mut moe_fn = |layer: usize, h_post_attn: &[f32]| -> Vec<f32> {
+            if skip_moe { return vec![0.0f32; hidden]; }
+            if step_error.is_some() { return vec![0.0f32; hidden]; }
+            let router = match build_router(weights, arch, layer) {
+                Some(r) => r,
+                None => return vec![0.0f32; hidden],
+            };
+            let result = if streams.is_empty() {
+                remote.forward_moe(layer, h_post_attn, &router, norm_offset, eps)
+            } else {
+                remote.forward_moe_stream(layer, h_post_attn, &router, &mut streams, norm_offset, eps)
+            };
+            match result {
+                Ok(out) => out,
+                Err(e) => { step_error = Some(e); vec![0.0f32; hidden] }
+            }
+        };
 
-    // Run GPU prefill (uses local experts for prefill positions).
-    let h_prefill = backend
-        .prefill_q4(
-            &layers,
-            &x,
-            hidden,
-            intermediate,
-            q_dim,
-            kv_dim,
-            seq_len,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
-            qk_norm,
-            softcap,
-        )
-        .ok_or_else(|| {
-            RemoteMoeError::BadResponse("GPU prefill not available — need Metal backend".into())
+        let h = backend.decode_token_with_moe(
+            &layers, &x_tok, hidden, intermediate, q_dim, kv_dim,
+            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope, &mut moe_fn,
+        );
+        if let Some(err) = step_error { return Err(err); }
+        last_hidden_vec = h.ok_or_else(|| {
+            RemoteMoeError::BadResponse("decode_token_with_moe returned None during prefill".into())
         })?;
+    }
 
     // ── Decode loop ───────────────────────────────────────────────────────────
-    let mut last_hidden_vec = h_prefill;
-    let mut current_ids = prompt_ids;
     let mut tokens = Vec::new();
     let mut decode_ms = Vec::new();
 
-    // Get initial top-1 prediction from prefill output.
-    let prefill_h_arr = ndarray::Array2::from_shape_vec((seq_len, hidden), last_hidden_vec.clone())
+    // First token from the (correct) prefill output.
+    let prefill_h_arr = ndarray::Array2::from_shape_vec((1, hidden), last_hidden_vec.clone())
         .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
     let h_norm0 = apply_norm(weights, &prefill_h_arr, arch.final_norm_key(), norm_offset);
-    let last0 = h_norm0.row(seq_len - 1).to_owned();
+    let last0 = h_norm0.row(0).to_owned();
     let first_id = lm_topk(index, weights, &last0, 1, backend)
         .into_iter()
         .next()
@@ -170,75 +220,22 @@ pub fn generate_with_remote_moe(
         let tok_embed = embed_tokens_pub(weights, &[next_input_id]);
         let x_tok: Vec<f32> = tok_embed.as_slice().unwrap_or(&[]).to_vec();
 
-        // Build the expert dispatch closure for this decode step.
-        // Called once per MoE layer by `decode_token_with_moe`.
         let mut step_error: Option<RemoteMoeError> = None;
-        // SKIP_MOE=1 zeroes out the expert block (diagnostic: checks if dense FFN alone is correct).
-        let skip_moe = std::env::var("SKIP_MOE").is_ok();
-
         let mut moe_fn = |layer: usize, h_post_attn: &[f32]| -> Vec<f32> {
-            if skip_moe {
-                return vec![0.0f32; hidden];
-            }
-            if step_error.is_some() {
-                return vec![0.0f32; hidden];
-            }
-            let arch = &*weights.arch;
-            let router_proj_key = match arch.moe_router_key(layer) {
-                Some(k) => k,
+            if skip_moe { return vec![0.0f32; hidden]; }
+            if step_error.is_some() { return vec![0.0f32; hidden]; }
+            let router = match build_router(weights, arch, layer) {
+                Some(r) => r,
                 None => return vec![0.0f32; hidden],
             };
-            let router_proj = match weights.vectors.get(&router_proj_key) {
-                Some(v) => v,
-                None => return vec![0.0f32; hidden],
+            let result = if streams.is_empty() {
+                remote.forward_moe(layer, h_post_attn, &router, norm_offset, eps)
+            } else {
+                remote.forward_moe_stream(layer, h_post_attn, &router, &mut streams, norm_offset, eps)
             };
-            let router_scale = arch
-                .moe_router_scale_key(layer)
-                .and_then(|k| weights.vectors.get(&k))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            let per_expert_scale = arch
-                .moe_router_per_expert_scale_key(layer)
-                .and_then(|k| weights.vectors.get(&k))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            let pre_experts_norm = arch
-                .moe_pre_experts_norm_key(layer)
-                .and_then(|k| weights.vectors.get(&k))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            let post_experts_norm = arch
-                .moe_post_experts_norm_key(layer)
-                .and_then(|k| weights.vectors.get(&k))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            let router_norm = arch
-                .moe_router_norm_key(layer)
-                .and_then(|k| weights.vectors.get(&k))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            let router_norm_parameter_free = arch.moe_router_norm_parameter_free();
-            let router_input_scalar = arch.moe_router_input_scalar().unwrap_or(1.0);
-
-            let router = MoeRouterWeights {
-                router_proj: router_proj.as_slice(),
-                router_scale,
-                router_per_expert_scale: per_expert_scale,
-                router_norm,
-                router_norm_parameter_free,
-                router_input_scalar,
-                pre_experts_norm,
-                post_experts_norm,
-                num_experts: arch.num_experts(),
-                top_k: arch.num_experts_per_token(),
-            };
-
-            match remote.forward_moe(layer, h_post_attn, &router, norm_offset, eps) {
+            match result {
                 Ok(out) => out,
-                Err(e) => {
-                    step_error = Some(e);
-                    vec![0.0f32; hidden]
-                }
+                Err(e) => { step_error = Some(e); vec![0.0f32; hidden] }
             }
         };
 

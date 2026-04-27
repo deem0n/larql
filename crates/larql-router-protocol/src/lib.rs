@@ -8,7 +8,10 @@ pub mod expert_proto {
 
 pub use expert_proto::expert_service_client::ExpertServiceClient;
 pub use expert_proto::expert_service_server::{ExpertService, ExpertServiceServer};
-pub use expert_proto::{ExpertBatchItem, ExpertBatchRequest, ExpertBatchResponse, ExpertBatchResult};
+pub use expert_proto::{
+    ExpertBatchItem, ExpertBatchRequest, ExpertBatchResponse, ExpertBatchResult,
+    ExpertLayerInput, ExpertLayerOutput,
+};
 pub use proto::grid_service_client::GridServiceClient;
 pub use proto::grid_service_server::{GridService, GridServiceServer};
 pub use proto::router_message::Payload as RouterPayload;

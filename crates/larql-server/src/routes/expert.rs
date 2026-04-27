@@ -71,7 +71,7 @@ pub struct BatchExpertResponse {
 
 // ── Core computation ──────────────────────────────────────────────────────────
 
-fn run_expert(
+pub fn run_expert(
     state: &AppState,
     layer: usize,
     expert_id: usize,

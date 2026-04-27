@@ -52,9 +52,11 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 # gRPC expert client (RemoteMoeBackend → ExpertService via tonic)
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 tonic = "0.13"
 larql-router-protocol = { path = "../larql-router-protocol" }
+async-stream = "0.3"
+futures = "0.3"
 
 # WASM expert registry
 wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime"] }
