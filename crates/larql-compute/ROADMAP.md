@@ -1041,3 +1041,4 @@ Single kernel per layer: norm → QKV → attention → O → residual → norm 
 | Single global encoder | 2026-04-09 | One encoder for all 34 layers (no per-layer create/end) |
 | **Cooperative SIMD norms** | **2026-04-09** | **O(N²)→O(N) in rms_norm/residual_norm — saved ~10ms** |
 | **Ollama EXCEEDED** | **2026-04-09** | **8.5ms / 117 tok/s = 0.83x Ollama (17% faster)** |
+| Fused Q4_K geglu+down disabled by default — `LARQL_FUSED_DOWN=1` opt-in | 2026-04-30 | The `q4k_geglu_silu_down` / `q4k_geglu_gelu_tanh_down` shaders pass their unit tests but produce all-NaN at the prefill output for production-shape weights (Gemma 3 4B q4k-downq4k → 2560/2560 NaN; Gemma 4 31B q4k → empty output). Separated path (existing GEGLU dispatch + `q4k_matvec`) is correct for the same shapes. Default flipped in `metal::stages::ffn::encode_gated`; perf parity to be re-tested if/when the fused kernel is fixed |

@@ -1,7 +1,8 @@
 //! Exp37 q4k slot-bit additivity runner.
 //!
-//! Scores the object slot for each row in the Exp37 design matrix using the
-//! low-memory q4k walk path, then computes pairwise additivity interactions.
+//! Scores the object slot for each row in the Exp37 design matrix using exact
+//! target log-probabilities from the low-memory q4k walk path, then computes
+//! pairwise additivity interactions.
 
 #[cfg(feature = "real-model")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,8 +22,8 @@ mod runner {
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
 
-    use larql_inference::vindex::{predict_q4k_with_ffn, WalkFfn};
-    use larql_inference::{encode_prompt, open_inference_vindex, PredictResult};
+    use larql_inference::vindex::{predict_q4k_hidden_with_ffn, WalkFfn};
+    use larql_inference::{encode_prompt, hidden_to_raw_logits, open_inference_vindex};
     use larql_vindex::{load_model_weights_q4k, load_vindex_tokenizer};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
@@ -113,6 +114,7 @@ mod runner {
             serde_json::to_string_pretty(&json!({
                 "experiment": "37_bit_budget_additivity",
                 "path": "q4k",
+                "scoring": "exact_target_logprob",
                 "vindex": args.vindex,
                 "top_k_predictions": args.top_k,
                 "feature_top_k": args.feature_top_k,
@@ -237,7 +239,7 @@ mod runner {
         tokenizer: &tokenizers::Tokenizer,
         index: &larql_vindex::VectorIndex,
         cell: &Cell,
-        top_k: usize,
+        _top_k: usize,
         feature_top_k: usize,
     ) -> Result<ScoredCell, Box<dyn std::error::Error>> {
         let prefix = cell.text[..cell.object_span_start].to_string();
@@ -254,28 +256,17 @@ mod runner {
             .to_vec();
         let mut token_bits = Vec::new();
         let mut token_probs = Vec::new();
-        let mut clipped = 0usize;
+        let clipped = 0usize;
         for &target_id in &object_ids {
-            let result = run_q4k_walk(
+            let prob = exact_target_prob(
                 weights,
-                tokenizer,
                 index,
                 &context_ids,
-                top_k,
+                target_id as usize,
                 feature_top_k,
             );
-            let target_surface = tokenizer.decode(&[target_id], true).unwrap_or_default();
-            let prob = result
-                .predictions
-                .iter()
-                .find(|(surface, _)| surface == &target_surface)
-                .map(|(_, p)| *p)
-                .unwrap_or(0.0);
-            if prob == 0.0 {
-                clipped += 1;
-            }
             token_probs.push(prob);
-            token_bits.push(-prob.max(1e-45).log2());
+            token_bits.push(-prob.log2());
             context_ids.push(target_id);
         }
         let total = token_bits.iter().sum::<f64>();
@@ -292,18 +283,25 @@ mod runner {
         })
     }
 
-    fn run_q4k_walk(
+    fn exact_target_prob(
         weights: &mut larql_models::ModelWeights,
-        tokenizer: &tokenizers::Tokenizer,
         index: &larql_vindex::VectorIndex,
         token_ids: &[u32],
-        pred_top_k: usize,
+        target_id: usize,
         feature_top_k: usize,
-    ) -> PredictResult {
+    ) -> f64 {
         let weights_ref: &larql_models::ModelWeights =
             unsafe { &*(weights as *const larql_models::ModelWeights) };
         let walk_ffn = WalkFfn::new(weights_ref, index, feature_top_k);
-        predict_q4k_with_ffn(weights, tokenizer, token_ids, pred_top_k, index, &walk_ffn)
+        let h = predict_q4k_hidden_with_ffn(weights, token_ids, index, &walk_ffn);
+        let seq_len = h.shape()[0];
+        let h_last = h.slice(ndarray::s![seq_len - 1..seq_len, ..]).to_owned();
+        let logits = hidden_to_raw_logits(weights, &h_last);
+        let target = logits[target_id] as f64;
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exp_sum: f64 = logits.iter().map(|&l| ((l as f64) - max_logit).exp()).sum();
+        let logsumexp = max_logit + exp_sum.ln();
+        (target - logsumexp).exp().max(f64::MIN_POSITIVE)
     }
 
     fn compute_interactions(scored: &[ScoredCell]) -> Vec<Interaction> {

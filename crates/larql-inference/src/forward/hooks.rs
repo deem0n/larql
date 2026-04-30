@@ -116,8 +116,7 @@ impl LayerHook for RecordHook {
     }
     fn on_attention_weights(&mut self, layer: usize, weights: &AttentionWeights) {
         if self.layers.contains(&layer) {
-            self.attention_weights
-                .insert(layer, weights.heads.clone());
+            self.attention_weights.insert(layer, weights.heads.clone());
         }
     }
     fn on_ffn_activation(&mut self, layer: usize, gate: &Array2<f32>) {

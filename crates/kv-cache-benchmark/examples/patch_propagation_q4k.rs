@@ -29,7 +29,9 @@ mod runner {
     use std::path::PathBuf;
 
     use larql_inference::vindex::{predict_q4k_hidden_with_ffn, predict_q4k_with_ffn, WalkFfn};
-    use larql_inference::{encode_prompt, hidden_to_raw_logits, open_inference_vindex, PredictResult};
+    use larql_inference::{
+        encode_prompt, hidden_to_raw_logits, open_inference_vindex, PredictResult,
+    };
     use larql_vindex::{load_model_weights_q4k, load_vindex_tokenizer, FeatureMeta};
     use ndarray::Array1;
     use serde::{Deserialize, Serialize};
@@ -377,7 +379,7 @@ mod runner {
         prompt: &PromptRow,
         answer: &str,
         surface_idx: usize,
-        top_k: usize,
+        _top_k: usize,
         feature_top_k: usize,
     ) -> Result<ScoreRow, Box<dyn std::error::Error>> {
         let mut context_ids = encode_prompt(tokenizer, &*weights.arch, &prompt.prefix)?;
@@ -388,7 +390,7 @@ mod runner {
             .to_vec();
         let mut token_bits = Vec::new();
         let mut token_probs = Vec::new();
-        let mut clipped = 0usize;
+        let clipped = 0usize;
 
         for &target_id in &answer_ids {
             let prob = exact_target_prob(
@@ -527,14 +529,8 @@ mod runner {
         let h_last = h.slice(ndarray::s![seq_len - 1..seq_len, ..]).to_owned();
         let logits = hidden_to_raw_logits(weights, &h_last);
         let target = logits[target_id] as f64;
-        let max_logit = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max) as f64;
-        let exp_sum: f64 = logits
-            .iter()
-            .map(|&l| ((l as f64) - max_logit).exp())
-            .sum();
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exp_sum: f64 = logits.iter().map(|&l| ((l as f64) - max_logit).exp()).sum();
         let logsumexp = max_logit + exp_sum.ln();
         (target - logsumexp).exp().max(f64::MIN_POSITIVE)
     }

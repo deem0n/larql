@@ -16,18 +16,24 @@
 //!   - `predict/ffn`: Custom FFN backend, router, and strategy forward passes
 //! - `trace`: Residual/activation capture and calibration
 //! - `hooks`: Mid-forward `LayerHook` trait + built-in record/ablate/steer hooks
+//! - `lens`: Logit lens — project arbitrary-layer residuals through final norm + lm_head
+//! - `vocab_proj`: Direct W_E / W_U primitives — embedding rows, neighbors, raw unembed
+//! - `patching`: Activation patching — donor → recipient residual swap at (layer, position)
 
 pub mod embed;
 pub mod hooks;
 pub mod infer_patched;
 pub mod kv_generate;
 pub mod layer;
+pub mod lens;
 pub mod memit;
 pub mod ops;
+pub mod patching;
 pub mod ple;
 pub mod predict;
 pub mod target_delta;
 pub mod trace;
+pub mod vocab_proj;
 
 // ── Re-export ops so all `super::apply_norm` / `crate::forward::*` paths work ──
 pub use ops::{add_bias, apply_norm, dot_proj, softmax};
@@ -51,8 +57,12 @@ pub use kv_generate::{
     generate_cached, generate_cached_backend, generate_cached_constrained,
     generate_cached_with_window,
 };
-pub use layer::{run_attention_public, run_ffn, run_layer_with_ffn};
+pub use layer::{
+    run_attention_public, run_ffn, run_layer_with_ffn, run_layer_with_zeroed_pre_o_heads,
+};
+pub use lens::{logit_lens_topk, track_race, track_token};
 pub use memit::{run_memit, run_memit_with_target_opt, MemitFact, MemitFactResult, MemitResult};
+pub use patching::{capture_donor_state, patch_and_trace, DonorState, PatchHook};
 pub use predict::{
     forward_from_layer, forward_raw_logits, forward_raw_logits_with_prefix, hidden_to_raw_logits,
     logit_lens_top1, logits_to_predictions_pub, predict, predict_from_hidden,
@@ -66,4 +76,8 @@ pub use trace::{
     capture_residuals, capture_spec_residuals, estimate_ffn_covariance, forward_to_layer,
     trace_forward, trace_forward_full, trace_forward_full_hooked, trace_forward_with_ffn,
     SpecCapture,
+};
+pub use vocab_proj::{
+    embedding_neighbors, embedding_row, embedding_row_scaled, project_through_unembed,
+    unembedding_row,
 };

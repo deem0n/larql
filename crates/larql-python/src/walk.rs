@@ -4,13 +4,21 @@
 //! at mmap'd memory. Only the pages touched during inference are paged in.
 //! Peak RSS: ~one layer of weights at a time (OS manages page eviction).
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
 use std::path::Path;
 
 use larql_inference::ffn::FfnBackend;
+use larql_inference::forward::{
+    capture_donor_state, embedding_neighbors as li_embedding_neighbors,
+    embedding_row as li_embedding_row, embedding_row_scaled as li_embedding_row_scaled,
+    logit_lens_topk, patch_and_trace, project_through_unembed as li_project_through_unembed,
+    trace_forward_full_hooked, track_race as li_track_race, track_token as li_track_token,
+    unembedding_row as li_unembedding_row, RecordHook, SteerHook, ZeroAblateHook,
+};
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
 use larql_vindex::{
     load_vindex_config, load_vindex_tokenizer, tokenizers, SilentLoadCallbacks, VectorIndex,
@@ -528,10 +536,305 @@ impl PyWalkModel {
         trace_py::capture_trace(&self.weights, &self.tokenizer, prompt, positions)
     }
 
+    // ── Mechanistic interp surface (lazarus parity) ────────────────────────
+    //
+    // These methods mirror the chuk-mcp-lazarus tool surface. They run a
+    // forward pass with a `LayerHook` registered and return numpy tensors
+    // ready for Python-side analysis.
+
+    /// Tokenize then capture last-token residual at each requested layer.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (hidden_size,)`.
+    #[pyo3(signature = (prompt, layers))]
+    fn capture_residuals<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let mut hook = RecordHook::for_layers(layers.iter().copied());
+        let _ = trace_forward_full_hooked(
+            &self.weights,
+            &token_ids,
+            &layers,
+            false,
+            0,
+            false,
+            &walk_ffn,
+            &mut hook,
+        );
+
+        let out = PyDict::new(py);
+        for (layer, mat) in hook.post_layer.iter() {
+            // Last-token row only — matches the convention everywhere else
+            // in larql_inference. Full matrix available via
+            // `forward_with_capture` if a caller needs every position.
+            let last = mat.row(mat.nrows() - 1).to_vec();
+            out.set_item(*layer, last.into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Run a forward pass with a [`RecordHook`] and return the **full**
+    /// `(seq_len, hidden_size)` post-layer residual at each requested
+    /// layer. Larger than `capture_residuals` — only call when you need
+    /// per-position activations (patching, full causal trace).
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (seq_len, hidden_size)`.
+    #[pyo3(signature = (prompt, layers))]
+    fn forward_with_capture<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let mut hook = RecordHook::for_layers(layers.iter().copied());
+        let _ = trace_forward_full_hooked(
+            &self.weights,
+            &token_ids,
+            &layers,
+            false,
+            0,
+            false,
+            &walk_ffn,
+            &mut hook,
+        );
+
+        let out = PyDict::new(py);
+        for (layer, mat) in hook.post_layer.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Zero-ablate the post-layer residual at the listed `ablate_layers`,
+    /// then capture last-token residuals at `capture_layers`. Mirrors
+    /// lazarus's `ablate_layers` + measurement workflow.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (hidden_size,)` for
+    /// each capture layer (post-ablation).
+    #[pyo3(signature = (prompt, ablate_layers, capture_layers))]
+    fn forward_ablate<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        ablate_layers: Vec<usize>,
+        capture_layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let mut ablate = ZeroAblateHook::for_layers(ablate_layers);
+        let trace = trace_forward_full_hooked(
+            &self.weights,
+            &token_ids,
+            &capture_layers,
+            false,
+            0,
+            false,
+            &walk_ffn,
+            &mut ablate,
+        );
+
+        let out = PyDict::new(py);
+        for (layer, residual) in trace.residuals {
+            out.set_item(layer, residual.into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Add `alpha * v` to the last-token row of the post-layer residual at
+    /// each (layer, vector, alpha) entry, then capture last-token
+    /// residuals at `capture_layers`. Mirrors lazarus's `steer_and_generate`
+    /// at the residual-readback level.
+    ///
+    /// `steers` is a list of `(layer, numpy_vector, alpha)` tuples.
+    #[pyo3(signature = (prompt, steers, capture_layers))]
+    fn forward_steer<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        steers: Vec<(usize, PyReadonlyArray1<f32>, f32)>,
+        capture_layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+
+        let mut steer = SteerHook::new();
+        for (layer, vec, alpha) in steers {
+            let arr = Array1::from_vec(vec.as_slice()?.to_vec());
+            steer = steer.add(layer, arr, alpha);
+        }
+        let trace = trace_forward_full_hooked(
+            &self.weights,
+            &token_ids,
+            &capture_layers,
+            false,
+            0,
+            false,
+            &walk_ffn,
+            &mut steer,
+        );
+
+        let out = PyDict::new(py);
+        for (layer, residual) in trace.residuals {
+            out.set_item(layer, residual.into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Activation patching. Run `donor_prompt`, capture post-layer
+    /// residuals at the `(layer, position)` coords in `coords`, then run
+    /// `recipient_prompt` with those residuals patched in at the same
+    /// coords. Returns last-token residuals at `capture_layers` (post-
+    /// patch).
+    ///
+    /// Mirrors lazarus's `patch_activations`. Uses dense FFN for
+    /// faithfulness (not the walk path).
+    #[pyo3(signature = (donor_prompt, recipient_prompt, coords, capture_layers))]
+    fn patch_activations<'py>(
+        &self,
+        py: Python<'py>,
+        donor_prompt: &str,
+        recipient_prompt: &str,
+        coords: Vec<(usize, usize)>,
+        capture_layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let donor_tokens = self.encode(donor_prompt)?;
+        let recipient_tokens = self.encode(recipient_prompt)?;
+
+        let donor = capture_donor_state(&self.weights, &donor_tokens, &coords);
+        let trace = patch_and_trace(&self.weights, &recipient_tokens, &donor, &capture_layers);
+
+        let out = PyDict::new(py);
+        for (layer, residual) in trace.residuals {
+            out.set_item(layer, residual.into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    // ── Logit lens / vocab projection ──────────────────────────────────────
+
+    /// Project `residual` through final norm + lm_head + softcap and
+    /// return the top-`k` `(token_id, probability)` pairs.
+    #[pyo3(signature = (residual, k=10))]
+    fn logit_lens(&self, residual: PyReadonlyArray1<f32>, k: usize) -> PyResult<Vec<(u32, f32)>> {
+        Ok(logit_lens_topk(&self.weights, residual.as_slice()?, k))
+    }
+
+    /// Probability of `target_token_id` at the residual.
+    fn track_token_at(
+        &self,
+        residual: PyReadonlyArray1<f32>,
+        target_token_id: u32,
+    ) -> PyResult<f32> {
+        Ok(li_track_token(
+            &self.weights,
+            residual.as_slice()?,
+            target_token_id,
+        ))
+    }
+
+    /// Top-k per layer for a `dict[layer] -> residual` mapping.
+    /// Returns `dict[layer] -> List[(token_id, prob)]`.
+    #[pyo3(signature = (residuals, k=5))]
+    fn track_race<'py>(
+        &self,
+        py: Python<'py>,
+        residuals: &Bound<'py, PyDict>,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let mut pairs: Vec<(usize, Vec<f32>)> = Vec::with_capacity(residuals.len());
+        for (key, val) in residuals.iter() {
+            let layer: usize = key.extract()?;
+            let arr: PyReadonlyArray1<f32> = val.extract()?;
+            pairs.push((layer, arr.as_slice()?.to_vec()));
+        }
+        let race = li_track_race(&self.weights, &pairs, k);
+        let out = PyDict::new(py);
+        for (layer, top) in race {
+            out.set_item(layer, top)?;
+        }
+        Ok(out)
+    }
+
+    /// Top-`k` vocab tokens by cosine similarity to `query` against `W_E`.
+    /// Returns `[(token_id, cosine), ...]` descending.
+    #[pyo3(signature = (query, k=10))]
+    fn embedding_neighbors(
+        &self,
+        query: PyReadonlyArray1<f32>,
+        k: usize,
+    ) -> PyResult<Vec<(u32, f32)>> {
+        Ok(li_embedding_neighbors(&self.weights, query.as_slice()?, k))
+    }
+
+    /// Raw `lm_head @ vec` projection — top-`k` `(token_id, logit)` pairs.
+    /// **No final norm, no softcap, no softmax.** This is the DLA
+    /// primitive — apply it to a head's contribution or any direction
+    /// you want to read out as a vocabulary distribution without the
+    /// model's final-stage normalisation.
+    #[pyo3(signature = (vec, k=10))]
+    fn project_through_unembed(
+        &self,
+        vec: PyReadonlyArray1<f32>,
+        k: usize,
+    ) -> PyResult<Vec<(u32, f32)>> {
+        Ok(li_project_through_unembed(
+            &self.weights,
+            vec.as_slice()?,
+            k,
+        ))
+    }
+
+    /// Embedding row for `token_id`. `scaled=True` (default) returns the
+    /// row multiplied by `embed_scale` so it matches what the forward
+    /// pass writes into the residual. `scaled=False` returns the raw
+    /// matrix row.
+    #[pyo3(signature = (token_id, scaled=true))]
+    fn embedding_for<'py>(
+        &self,
+        py: Python<'py>,
+        token_id: u32,
+        scaled: bool,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
+        let row = if scaled {
+            li_embedding_row_scaled(&self.weights, token_id)
+        } else {
+            li_embedding_row(&self.weights, token_id)
+        };
+        Ok(row.map(|r| r.into_pyarray(py)))
+    }
+
+    /// Unembedding (`lm_head`) row for `token_id` — the direction whose
+    /// dot product with the final residual gives the raw logit for that
+    /// token (before any norm/softcap/scaling).
+    fn unembedding_for<'py>(
+        &self,
+        py: Python<'py>,
+        token_id: u32,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
+        Ok(li_unembedding_row(&self.weights, token_id).map(|r| r.into_pyarray(py)))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "WalkModel(path='{}', layers={}, hidden={}, top_k={})",
             self.path, self.weights.num_layers, self.weights.hidden_size, self.top_k
         )
+    }
+}
+
+impl PyWalkModel {
+    /// Tokenize a prompt to ids, raising a Python ValueError on failure.
+    fn encode(&self, prompt: &str) -> PyResult<Vec<u32>> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(encoding.get_ids().to_vec())
     }
 }

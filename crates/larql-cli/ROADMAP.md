@@ -141,3 +141,14 @@ testing without a client library.
 to `--ffn URL`. Maps expert ID ranges to remote URLs; passed through to
 `RemoteExpertBackend` in larql-inference. See also `larql-lql/ROADMAP.md` Phase 3
 for the LQL grammar surface.
+
+---
+
+## Shipped — 2026-04-30
+
+| What | Notes |
+|------|-------|
+| `larql parity --component layer` extended to dense models | Was MoE-only via `LARQL_DUMP_RESIDUALS`; now also handles dense by setting `LARQL_METAL_DUMP_LAYERS` and reading per-layer `metal_layer_NN_h_out.f32` / `metal_layer_NN_h_post_attn.f32`. Used to confirm Gemma 4 31B dense matches between CPU and Metal at every layer (cos ≥ 0.9999), which localised the bug to chat-template / sampling rather than the math |
+| `larql parity --component lm-head` works on dense vindexes | The MoE-only gate (`is_hybrid_moe()` check) only fires for `moe-expert` / `moe-block` now; `lm-head` is backend-agnostic (Q4_K matvec vs f32 reference) and works on any vindex with an lm_head |
+| Dense Metal path applies chat templates | `walk_cmd::run_predict_q4k` was sending the raw user prompt to `encode_prompt`; chat-template wrapping only happened for the `--moe-shards` / `--moe-units-manifest` paths. Both paths now go through `larql_inference::chat::render_user_prompt`. Fixes "The answer is:" looping on Gemma 4 31B dense and the "more questions instead of answers" frame on Gemma 3 |
+| Auto-injected default system prompt for Gemma 4 (all variants) | Gemma 4 needs a system prompt to enter answer mode; `LARQL_NO_DEFAULT_SYSTEM=1` opts out, `LARQL_SYSTEM=<text>` overrides |

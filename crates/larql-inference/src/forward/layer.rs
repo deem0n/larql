@@ -188,6 +188,36 @@ pub fn run_layer_with_ffn(
     Some((h_out, activation, kv_out))
 }
 
+/// Run a single transformer layer while zeroing selected pre-W_O attention heads.
+///
+/// This is intended for OV ablation diagnostics: the selected query-head slices
+/// are zeroed after GQA and before W_O, then the normal FFN, PLE, and layer
+/// scalar path runs unchanged.
+#[allow(clippy::type_complexity)]
+pub fn run_layer_with_zeroed_pre_o_heads(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn FfnBackend,
+    heads: &[usize],
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post_attn, kv_out) = crate::attention::run_attention_block_zero_pre_o_heads(
+        weights, h, layer, heads, shared_kv,
+    )?;
+    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+        let slice = h_post_attn.as_slice().unwrap_or(&[]);
+        let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
+        let _ = std::fs::write(&path, &bytes);
+    }
+    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(weights, &mut h_out, layer);
+    Some((h_out, kv_out))
+}
+
 /// Run a single transformer layer, optionally capturing attention weights.
 ///
 /// Backwards-compatible wrapper: behaves identically to the pre-hook version

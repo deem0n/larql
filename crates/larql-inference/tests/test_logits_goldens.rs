@@ -148,6 +148,56 @@ const GOLDENS: &[Golden] = &[
         top5_token_ids: [5465, 264, 272, 5651, 624],
         top1_logit: 1.452387,
     },
+    // Q4_K down dense path — regression-tests the fused-down opt-in flip
+    // (`LARQL_FUSED_DOWN`). With the old default, the fused
+    // `q4k_geglu_gelu_tanh_down` kernel produced NaN at the prefill output
+    // and decoded into empty/garbage tokens. The separated path (now the
+    // default) goes through `geglu_dispatch + q4k_matvec` and produces
+    // valid logits.
+    Golden {
+        arch_name: "gemma3-4b-it (Q4_K down)",
+        vindex_name: "gemma3-4b-q4k-downq4k",
+        backend: "metal",
+        top5_token_ids: [250251, 256240, 256331, 120545, 123779],
+        top1_logit: 14667.831055,
+    },
+    Golden {
+        arch_name: "gemma3-4b-it (Q4_K down)",
+        vindex_name: "gemma3-4b-q4k-downq4k",
+        backend: "cpu",
+        top5_token_ids: [250251, 256240, 253044, 212287, 250492],
+        top1_logit: 14667.836914,
+    },
+    // Gemma 4 31B with Q6_K down — the variant the per-layer parity passed
+    // on, and the variant the chat-template rewrite + default system prompt
+    // get exercised through.
+    Golden {
+        arch_name: "gemma4-31b-it (Q6_K down)",
+        vindex_name: "gemma4-31b-q4k-q6kdown",
+        backend: "metal",
+        top5_token_ids: [497, 236762, 514, 237051, 236945],
+        top1_logit: 1.064088,
+    },
+    Golden {
+        arch_name: "gemma4-31b-it (Q6_K down)",
+        vindex_name: "gemma4-31b-q4k-q6kdown",
+        backend: "cpu",
+        top5_token_ids: [497, 524, 236762, 514, 237051],
+        top1_logit: 1.064089,
+    },
+    // Gemma 4 E2B — has Per-Layer Embeddings (PLE) which the Metal pipeline
+    // doesn't implement. The dispatcher in `generate_streaming` auto-routes
+    // PLE-using arches to the CPU dense Q4K path, which DOES apply PLE.
+    // CPU-only golden because the auto-routing means a `--metal` invocation
+    // ends up running CPU code anyway — testing Metal would just duplicate
+    // the CPU result.
+    Golden {
+        arch_name: "gemma4-e2b-it (PLE)",
+        vindex_name: "gemma4-e2b-q4k",
+        backend: "cpu",
+        top5_token_ids: [196228, 134673, 90239, 37373, 112144],
+        top1_logit: 10.414763,
+    },
 ];
 
 fn lookup_golden(vindex: &str, backend: &str) -> Option<&'static Golden> {
@@ -390,4 +440,28 @@ fn logits_golden_mistral_7b_metal() {
 #[test]
 fn logits_golden_mistral_7b_cpu() {
     run_cpu("mistral-7b-v0.1-q4k");
+}
+// Q4_K down variants — exercise the separated geglu + q4k_matvec path
+// after the fused-kernel default flip.
+#[test]
+fn logits_golden_gemma3_4b_q4k_down_metal() {
+    run_metal("gemma3-4b-q4k-downq4k");
+}
+#[test]
+fn logits_golden_gemma3_4b_q4k_down_cpu() {
+    run_cpu("gemma3-4b-q4k-downq4k");
+}
+// Gemma 4 31B Q6_K-down variant.
+#[test]
+fn logits_golden_gemma4_31b_q6kdown_metal() {
+    run_metal("gemma4-31b-q4k-q6kdown");
+}
+#[test]
+fn logits_golden_gemma4_31b_q6kdown_cpu() {
+    run_cpu("gemma4-31b-q4k-q6kdown");
+}
+// Gemma 4 E2B (PLE auto-routes to CPU even under `--metal`).
+#[test]
+fn logits_golden_gemma4_e2b_cpu() {
+    run_cpu("gemma4-e2b-q4k");
 }

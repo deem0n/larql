@@ -603,3 +603,27 @@ bottleneck.
 | Q4_K vs Q4_KF kernel routing fix in `quant_matvec::encode` | 2026-04-27 | Q4_K weights now dispatch the Q4_K kernel; `FusedQkvKernel` enum carries TG geometry |
 | `vindex::open_inference_vindex` strict loader | 2026-04-27 | Single entry point; propagates stride errors instead of silently degrading |
 | Demos switched to `open_inference_vindex` | 2026-04-27 | sampling/streaming/eos/chat now error loudly with rebuild guidance on stale vindexes |
+
+### 2026-04-30 — gRPC grid accuracy + dense Metal chat template + Gemma 4 model coverage
+
+End-to-end accuracy work across Gemma 4's three production variants (26B-A4B
+MoE via gRPC grid, 31B dense via Metal, E2B with PLE). Started from the gRPC
+grid producing semantically wrong text ("not specified in the text") and
+ended with all four Gemma 4 vindexes producing correct answers. Per-layer
+CPU vs Metal residual parity (cos ≥ 0.9999 across all 60 layers of the 31B)
+confirmed the inference math itself was always correct — every remaining
+gap was somewhere in the wrapping, sampling, or routing logic.
+
+| What | Date | Notes |
+|------|------|-------|
+| `grid.rs` uses `Detokenizer` + `EosConfig::from_vindex_dir` | 2026-04-30 | Was per-token decode losing SP `▁` leading-space + falling back to `<{id}>` for special tokens; output looked like "Thecapital of France is**not specified...**" |
+| Special-token suppression in grid `pick_next_filtered` | 2026-04-30 | Built from `tokenizer.get_added_tokens_decoder()` + structural-marker scan (`<unused…>`, HTML tags, `[multimodal]`). Top-K=256 fallback finds a real word when many candidates are markers. Q4_K quantisation noise was lifting `<mask>` (id 4) over the intended next word at the first answer position |
+| `chat::render_user_prompt` shared helper | 2026-04-30 | Centralises `LARQL_RAW_PROMPT` / `LARQL_THINKING` / `LARQL_SYSTEM` / `LARQL_NO_DEFAULT_SYSTEM` + auto Gemma 4 default system prompt. Used by both `run_with_moe_shards` (gRPC) and `walk_cmd::run_predict_q4k` (dense Metal) |
+| Built-in Gemma 4 fallback chat template | 2026-04-30 | Vindexes extracted before `chat_template.jinja` was snapshotted (early 31B and E2B) silently sent raw prompts and looped "The answer is:". `family_default_template("gemma4")` plugs the gap |
+| Dense Metal path now applies chat templates | 2026-04-30 | `walk_cmd::run_predict_q4k` was sending the raw user string to `encode_prompt`; the chat-template machinery only ran for gRPC. Both paths now go through `render_user_prompt` |
+| `lm_head_topk` falls back to backend GEMV when KNN is all-zero | 2026-04-30 | At the prefill→decode boundary the Metal `q4k_matvec` for lm_head occasionally returned 256/256 zero scores while h_1d was healthy (rms ≈ 4, max_abs ≈ 60). Detect + retry via `backend_lm_head_topk` recovers a non-zero distribution immediately |
+| PLE auto-route for Gemma 4 E2B | 2026-04-30 | E2B has `hidden_size_per_layer_input=256` (per-layer-input gate + projection + norm + global PLE embedding). The CPU dense path implements PLE; Metal does not. `generate_streaming` now checks `arch.has_per_layer_embeddings()` and delegates to `generate_via_cpu_q4k` for those models so the residual stream gets the per-layer per-position contribution. Without this E2B emitted multilingual gibberish; with it, "The capital of France is Paris" |
+| Diagnostic env vars: `LARQL_DEBUG_TOKEN_IDS`, `LARQL_DEBUG_TOPK` | 2026-04-30 | Per-step token-id + raw top-K scores in both `grid.rs` (gRPC) and `gpu.rs` (dense). Surfaced the "all logits == 0.000" smoking gun that localised the lm_head KNN bug |
+| `larql parity --component layer` extended to dense | 2026-04-30 | Was MoE-only (`LARQL_DUMP_RESIDUALS`). Now uses `LARQL_METAL_DUMP_LAYERS` for dense models — wrote per-layer `metal_layer_NN_h_out.f32` and CPU dump files. Gave us the cos ≥ 0.9999 confirmation across 60 layers that ruled out the inference math as the bug source |
+| `larql parity --component lm-head` works on dense | 2026-04-30 | Dropped the MoE-only gate for `lm-head` (Q4_K vs f32 reference is backend-agnostic) |
+| `test_logits_goldens.rs` compile fix + 5 new entries | 2026-04-30 | Added missing `None` for `predict_q4k_hidden`'s `Option<&RemoteMoeBackend>`; refreshed stale 5 goldens to match current kernel state; added `gemma3-4b-q4k-downq4k` (Q4_K-down regression test), `gemma4-31b-q4k-q6kdown` (Q6_K-down dense), `gemma4-e2b-q4k` (PLE auto-route) — 13/13 passing |

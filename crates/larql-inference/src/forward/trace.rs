@@ -3,8 +3,7 @@
 use super::embed::embed_tokens;
 use super::hooks::{LayerHook, NoopHook};
 use super::layer::{
-    apply_layer_scalar, run_attention, run_ffn, run_layer_with_capture,
-    run_layer_with_capture_hooked, run_layer_with_ffn,
+    apply_layer_scalar, run_attention, run_ffn, run_layer_with_capture_hooked, run_layer_with_ffn,
 };
 use super::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 use super::{LayerAttentionCapture, TraceResult};
@@ -595,7 +594,14 @@ mod tests {
         // since downstream layers see a zero residual entering them.
         let mut ablate = crate::forward::ZeroAblateHook::for_layers([0usize]);
         let result = trace_forward_full_hooked(
-            &weights, &tokens, &layers, false, 0, false, &ffn, &mut ablate,
+            &weights,
+            &tokens,
+            &layers,
+            false,
+            0,
+            false,
+            &ffn,
+            &mut ablate,
         );
 
         let layer0 = result
@@ -617,7 +623,14 @@ mod tests {
 
         let mut record = crate::forward::RecordHook::for_layers([0usize, 1]);
         let _ = trace_forward_full_hooked(
-            &weights, &tokens, &[0, 1], false, 0, false, &ffn, &mut record,
+            &weights,
+            &tokens,
+            &[0, 1],
+            false,
+            0,
+            false,
+            &ffn,
+            &mut record,
         );
 
         assert!(

@@ -3,14 +3,18 @@ use std::time::Instant;
 
 use clap::{Args, Subcommand};
 use larql_inference::attention::run_attention_block_with_pre_o;
+use larql_inference::attention::SharedKV;
 use larql_inference::forward::ple::precompute_per_layer_inputs;
-use larql_inference::forward::{embed_tokens_pub, run_layer_with_ffn};
-use larql_inference::{encode_prompt, WeightFfn};
+use larql_inference::forward::{
+    embed_tokens_pub, run_layer_with_ffn, run_layer_with_zeroed_pre_o_heads,
+};
+use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex,
 };
 use ndarray::{s, Array2};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Args)]
 pub struct OvRdArgs {
@@ -22,6 +26,9 @@ pub struct OvRdArgs {
 enum OvRdCommand {
     /// Capture pre-W_O OV output statistics from a Q4K vindex.
     Capture(CaptureArgs),
+
+    /// Gate 1: zero selected pre-W_O heads and measure final-logit KL.
+    ZeroAblate(ZeroAblateArgs),
 }
 
 #[derive(Args)]
@@ -49,6 +56,37 @@ struct CaptureArgs {
     /// Limit token positions per prompt for smoke runs.
     #[arg(long)]
     max_positions: Option<usize>,
+}
+
+#[derive(Args)]
+struct ZeroAblateArgs {
+    /// Self-contained Q4K vindex directory.
+    #[arg(long)]
+    index: PathBuf,
+
+    /// JSONL prompt file. Each line must include at least {"prompt": "..."}.
+    #[arg(long)]
+    prompts: PathBuf,
+
+    /// Output directory.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Explicit heads as layer:head comma list, e.g. 11:3,11:0,0:4.
+    #[arg(long)]
+    heads: Option<String>,
+
+    /// Stage-0 stats JSON. Used with --top-heads when --heads is absent.
+    #[arg(long)]
+    stage0: Option<PathBuf>,
+
+    /// Number of highest-variance Stage-0 heads to test.
+    #[arg(long, default_value_t = 8)]
+    top_heads: usize,
+
+    /// Limit prompts for bounded gate runs.
+    #[arg(long)]
+    max_prompts: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,7 +154,7 @@ impl RunningHeadStats {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct FinishedHeadStats {
     count: u64,
     mean_norm_sq: f64,
@@ -125,7 +163,7 @@ struct FinishedHeadStats {
     rms_norm: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct HeadReport {
     layer: usize,
     head: usize,
@@ -133,7 +171,7 @@ struct HeadReport {
     stats: FinishedHeadStats,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CaptureReport {
     index: String,
     prompt_file: String,
@@ -143,9 +181,94 @@ struct CaptureReport {
     heads: Vec<HeadReport>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct HeadId {
+    layer: usize,
+    head: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ZeroStratumReport {
+    stratum: String,
+    prompts: usize,
+    mean_kl: f64,
+    max_kl: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct ZeroHeadReport {
+    layer: usize,
+    head: usize,
+    prompts: usize,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    strata: Vec<ZeroStratumReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ZeroAblationReport {
+    index: String,
+    prompt_file: String,
+    prompts_seen: usize,
+    selected_heads: Vec<HeadId>,
+    heads: Vec<ZeroHeadReport>,
+}
+
+#[derive(Debug)]
+struct ZeroHeadAccumulator {
+    values: Vec<f64>,
+    by_stratum: HashMap<String, Vec<f64>>,
+}
+
+impl ZeroHeadAccumulator {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            by_stratum: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, stratum: &str, kl: f64) {
+        self.values.push(kl);
+        self.by_stratum
+            .entry(stratum.to_string())
+            .or_default()
+            .push(kl);
+    }
+
+    fn finish(self, head: HeadId) -> ZeroHeadReport {
+        let prompts = self.values.len();
+        let mean_kl = mean(&self.values);
+        let p95_kl = percentile(self.values.clone(), 0.95);
+        let max_kl = self.values.iter().copied().fold(0.0, f64::max);
+        let mut strata: Vec<_> = self
+            .by_stratum
+            .into_iter()
+            .map(|(stratum, values)| ZeroStratumReport {
+                stratum,
+                prompts: values.len(),
+                mean_kl: mean(&values),
+                max_kl: values.iter().copied().fold(0.0, f64::max),
+            })
+            .collect();
+        strata.sort_by(|a, b| a.stratum.cmp(&b.stratum));
+        ZeroHeadReport {
+            layer: head.layer,
+            head: head.head,
+            prompts,
+            mean_kl,
+            p95_kl,
+            max_kl,
+            strata,
+        }
+    }
+}
+
 pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         OvRdCommand::Capture(capture) => run_capture(capture),
+        OvRdCommand::ZeroAblate(zero) => run_zero_ablate(zero),
     }
 }
 
@@ -269,6 +392,95 @@ fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_zero_ablate(args: ZeroAblateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&args.out)?;
+
+    eprintln!("Loading vindex: {}", args.index.display());
+    let start = Instant::now();
+    let mut cb = SilentLoadCallbacks;
+    let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
+    index.load_attn_q4k(&args.index)?;
+    index.load_interleaved_q4k(&args.index)?;
+    let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
+    let tokenizer = load_vindex_tokenizer(&args.index)?;
+    if weights.arch.is_hybrid_moe() {
+        return Err("ov-rd zero-ablate currently supports dense FFN vindexes only".into());
+    }
+    eprintln!(
+        "  {} layers, hidden_size={}, q_heads={}, head_dim={} ({:.1}s)",
+        weights.num_layers,
+        weights.hidden_size,
+        weights.num_q_heads,
+        weights.head_dim,
+        start.elapsed().as_secs_f64()
+    );
+
+    let selected_heads = select_zero_ablation_heads(&args)?;
+    if selected_heads.is_empty() {
+        return Err("no heads selected for zero-ablation".into());
+    }
+    eprintln!("Selected heads: {:?}", selected_heads);
+
+    let prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    eprintln!("Prompts: {}", prompts.len());
+
+    let mut accumulators: Vec<ZeroHeadAccumulator> = selected_heads
+        .iter()
+        .map(|_| ZeroHeadAccumulator::new())
+        .collect();
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+
+        let token_ids = encode_prompt(&tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+
+        let baseline_hidden =
+            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+        let baseline_logits = final_logits(&weights, &baseline_hidden);
+        let baseline_logp = log_softmax(&baseline_logits);
+
+        for (idx, head) in selected_heads.iter().copied().enumerate() {
+            let ablated_hidden =
+                forward_q4k_zero_pre_o_head(&mut weights, &token_ids, &index, head)?;
+            let ablated_logits = final_logits(&weights, &ablated_hidden);
+            let ablated_logp = log_softmax(&ablated_logits);
+            let kl = kl_logp(&baseline_logp, &ablated_logp);
+            accumulators[idx].add(stratum, kl);
+        }
+    }
+
+    let head_reports = selected_heads
+        .iter()
+        .copied()
+        .zip(accumulators)
+        .map(|(head, acc)| acc.finish(head))
+        .collect();
+
+    let report = ZeroAblationReport {
+        index: args.index.display().to_string(),
+        prompt_file: args.prompts.display().to_string(),
+        prompts_seen: prompts.len(),
+        selected_heads,
+        heads: head_reports,
+    };
+
+    let out_path = args.out.join("gate1_zero_ablation.json");
+    let file = std::fs::File::create(&out_path)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    eprintln!("Wrote {}", out_path.display());
+
+    Ok(())
+}
+
 fn add_pre_o_stats(
     stats: &mut [RunningHeadStats],
     pre_o: &Array2<f32>,
@@ -308,6 +520,168 @@ fn load_prompts(
         }
     }
     Ok(prompts)
+}
+
+fn select_zero_ablation_heads(
+    args: &ZeroAblateArgs,
+) -> Result<Vec<HeadId>, Box<dyn std::error::Error>> {
+    let mut heads = if let Some(spec) = &args.heads {
+        parse_head_spec(spec)?
+    } else {
+        let stage0_path = args
+            .stage0
+            .as_ref()
+            .ok_or("--heads or --stage0 must be provided")?;
+        let file = std::fs::File::open(stage0_path)?;
+        let report: CaptureReport = serde_json::from_reader(file)?;
+        let mut candidates = report.heads;
+        candidates.sort_by(|a, b| {
+            b.stats
+                .variance
+                .partial_cmp(&a.stats.variance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates
+            .into_iter()
+            .take(args.top_heads)
+            .map(|h| HeadId {
+                layer: h.layer,
+                head: h.head,
+            })
+            .collect()
+    };
+
+    heads.sort_by_key(|h| (h.layer, h.head));
+    heads.dedup();
+    Ok(heads)
+}
+
+fn parse_head_spec(spec: &str) -> Result<Vec<HeadId>, Box<dyn std::error::Error>> {
+    let mut heads = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (layer, head) = part
+            .split_once(':')
+            .ok_or_else(|| format!("invalid head spec '{part}', expected layer:head"))?;
+        heads.push(HeadId {
+            layer: layer.parse()?,
+            head: head.parse()?,
+        });
+    }
+    Ok(heads)
+}
+
+fn forward_q4k_zero_pre_o_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                run_layer_with_zeroed_pre_o_heads(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    &[head.head],
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, kv_out)| (h_new, kv_out))
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} while ablating L{} H{}",
+                head.layer, head.head
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(h)
+}
+
+fn final_logits(weights: &larql_inference::ModelWeights, h: &Array2<f32>) -> Vec<f32> {
+    let last = h.nrows().saturating_sub(1);
+    let h_last = h.slice(s![last..last + 1, ..]).to_owned();
+    hidden_to_raw_logits(weights, &h_last)
+}
+
+fn log_softmax(logits: &[f32]) -> Vec<f64> {
+    let max_logit = logits
+        .iter()
+        .map(|&v| v as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let sum_exp = logits
+        .iter()
+        .map(|&v| ((v as f64) - max_logit).exp())
+        .sum::<f64>();
+    let log_z = max_logit + sum_exp.ln();
+    logits.iter().map(|&v| (v as f64) - log_z).collect()
+}
+
+fn kl_logp(p_logp: &[f64], q_logp: &[f64]) -> f64 {
+    p_logp
+        .iter()
+        .zip(q_logp.iter())
+        .map(|(&lp, &lq)| {
+            let p = lp.exp();
+            p * (lp - lq)
+        })
+        .sum()
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = ((values.len() - 1) as f64 * p).ceil() as usize;
+    values[rank.min(values.len() - 1)]
 }
 
 fn insert_q4k_layer_tensors(

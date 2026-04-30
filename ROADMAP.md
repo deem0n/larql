@@ -14,6 +14,7 @@ This file tracks the demo narrative, the critical path, and cross-crate sequenci
 | [larql-server](crates/larql-server/ROADMAP.md) | HTTP API, gRPC grid, remote expert protocol |
 | [larql-cli](crates/larql-cli/ROADMAP.md) | CLI UX, sampling flags, streaming display |
 | [larql-lql](crates/larql-lql/ROADMAP.md) | LQL grammar, INSERT/SELECT/USE extensions |
+| [larql-core](crates/larql-core/ROADMAP.md) | Graph data model, algorithms, serialization |
 | [larql-vindex](crates/larql-vindex/ROADMAP.md) | Vindex format, storage, extraction |
 | [larql-models](crates/larql-models/ROADMAP.md) | Architecture definitions, model loading |
 

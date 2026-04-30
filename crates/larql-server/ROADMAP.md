@@ -551,6 +551,22 @@ automatically (`weights.has_per_layer_ffn()`); legacy BF16 vindexes still work
 unchanged. Future MoE vindexes only emit per-layer files — the q4k extractor
 at `format/weights/write_q4k/mod.rs` already does this.
 
+### 2026-04-30 — gRPC grid: end-to-end accuracy
+
+The grid produced semantically wrong text on Gemma 4 26B-A4B-it ("The capital
+of France is **not specified in the text**…") despite each shard correctly
+running its expert FFN. Root cause was on the **client** side
+(`larql-inference::layer_graph::grid`) — chat-template handling, detokeniser,
+EOS detection, and special-token suppression — not the shard server. The
+server work here was confirming the contract: shards return correct expert
+outputs given the right top-K input. Documenting for future grid changes.
+
+| Item | Notes |
+|------|-------|
+| Server shards verified correct | A 2-shard split (experts 0-63 on `:9081`, 64-127 on `:9082`) running against the unit manifest serves expert outputs that, when combined client-side with the proper detokenisation + EOS + special-token suppression + default system prompt, produce "**Paris**" as the answer |
+| Shard contract: per-(layer, expert) ownership via `--units` | The `parse_unit_manifest` path is what the client's `--moe-units-manifest` resolves against; ownership is the strict source of truth and `forward_moe_seq` rejects layers/experts not owned by any shard |
+| Decode throughput (loopback, M3 Max) | 2.3 tok/s end-to-end on the 26B-A4B with two shards in the same process — expected to climb meaningfully when shards run on separate hosts (less GPU contention with the client) |
+
 ### 2026-04-26 — examples, synthetic benchmark, grid checks
 
 | Item | Outcome |

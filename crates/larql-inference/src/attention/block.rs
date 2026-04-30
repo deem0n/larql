@@ -6,7 +6,7 @@
 use super::gqa::gqa_attention_with_weights;
 use super::rope::apply_rope_partial;
 use super::{AttentionWeights, SharedKV};
-use ndarray::Array2;
+use ndarray::{s, Array2};
 
 /// Run the full attention block. Returns (h_post_attn, attn_projected, optional_weights).
 #[allow(clippy::too_many_arguments)]
@@ -36,7 +36,7 @@ pub fn run_attention_block_with_kv_out(
     Array2<f32>,
 )> {
     let (h_post, attn_proj, attn_w, k, v, _pre_o) =
-        run_attention_block_core(weights, h, layer, capture_attention, shared_kv)?;
+        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None)?;
     Some((h_post, attn_proj, attn_w, k, v))
 }
 
@@ -50,7 +50,7 @@ pub fn run_attention_block_shared(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>)> {
     let (h_post, attn_proj, attn_w, _, _, _) =
-        run_attention_block_core(weights, h, layer, capture_attention, shared_kv)?;
+        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None)?;
     Some((h_post, attn_proj, attn_w))
 }
 
@@ -62,8 +62,30 @@ pub fn run_attention_block_with_pre_o(
     h: &Array2<f32>,
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
-    let (h_post, _, _, _, _, pre_o) = run_attention_block_core(weights, h, layer, false, None)?;
+    let (h_post, _, _, _, _, pre_o) =
+        run_attention_block_core(weights, h, layer, false, None, None)?;
     Some((h_post, pre_o))
+}
+
+/// Run attention while zeroing selected pre-O-projection query heads before W_O.
+///
+/// Returns the post-attention residual and, when K/V were computed by this call,
+/// the K/V pair for cross-layer sharing.
+pub fn run_attention_block_zero_pre_o_heads(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    heads: &[usize],
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post, _, _, k_rope, v_final, _) =
+        run_attention_block_core(weights, h, layer, false, shared_kv, Some(heads))?;
+    let kv_out = if shared_kv.is_none() {
+        Some((k_rope, v_final))
+    } else {
+        None
+    };
+    Some((h_post, kv_out))
 }
 
 /// Core attention block implementation.
@@ -75,6 +97,7 @@ fn run_attention_block_core(
     layer: usize,
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
+    zero_pre_o_heads: Option<&[usize]>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -222,7 +245,7 @@ fn run_attention_block_core(
 
     // GQA attention
     let softcap = arch.attn_logit_softcapping();
-    let (attn_out, attn_weights) = gqa_attention_with_weights(
+    let (mut attn_out, attn_weights) = gqa_attention_with_weights(
         &q_rope,
         &k_rope,
         &v_final,
@@ -234,6 +257,16 @@ fn run_attention_block_core(
         capture_attention,
         softcap,
     );
+    if let Some(heads) = zero_pre_o_heads {
+        for &head in heads {
+            if head >= num_q {
+                return None;
+            }
+            let start = head * head_dim;
+            let end = start + head_dim;
+            attn_out.slice_mut(s![.., start..end]).fill(0.0);
+        }
+    }
     dump_f32("attn_out", &attn_out);
 
     // O projection
