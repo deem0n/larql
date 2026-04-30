@@ -21,6 +21,10 @@ engine.
 - LLM extraction utilities are provider-agnostic through `ModelProvider`,
   `TemplateRegistry`, `chain_tokens`, and BFS extraction.
 - Baseline verification: `cargo test -p larql-core` passes.
+- Current coverage: 89.49% line coverage with default features; 92.15% line
+  coverage with `--no-default-features --features msgpack`.
+- Current release benchmark snapshot is recorded in `README.md` from
+  `cargo run --release -p larql-core --example bench_graph`.
 
 ---
 
@@ -72,7 +76,7 @@ regressions now covered by tests.
 | Memory-efficient string storage | `core::graph` | Edges and indexes clone strings heavily. Consider optional string interning for large graphs while preserving ergonomic `String` APIs. |
 | Streaming readers/writers | `io` | JSON and packed paths operate on whole buffers. Add streaming load/save where format allows, especially for checkpoint compaction and large interchange files. |
 | Packed format versioning plan | `io::packed` | Add explicit flags handling, forward-compatible unknown flag rejection, metadata/injection section lengths, and upgrade tests before `.larql.pak` becomes a durable format. |
-| Bench regression harness | `examples`, benches | Turn README benchmark claims into repeatable `cargo bench` or example-driven measurements with fixed graph generators. |
+| Bench regression harness | `examples`, benches | Partially done: README claims are backed by `bench_graph` release output with fixed generators. Still open: convert this into a proper `cargo bench` regression harness. |
 
 ---
 

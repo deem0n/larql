@@ -649,4 +649,74 @@ mod tests {
         let pre1 = record.pre_layer.get(&1).unwrap();
         assert_eq!(pre1.shape(), &[tokens.len(), weights.hidden_size]);
     }
+
+    #[test]
+    fn hooked_trace_fires_attention_weights_callback() {
+        // on_attention_weights only fires when capture_attention=true on
+        // a layer the trace was asked about.
+        let weights = shared_weights();
+        let ffn = WeightFfn { weights };
+        let tokens = vec![0u32, 1, 2];
+
+        let mut record = crate::forward::RecordHook::for_layers([0usize]);
+        let _ = trace_forward_full_hooked(
+            &weights,
+            &tokens,
+            &[0],
+            /*capture_activations=*/ false,
+            0,
+            /*capture_attention=*/ true,
+            &ffn,
+            &mut record,
+        );
+
+        let attn = record
+            .attention_weights
+            .get(&0)
+            .expect("attention weights captured at layer 0");
+        // Per-head: heads.len() = num_q_heads, each row has one entry per
+        // attended position (last token attends to all 3 positions).
+        assert_eq!(
+            attn.len(),
+            weights.num_q_heads,
+            "attention head count should equal num_q_heads"
+        );
+        for head in attn {
+            assert_eq!(
+                head.len(),
+                tokens.len(),
+                "each head row attends across all token positions"
+            );
+            assert!(head.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn hooked_trace_fires_ffn_activation_callback() {
+        // on_ffn_activation only fires when capture_activations=true on
+        // a layer the trace was asked about.
+        let weights = shared_weights();
+        let ffn = WeightFfn { weights };
+        let tokens = vec![0u32, 1];
+
+        let mut record = crate::forward::RecordHook::for_layers([0usize]);
+        let _ = trace_forward_full_hooked(
+            &weights,
+            &tokens,
+            &[0],
+            /*capture_activations=*/ true,
+            0,
+            /*capture_attention=*/ false,
+            &ffn,
+            &mut record,
+        );
+
+        let act = record
+            .ffn_activation
+            .get(&0)
+            .expect("FFN activation captured at layer 0");
+        // Shape: (seq_len, ffn_dim).
+        assert_eq!(act.shape(), &[tokens.len(), weights.intermediate_size]);
+        assert!(act.iter().all(|v| v.is_finite()));
+    }
 }

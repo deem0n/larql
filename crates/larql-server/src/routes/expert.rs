@@ -491,6 +491,44 @@ pub fn run_experts_metal_batch(
     // experts where the mmap lookup itself failed (we just skipped them).
     let _ = get_expert_bytes;
 
+    // LARQL_METAL_VS_CPU_DEBUG=1 — recompute via CPU and print element-wise
+    // max diff. Used to localise the metal-experts accuracy bug. Slow
+    // (every layer × every token does both paths), so opt-in only.
+    if std::env::var("LARQL_METAL_VS_CPU_DEBUG").is_ok() {
+        // Run the same K experts via the CPU pooled path against the same
+        // residual + weights so we get a direct apples-to-apples diff.
+        match run_experts_cpu_batch(state, layer, h_post_attn, expert_ids, expert_weights) {
+            Ok(cpu_out) => {
+                let max_abs_diff = result
+                    .iter()
+                    .zip(cpu_out.iter())
+                    .fold(0.0f32, |acc, (m, c)| acc.max((m - c).abs()));
+                let metal_norm =
+                    (result.iter().map(|v| v * v).sum::<f32>() / hidden as f32).sqrt();
+                let cpu_norm =
+                    (cpu_out.iter().map(|v| v * v).sum::<f32>() / hidden as f32).sqrt();
+                let cos = {
+                    let dot: f32 = result.iter().zip(cpu_out.iter()).map(|(a, b)| a * b).sum();
+                    let na: f32 = result.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let nb: f32 = cpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    if na > 0.0 && nb > 0.0 {
+                        dot / (na * nb)
+                    } else {
+                        f32::NAN
+                    }
+                };
+                eprintln!(
+                    "[metal-vs-cpu] L{layer:02} K={} max|Δ|={max_abs_diff:.4e} \
+                     |metal|={metal_norm:.4} |cpu|={cpu_norm:.4} cos={cos:.6}",
+                    expert_ids.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("[metal-vs-cpu] L{layer:02} cpu reference failed: {e}");
+            }
+        }
+    }
+
     if timing_enabled {
         eprintln!(
             "[expert_metal_batch] layer={layer} experts={} state={:.2}ms norm={:.2}ms \

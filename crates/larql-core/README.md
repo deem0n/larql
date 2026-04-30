@@ -139,22 +139,25 @@ cargo run -p larql-core --example graph_demo              # Feature showcase
 cargo run -p larql-core --example algorithm_demo          # Algorithm examples
 ```
 
-### Benchmarks (100K edges, M3 Max)
+### Benchmarks (100K edges, release build)
 
 | Operation | Latency |
 |-----------|---------|
-| Insert (100K edges) | 152ms (1.5us/edge) |
+| Insert (100K edges) | 141ms (1.4us/edge) |
 | select(entity, relation) | 0.1us |
 | exists(s, r, o) | 0.1us |
-| search(keyword, 10) | 0.5us |
-| shortest_path (1K nodes) | 14us |
-| connected_components (1K nodes) | 478us |
+| search(keyword, 10) | 0.6us |
+| shortest_path (1K nodes) | 18us |
+| connected_components (1K nodes) | 495us |
 | are_connected (1K nodes) | 14us |
-| walk_all_paths (3 hops) | 1.1us |
-| bfs_traversal (depth=5) | 11us |
-| pagerank (1K nodes) | 12ms |
-| filter (100K, confidence) | 56ms |
-| Packed binary serialize (100K) | 22ms |
+| walk_all_paths (3 hops) | 1.3us |
+| bfs_traversal (depth=5) | 11.5us |
+| pagerank (1K nodes) | 12.5ms |
+| filter (100K, confidence) | 55ms |
+| JSON serialize / deserialize (100K) | 153ms / 351ms |
+| MsgPack serialize / deserialize (100K) | 143ms / 350ms |
+| Packed binary serialize / deserialize (100K) | 26ms / 267ms |
+| stats (100K edges) | 72ms |
 
 ### Test Coverage (176 tests)
 
