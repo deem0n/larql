@@ -130,6 +130,8 @@ impl Session {
                                 layer: *layer,
                                 feature: feat,
                                 gate_vector_b64: None,
+                                up_vector_b64: None,
+                                down_vector_b64: None,
                                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                                     top_token: b.top_token.clone(),
                                     top_token_id: b.top_token_id,
@@ -153,6 +155,8 @@ impl Session {
                                 target: b.top_token.clone(),
                                 confidence: Some(b.c_score),
                                 gate_vector_b64: None,
+                                up_vector_b64: None,
+                                down_vector_b64: None,
                                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                                     top_token: b.top_token.clone(),
                                     top_token_id: b.top_token_id,

@@ -306,6 +306,8 @@ fn main() {
                 gate_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
                     0.0, 0.0, 0.0, 10.0,
                 ])),
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "headache".into(),
                     top_token_id: 200,
@@ -686,6 +688,7 @@ fn make_config(
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     }
 }
 

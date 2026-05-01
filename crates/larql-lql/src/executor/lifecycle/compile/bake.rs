@@ -520,6 +520,8 @@ mod tests {
             down_top_k: 10,
             has_model_weights: true,
             model_config: None,
+            fp4: None,
+            ffn_layout: None,
         }
     }
 

@@ -50,6 +50,8 @@ impl PatchedVindex {
                     target,
                     confidence,
                     gate_vector_b64,
+                    up_vector_b64,
+                    down_vector_b64,
                     down_meta,
                     ..
                 } => {
@@ -79,9 +81,21 @@ impl PatchedVindex {
                             self.overrides_gate.insert(key, vec);
                         }
                     }
+                    if let Some(b64) = up_vector_b64 {
+                        if let Ok(vec) = decode_gate_vector(b64) {
+                            self.base.set_up_vector(key.0, key.1, vec);
+                        }
+                    }
+                    if let Some(b64) = down_vector_b64 {
+                        if let Ok(vec) = decode_gate_vector(b64) {
+                            self.base.set_down_vector(key.0, key.1, vec);
+                        }
+                    }
                 }
                 PatchOp::Update {
                     gate_vector_b64,
+                    up_vector_b64,
+                    down_vector_b64,
                     down_meta,
                     ..
                 } => {
@@ -101,6 +115,16 @@ impl PatchedVindex {
                     if let Some(b64) = gate_vector_b64 {
                         if let Ok(vec) = decode_gate_vector(b64) {
                             self.overrides_gate.insert(key, vec);
+                        }
+                    }
+                    if let Some(b64) = up_vector_b64 {
+                        if let Ok(vec) = decode_gate_vector(b64) {
+                            self.base.set_up_vector(key.0, key.1, vec);
+                        }
+                    }
+                    if let Some(b64) = down_vector_b64 {
+                        if let Ok(vec) = decode_gate_vector(b64) {
+                            self.base.set_down_vector(key.0, key.1, vec);
                         }
                     }
                 }
@@ -172,6 +196,8 @@ mod tests {
             target: "Paris".into(),
             confidence: Some(0.9),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         pv.apply_patch(patch);
@@ -191,6 +217,8 @@ mod tests {
             target: "Berlin".into(),
             confidence: Some(0.8),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(PatchDownMeta {
                 top_token: "Berlin".into(),
                 top_token_id: 42,
@@ -217,6 +245,8 @@ mod tests {
             target: "Madrid".into(),
             confidence: None,
             gate_vector_b64: Some(b64),
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         pv.apply_patch(patch);
@@ -224,6 +254,35 @@ mod tests {
         let stored = &pv.overrides_gate[&(3, 7)];
         assert_eq!(stored.len(), 3);
         assert_eq!(stored[0].to_bits(), 1.0f32.to_bits());
+    }
+
+    #[test]
+    fn apply_insert_with_up_and_down_vectors_populates_base_overrides() {
+        // Compose-mode INSERT writes gate + up + down overrides; the .vlp
+        // must round-trip all three. Without up_vector_b64 /
+        // down_vector_b64 in the patch, re-applying the file (e.g. on
+        // `larql apply` after a save) would lose up + down and
+        // `COMPILE INTO VINDEX` would bake nothing.
+        let mut pv = empty_pv();
+        let gate = vec![1.0f32, 2.0, 3.0];
+        let up = vec![0.1f32, 0.2, 0.3];
+        let down = vec![-0.5f32, 0.0, 0.5];
+        let patch = make_patch(vec![PatchOp::Insert {
+            layer: 4,
+            feature: 9,
+            relation: Some("capital".into()),
+            entity: "France".into(),
+            target: "Paris".into(),
+            confidence: Some(0.9),
+            gate_vector_b64: Some(encode_gate_vector(&gate)),
+            up_vector_b64: Some(encode_gate_vector(&up)),
+            down_vector_b64: Some(encode_gate_vector(&down)),
+            down_meta: None,
+        }]);
+        pv.apply_patch(patch);
+        assert_eq!(pv.overrides_gate_at(4, 9), Some(gate.as_slice()));
+        assert_eq!(pv.up_override_at(4, 9), Some(up.as_slice()));
+        assert_eq!(pv.down_override_at(4, 9), Some(down.as_slice()));
     }
 
     #[test]
@@ -252,6 +311,8 @@ mod tests {
             target: "B".into(),
             confidence: None,
             gate_vector_b64: Some(b64),
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         pv.apply_patch(insert_patch);
@@ -274,6 +335,8 @@ mod tests {
             layer: 0,
             feature: 2,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(PatchDownMeta {
                 top_token: "updated".into(),
                 top_token_id: 99,
@@ -298,6 +361,8 @@ mod tests {
             target: "Y".into(),
             confidence: Some(0.5),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         let p2 = make_patch(vec![PatchOp::Insert {
@@ -308,6 +373,8 @@ mod tests {
             target: "B".into(),
             confidence: Some(0.9),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         pv.apply_patch(p1);
@@ -328,6 +395,8 @@ mod tests {
             target: "first".into(),
             confidence: None,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         let p2 = make_patch(vec![PatchOp::Insert {
@@ -338,6 +407,8 @@ mod tests {
             target: "second".into(),
             confidence: None,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }]);
         pv.apply_patch(p1);

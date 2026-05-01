@@ -635,6 +635,8 @@ fn make_test_vindex_dir(tag: &str) -> std::path::PathBuf {
         down_top_k: 5,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 
@@ -971,6 +973,8 @@ fn compile_on_conflict_fail_detects_collision() {
                 target: "t".into(),
                 confidence: Some(0.9),
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             }],
         };
@@ -1019,6 +1023,8 @@ fn compile_on_conflict_last_wins_succeeds() {
                 target: "t".into(),
                 confidence: Some(0.9),
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             }],
         };
@@ -1053,6 +1059,8 @@ fn memit_facts_count_inserts_only() {
             target: "Y".into(),
             confidence: Some(0.9),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         },
         PatchOp::Delete {
@@ -1064,6 +1072,8 @@ fn memit_facts_count_inserts_only() {
             layer: 0,
             feature: 2,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         },
     ];
@@ -1094,6 +1104,8 @@ fn memit_facts_deduplicate_across_patches() {
             target: "Paris".into(),
             confidence: Some(conf),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }],
     };

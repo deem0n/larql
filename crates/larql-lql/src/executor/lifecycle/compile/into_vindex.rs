@@ -434,6 +434,8 @@ mod tests {
             target: "t".into(),
             confidence: Some(0.9),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }
     }

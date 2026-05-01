@@ -28,7 +28,7 @@ fn process_batch_item(
 ) -> Result<ExpertBatchResult, Status> {
     let layer = item.layer as usize;
     let expert_id = item.expert_id as usize;
-    if item.residual.len() % 4 != 0 {
+    if !item.residual.len().is_multiple_of(4) {
         return Err(Status::invalid_argument("residual not 4-byte aligned"));
     }
     let residual: Vec<f32> = item
@@ -147,17 +147,19 @@ impl ExpertService for ExpertGrpcService {
             while let Some(msg) = in_stream.next().await {
                 let input = msg?;
                 let layer = input.layer as usize;
-                if input.residual.len() % 4 != 0 {
+                if !input.residual.len().is_multiple_of(4) {
                     Err(Status::invalid_argument("residual not 4-byte aligned"))?;
                 }
                 let residual: Vec<f32> = input.residual.chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                     .collect();
-                let post_norm: Vec<f32> = input.post_experts_norm.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
-                let norm_offset = input.norm_offset;
-                let eps = input.eps;
+                // post_experts_norm / norm_offset / eps are reserved for a
+                // future server-side post-norm path; ignored today (the
+                // client applies post-experts norm itself in
+                // `RemoteMoeBackend::forward_moe_stream_collect`).  Keep
+                // the wire fields in `ExpertLayerInput` for forward-compat;
+                // discard them here.
+                let _ = (&input.post_experts_norm, input.norm_offset, input.eps);
                 let expert_ids: Vec<usize> =
                     input.expert_ids.iter().map(|&e| e as usize).collect();
                 let expert_weights: Vec<f32> = input.expert_weights.clone();
@@ -171,7 +173,7 @@ impl ExpertService for ExpertGrpcService {
                 // experts to GPU as one MoE call (q4k_ffn_gate_up + GELU +
                 // K × q4k_matvec).  Falls through to the per-expert rayon
                 // CPU path otherwise — preserves identical wire output.
-                let mut path_used = "cpu";
+                let path_used: &str;
                 #[cfg(feature = "metal-experts")]
                 let metal_h2 = tokio::task::block_in_place(|| -> Result<Option<Vec<f32>>, Status> {
                     crate::routes::expert::run_experts_metal_batch(

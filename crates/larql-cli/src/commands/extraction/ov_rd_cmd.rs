@@ -262,6 +262,23 @@ struct OraclePqArgs {
     #[arg(long)]
     mode_d_check: bool,
 
+    /// Fit and evaluate graph-native discrete address probes.
+    ///
+    /// The probes use only prompt metadata and token ids, not residual vectors.
+    /// Requires --mode-d-check because predicted addresses are evaluated through
+    /// the materialized residual-space tables.
+    #[arg(long)]
+    address_probes: bool,
+
+    /// Evaluate how sensitive Mode D is to address corruption.
+    ///
+    /// This keeps a prefix of oracle PQ groups and replaces the rest with
+    /// per-group majority codes learned from the training split. It estimates
+    /// how many groups must be addressed correctly before predicted addressing
+    /// can pass the KL gate.
+    #[arg(long)]
+    address_corruption_sweep: bool,
+
     /// Limit prompts for bounded oracle runs.
     #[arg(long)]
     max_prompts: Option<usize>,
@@ -748,6 +765,8 @@ struct OraclePqReport {
     sigma_rel_cutoff: f64,
     pq_iters: usize,
     mode_d_check: bool,
+    address_probes: bool,
+    address_corruption_sweep: bool,
     selected_heads: Vec<HeadId>,
     heads: Vec<OraclePqHeadReport>,
 }
@@ -795,9 +814,59 @@ struct OraclePqPointReport {
     mode_d_top5_contains_baseline_top1: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coeff_mode_d_max_abs_logit_diff: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    address_probes: Vec<AddressProbeReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    address_corruption_sweep: Vec<AddressCorruptionReport>,
     mean_pre_wo_l2: f64,
     mean_wo_visible_l2: f64,
     per_prompt: Vec<OraclePqPromptReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct AddressProbeReport {
+    name: String,
+    prompts: usize,
+    positions: usize,
+    group_accuracy: f64,
+    exact_address_accuracy: f64,
+    mean_groups_correct_per_sequence: f64,
+    mean_groups_correct_per_position: f64,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+    worst_examples: Vec<AddressProbePromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AddressProbePromptReport {
+    id: String,
+    stratum: String,
+    kl: f64,
+    positions: usize,
+    groups_correct: usize,
+    groups_total: usize,
+    exact_address_match: bool,
+    top1_agree: bool,
+    baseline_top1_in_predicted_top5: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AddressCorruptionReport {
+    label: String,
+    oracle_groups_kept: usize,
+    prompts: usize,
+    positions: usize,
+    group_accuracy: f64,
+    exact_address_accuracy: f64,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+    worst_examples: Vec<AddressProbePromptReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -834,17 +903,41 @@ struct OraclePqPromptReport {
 #[derive(Debug)]
 struct OraclePqPointAccumulator {
     prompts: Vec<OraclePqPromptReport>,
+    address_probe_accumulators: HashMap<String, AddressProbeAccumulator>,
+    address_corruption_accumulators: HashMap<usize, AddressProbeAccumulator>,
 }
 
 impl OraclePqPointAccumulator {
     fn new() -> Self {
         Self {
             prompts: Vec::new(),
+            address_probe_accumulators: HashMap::new(),
+            address_corruption_accumulators: HashMap::new(),
         }
     }
 
     fn add(&mut self, prompt: OraclePqPromptReport) {
         self.prompts.push(prompt);
+    }
+
+    fn add_address_probe(&mut self, name: &str, prompt: AddressProbePromptReport) {
+        self.address_probe_accumulators
+            .entry(name.to_string())
+            .or_insert_with(|| AddressProbeAccumulator::new(name))
+            .add(prompt);
+    }
+
+    fn add_address_corruption(
+        &mut self,
+        oracle_groups_kept: usize,
+        prompt: AddressProbePromptReport,
+    ) {
+        self.address_corruption_accumulators
+            .entry(oracle_groups_kept)
+            .or_insert_with(|| {
+                AddressProbeAccumulator::new(&format!("oracle_groups_kept_{oracle_groups_kept}"))
+            })
+            .add(prompt);
     }
 
     fn finish(self, config: PqConfig, hidden_dim: usize) -> OraclePqPointReport {
@@ -942,6 +1035,16 @@ impl OraclePqPointAccumulator {
             } else {
                 Some(coeff_mode_d_diffs.iter().copied().fold(0.0, f64::max))
             },
+            address_probes: self
+                .address_probe_accumulators
+                .into_values()
+                .map(|acc| acc.finish())
+                .collect(),
+            address_corruption_sweep: self
+                .address_corruption_accumulators
+                .into_iter()
+                .map(|(oracle_groups_kept, acc)| acc.finish_corruption(oracle_groups_kept))
+                .collect(),
             mean_pre_wo_l2: mean(&self.prompts.iter().map(|p| p.pre_wo_l2).collect::<Vec<_>>()),
             mean_wo_visible_l2: mean(
                 &self
@@ -951,6 +1054,96 @@ impl OraclePqPointAccumulator {
                     .collect::<Vec<_>>(),
             ),
             per_prompt: self.prompts,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AddressProbeAccumulator {
+    name: String,
+    prompts: Vec<AddressProbePromptReport>,
+}
+
+impl AddressProbeAccumulator {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            prompts: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, prompt: AddressProbePromptReport) {
+        self.prompts.push(prompt);
+    }
+
+    fn finish(mut self) -> AddressProbeReport {
+        let kls = self.prompts.iter().map(|p| p.kl).collect::<Vec<_>>();
+        let positions = self.prompts.iter().map(|p| p.positions).sum::<usize>();
+        let total_groups = self
+            .prompts
+            .iter()
+            .map(|p| p.groups_total)
+            .sum::<usize>()
+            .max(1);
+        let correct_groups = self.prompts.iter().map(|p| p.groups_correct).sum::<usize>();
+        self.prompts
+            .sort_by(|a, b| b.kl.partial_cmp(&a.kl).unwrap_or(std::cmp::Ordering::Equal));
+        AddressProbeReport {
+            name: self.name,
+            prompts: self.prompts.len(),
+            positions,
+            group_accuracy: correct_groups as f64 / total_groups as f64,
+            exact_address_accuracy: bool_rate(self.prompts.iter().map(|p| p.exact_address_match)),
+            mean_groups_correct_per_sequence: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.groups_correct as f64)
+                    .collect::<Vec<_>>(),
+            ),
+            mean_groups_correct_per_position: correct_groups as f64 / positions.max(1) as f64,
+            mean_kl: mean(&kls),
+            p95_kl: percentile(kls.clone(), 0.95),
+            max_kl: kls.iter().copied().fold(0.0, f64::max),
+            top1_agreement: bool_rate(self.prompts.iter().map(|p| p.top1_agree)),
+            top5_contains_baseline_top1: bool_rate(
+                self.prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_in_predicted_top5),
+            ),
+            worst_examples: self.prompts.into_iter().take(8).collect(),
+        }
+    }
+
+    fn finish_corruption(mut self, oracle_groups_kept: usize) -> AddressCorruptionReport {
+        let kls = self.prompts.iter().map(|p| p.kl).collect::<Vec<_>>();
+        let positions = self.prompts.iter().map(|p| p.positions).sum::<usize>();
+        let total_groups = self
+            .prompts
+            .iter()
+            .map(|p| p.groups_total)
+            .sum::<usize>()
+            .max(1);
+        let correct_groups = self.prompts.iter().map(|p| p.groups_correct).sum::<usize>();
+        self.prompts
+            .sort_by(|a, b| b.kl.partial_cmp(&a.kl).unwrap_or(std::cmp::Ordering::Equal));
+        AddressCorruptionReport {
+            label: self.name,
+            oracle_groups_kept,
+            prompts: self.prompts.len(),
+            positions,
+            group_accuracy: correct_groups as f64 / total_groups as f64,
+            exact_address_accuracy: bool_rate(self.prompts.iter().map(|p| p.exact_address_match)),
+            mean_kl: mean(&kls),
+            p95_kl: percentile(kls.clone(), 0.95),
+            max_kl: kls.iter().copied().fold(0.0, f64::max),
+            top1_agreement: bool_rate(self.prompts.iter().map(|p| p.top1_agree)),
+            top5_contains_baseline_top1: bool_rate(
+                self.prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_in_predicted_top5),
+            ),
+            worst_examples: self.prompts.into_iter().take(8).collect(),
         }
     }
 }
@@ -2296,6 +2489,44 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         HashMap::new()
     };
+    let address_probe_models = if args.address_probes {
+        if !args.mode_d_check {
+            return Err("--address-probes requires --mode-d-check".into());
+        }
+        eprintln!("Fitting graph-native address probes");
+        fit_address_probe_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+        )?
+    } else {
+        HashMap::new()
+    };
+    if args.address_corruption_sweep && !args.mode_d_check {
+        return Err("--address-corruption-sweep requires --mode-d-check".into());
+    }
+    let majority_codes = if args.address_corruption_sweep {
+        eprintln!("Fitting per-group majority codes for address corruption sweep");
+        fit_majority_codes_for_codebooks(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+        )?
+    } else {
+        HashMap::new()
+    };
 
     let mut accumulators: HashMap<(HeadId, PqConfig), OraclePqPointAccumulator> = HashMap::new();
     for head in &selected_heads {
@@ -2349,7 +2580,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let codebook = codebooks.get(&(*head, config)).ok_or_else(|| {
                     format!("missing PQ codebook for L{} H{}", head.layer, head.head)
                 })?;
-                let (pq_hidden, metrics) = forward_q4k_oracle_pq_head(
+                let (pq_hidden, metrics, oracle_codes_by_position) = forward_q4k_oracle_pq_head(
                     &mut weights,
                     &token_ids,
                     &index,
@@ -2409,6 +2640,129 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     (None, None, None, None, None)
                 };
+
+                if args.address_probes {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for address probes L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let probe_models =
+                        address_probe_models.get(&(*head, config)).ok_or_else(|| {
+                            format!(
+                                "missing address probe models for L{} H{} {:?}",
+                                head.layer, head.head, config
+                            )
+                        })?;
+                    for probe_model in probe_models {
+                        let predicted_codes_by_position = (0..token_ids.len())
+                            .map(|pos| probe_model.predict_codes(&token_ids, stratum, pos))
+                            .collect::<Vec<_>>();
+                        let address_match = address_match_report(
+                            &oracle_codes_by_position,
+                            &predicted_codes_by_position,
+                        );
+                        let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                        )?;
+                        let predicted_logits = final_logits(&weights, &predicted_hidden);
+                        let predicted_logp = log_softmax(&predicted_logits);
+                        let predicted_top1 = argmax(&predicted_logits);
+                        let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_probe(
+                                &probe_model.name,
+                                AddressProbePromptReport {
+                                    id: label.to_string(),
+                                    stratum: stratum.to_string(),
+                                    kl: kl_logp(&baseline_logp, &predicted_logp),
+                                    positions: oracle_codes_by_position.len(),
+                                    groups_correct: address_match.groups_correct,
+                                    groups_total: address_match.groups_total,
+                                    exact_address_match: address_match.exact_address_match,
+                                    top1_agree: baseline_top1 == predicted_top1,
+                                    baseline_top1_in_predicted_top5: predicted_top5
+                                        .contains(&baseline_top1),
+                                },
+                            );
+                    }
+                }
+
+                if args.address_corruption_sweep {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for address corruption L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for address corruption L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let keep_values = corruption_keep_values(config.groups);
+                    for oracle_groups_kept in keep_values {
+                        let predicted_codes_by_position = oracle_codes_by_position
+                            .iter()
+                            .map(|codes| {
+                                codes
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(group, &code)| {
+                                        if group < oracle_groups_kept {
+                                            code
+                                        } else {
+                                            group_majority[group]
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        let address_match = address_match_report(
+                            &oracle_codes_by_position,
+                            &predicted_codes_by_position,
+                        );
+                        let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                        )?;
+                        let predicted_logits = final_logits(&weights, &predicted_hidden);
+                        let predicted_logp = log_softmax(&predicted_logits);
+                        let predicted_top1 = argmax(&predicted_logits);
+                        let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_corruption(
+                                oracle_groups_kept,
+                                AddressProbePromptReport {
+                                    id: label.to_string(),
+                                    stratum: stratum.to_string(),
+                                    kl: kl_logp(&baseline_logp, &predicted_logp),
+                                    positions: oracle_codes_by_position.len(),
+                                    groups_correct: address_match.groups_correct,
+                                    groups_total: address_match.groups_total,
+                                    exact_address_match: address_match.exact_address_match,
+                                    top1_agree: baseline_top1 == predicted_top1,
+                                    baseline_top1_in_predicted_top5: predicted_top5
+                                        .contains(&baseline_top1),
+                                },
+                            );
+                    }
+                }
 
                 accumulators
                     .get_mut(&(*head, config))
@@ -2484,6 +2838,8 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
         sigma_rel_cutoff: args.sigma_rel_cutoff,
         pq_iters: args.pq_iters,
         mode_d_check: args.mode_d_check,
+        address_probes: args.address_probes,
+        address_corruption_sweep: args.address_corruption_sweep,
         selected_heads,
         heads: head_reports,
     };
@@ -3276,11 +3632,6 @@ struct PqCodebook {
 }
 
 impl PqCodebook {
-    fn quantize(&self, coords: &[f64]) -> Vec<f64> {
-        let indices = self.quantize_indices(coords);
-        self.quantize_from_indices(&indices)
-    }
-
     fn quantize_indices(&self, coords: &[f64]) -> Vec<usize> {
         let group_dim = self.config.k / self.config.groups;
         (0..self.config.groups)
@@ -3326,6 +3677,94 @@ impl ModeDTable {
             }
         }
         out
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AddressProbeModel {
+    name: String,
+    group_majority: Vec<usize>,
+    group_maps: Vec<HashMap<String, usize>>,
+}
+
+impl AddressProbeModel {
+    fn predict_codes(&self, token_ids: &[u32], stratum: &str, position: usize) -> Vec<usize> {
+        let key = address_feature_key(&self.name, token_ids, stratum, position);
+        self.group_maps
+            .iter()
+            .enumerate()
+            .map(|(group, map)| {
+                map.get(&key)
+                    .copied()
+                    .unwrap_or_else(|| self.group_majority[group])
+            })
+            .collect()
+    }
+}
+
+fn address_probe_names() -> Vec<&'static str> {
+    vec![
+        "position",
+        "stratum",
+        "position_stratum",
+        "token_id",
+        "prev_token_id",
+        "token_bigram",
+        "position_stratum_token",
+    ]
+}
+
+fn address_feature_key(name: &str, token_ids: &[u32], stratum: &str, position: usize) -> String {
+    let token = token_ids.get(position).copied().unwrap_or(0);
+    let prev = if position == 0 {
+        u32::MAX
+    } else {
+        token_ids.get(position - 1).copied().unwrap_or(0)
+    };
+    match name {
+        "position" => format!("p:{position}"),
+        "stratum" => format!("s:{stratum}"),
+        "position_stratum" => format!("p:{position}|s:{stratum}"),
+        "token_id" => format!("t:{token}"),
+        "prev_token_id" => format!("pt:{prev}"),
+        "token_bigram" => format!("pt:{prev}|t:{token}"),
+        "position_stratum_token" => format!("p:{position}|s:{stratum}|t:{token}"),
+        _ => format!("p:{position}"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AddressMatchSummary {
+    groups_correct: usize,
+    groups_total: usize,
+    exact_address_match: bool,
+}
+
+fn address_match_report(
+    oracle_codes_by_position: &[Vec<usize>],
+    predicted_codes_by_position: &[Vec<usize>],
+) -> AddressMatchSummary {
+    let mut groups_correct = 0usize;
+    let mut groups_total = 0usize;
+    let mut exact_address_match = true;
+    for (oracle, predicted) in oracle_codes_by_position
+        .iter()
+        .zip(predicted_codes_by_position.iter())
+    {
+        if oracle != predicted {
+            exact_address_match = false;
+        }
+        for (&oracle_code, &predicted_code) in oracle.iter().zip(predicted.iter()) {
+            groups_total += 1;
+            if oracle_code == predicted_code {
+                groups_correct += 1;
+            }
+        }
+    }
+    AddressMatchSummary {
+        groups_correct,
+        groups_total,
+        exact_address_match,
     }
 }
 
@@ -3583,6 +4022,273 @@ fn fit_pq_codebooks(
     }
 
     Ok(codebooks)
+}
+
+fn fit_address_probe_models(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+) -> Result<HashMap<(HeadId, PqConfig), Vec<AddressProbeModel>>, Box<dyn std::error::Error>> {
+    let names = address_probe_names();
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut key_counts: HashMap<(HeadId, PqConfig, String, usize, String), Vec<usize>> =
+        HashMap::new();
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!(
+            "  address-fit [{}/{}] {}",
+            prompt_idx + 1,
+            prompts.len(),
+            label
+        );
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).ok_or_else(|| {
+                        format!("missing basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let head_means = means.get(head).ok_or_else(|| {
+                        format!("missing means for L{}H{}", head.layer, head.head)
+                    })?;
+                    let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                        format!("missing PCA basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let head_codebooks = codebooks
+                        .iter()
+                        .filter(|((codebook_head, _), _)| codebook_head == head)
+                        .collect::<Vec<_>>();
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row.as_slice().ok_or(
+                            "pre-W_O head row was not contiguous during address probe fit",
+                        )?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        for ((_, config), codebook) in &head_codebooks {
+                            let coords = pca_basis.coordinates_with_rank(&z, config.k);
+                            let codes = codebook.quantize_indices(&coords);
+                            for (group, &code) in codes.iter().enumerate() {
+                                let levels = 1usize << config.bits_per_group;
+                                let counts = majority_counts
+                                    .entry((*head, *config, group))
+                                    .or_insert_with(|| vec![0; levels]);
+                                counts[code] += 1;
+                                for name in &names {
+                                    let key = address_feature_key(name, &token_ids, stratum, pos);
+                                    let counts = key_counts
+                                        .entry((*head, *config, (*name).to_string(), group, key))
+                                        .or_insert_with(|| vec![0; levels]);
+                                    counts[code] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    let mut models = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let mut probe_models = Vec::new();
+        for name in &names {
+            let mut group_majority = Vec::with_capacity(config.groups);
+            let mut group_maps = Vec::with_capacity(config.groups);
+            for group in 0..config.groups {
+                let majority = majority_counts
+                    .get(&(*head, *config, group))
+                    .map(|counts| argmax_usize(counts))
+                    .unwrap_or(0);
+                group_majority.push(majority);
+                let mut map = HashMap::new();
+                for ((map_head, map_config, map_name, map_group, key), counts) in key_counts.iter()
+                {
+                    if map_head == head
+                        && map_config == config
+                        && map_name == name
+                        && *map_group == group
+                    {
+                        map.insert(key.clone(), argmax_usize(counts));
+                    }
+                }
+                group_maps.push(map);
+            }
+            probe_models.push(AddressProbeModel {
+                name: (*name).to_string(),
+                group_majority,
+                group_maps,
+            });
+        }
+        models.insert((*head, *config), probe_models);
+    }
+
+    Ok(models)
+}
+
+fn fit_majority_codes_for_codebooks(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+) -> Result<HashMap<(HeadId, PqConfig), Vec<usize>>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!(
+            "  majority-fit [{}/{}] {}",
+            prompt_idx + 1,
+            prompts.len(),
+            label
+        );
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).ok_or_else(|| {
+                        format!("missing basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let head_means = means.get(head).ok_or_else(|| {
+                        format!("missing means for L{}H{}", head.layer, head.head)
+                    })?;
+                    let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                        format!("missing PCA basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let head_codebooks = codebooks
+                        .iter()
+                        .filter(|((codebook_head, _), _)| codebook_head == head)
+                        .collect::<Vec<_>>();
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row.as_slice().ok_or(
+                            "pre-W_O head row was not contiguous during majority code fit",
+                        )?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        for ((_, config), codebook) in &head_codebooks {
+                            let coords = pca_basis.coordinates_with_rank(&z, config.k);
+                            let codes = codebook.quantize_indices(&coords);
+                            for (group, &code) in codes.iter().enumerate() {
+                                let levels = 1usize << config.bits_per_group;
+                                let counts = majority_counts
+                                    .entry((*head, *config, group))
+                                    .or_insert_with(|| vec![0; levels]);
+                                counts[code] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    let mut out = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let mut group_majority = Vec::with_capacity(config.groups);
+        for group in 0..config.groups {
+            group_majority.push(
+                majority_counts
+                    .get(&(*head, *config, group))
+                    .map(|counts| argmax_usize(counts))
+                    .unwrap_or(0),
+            );
+        }
+        out.insert((*head, *config), group_majority);
+    }
+    Ok(out)
+}
+
+fn corruption_keep_values(groups: usize) -> Vec<usize> {
+    [0usize, 4, 8, 12, 16, 24, 32, 40, groups]
+        .into_iter()
+        .filter(|value| *value <= groups)
+        .collect()
 }
 
 fn kmeans_centroids(samples: &[Vec<f64>], k: usize, iterations: usize) -> Vec<Vec<f64>> {
@@ -3965,11 +4671,12 @@ fn forward_q4k_oracle_pq_head(
     pca_basis: &ZPcaBasis,
     means: &StaticHeadMeans,
     codebook: &PqCodebook,
-) -> Result<(Array2<f32>, RoundtripPatchMetrics), Box<dyn std::error::Error>> {
+) -> Result<(Array2<f32>, RoundtripPatchMetrics, Vec<Vec<usize>>), Box<dyn std::error::Error>> {
     let mut h = embed_tokens_pub(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
     let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
     let mut metrics = None;
+    let mut oracle_codes = Vec::new();
 
     for layer in 0..weights.num_layers {
         let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
@@ -4002,7 +4709,9 @@ fn forward_q4k_oracle_pq_head(
                         .collect::<Vec<_>>();
                     let z = basis.residual_to_z(&residual);
                     let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
-                    let quantized_coords = codebook.quantize(&coords);
+                    let codes = codebook.quantize_indices(&coords);
+                    let quantized_coords = codebook.quantize_from_indices(&codes);
+                    oracle_codes.push(codes);
                     let z_projected = pca_basis.reconstruct_from_coordinates(&quantized_coords);
                     let residual_projected = basis.z_to_residual(&z_projected);
                     let projected = residual_projected
@@ -4073,7 +4782,11 @@ fn forward_q4k_oracle_pq_head(
         remove_layer_tensors(weights, inserted);
     }
 
-    Ok((h, metrics.ok_or("oracle PQ did not visit target layer")?))
+    Ok((
+        h,
+        metrics.ok_or("oracle PQ did not visit target layer")?,
+        oracle_codes,
+    ))
 }
 
 fn forward_q4k_oracle_pq_mode_d_head(
@@ -4352,6 +5065,81 @@ fn forward_q4k_replace_pre_o_head(
     Ok(h)
 }
 
+fn forward_q4k_predicted_address_mode_d_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    mode_d_table: &ModeDTable,
+    predicted_codes_by_position: &[Vec<usize>],
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                let mut replacement_delta = Vec::with_capacity(h.nrows() * weights.hidden_size);
+                for pos in 0..h.nrows() {
+                    let codes = predicted_codes_by_position
+                        .get(pos)
+                        .ok_or("missing predicted address for sequence position")?;
+                    let delta = mode_d_table.delta_for_position_codes(pos, codes);
+                    replacement_delta.extend_from_slice(&delta);
+                }
+                let replacement_delta =
+                    Array2::from_shape_vec((h.nrows(), weights.hidden_size), replacement_delta)?;
+                run_layer_with_replaced_head_residual_delta(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    &replacement_delta,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} during predicted-address Mode D L{} H{}",
+                head.layer, head.head
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(h)
+}
+
 fn final_logits(weights: &larql_inference::ModelWeights, h: &Array2<f32>) -> Vec<f32> {
     let last = h.nrows().saturating_sub(1);
     let h_last = h.slice(s![last..last + 1, ..]).to_owned();
@@ -4386,6 +5174,15 @@ fn token_prob(logp: &[f64], token_id: u32) -> f64 {
     logp.get(token_id as usize)
         .map(|value| value.exp())
         .unwrap_or(0.0)
+}
+
+fn argmax_usize(values: &[usize]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, value)| *value)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {

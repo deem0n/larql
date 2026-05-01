@@ -775,6 +775,8 @@ impl Session {
             layer,
             feature,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta,
         };
 

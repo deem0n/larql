@@ -179,6 +179,22 @@ impl VectorIndex {
         self.ffn.down_features_mmap.is_some()
     }
 
+    /// Byte offset where layer `layer` starts in a packed per-layer f32
+    /// FFN file. `matrices_per_layer` = 1 for feature-major files
+    /// (`down_features.bin`, `up_features.bin`) and 3 for the interleaved
+    /// `[gate|up|down]` file. Computed as a prefix sum over
+    /// `num_features(l) * hidden_size` rather than `layer * intermediate`
+    /// — the latter is wrong when `layers[].num_features` varies (MoE
+    /// shards with per-layer expert counts), and the prefix sum collapses
+    /// to the same value for constant-feature dense models.
+    fn ffn_layer_byte_offset(&self, layer: usize, matrices_per_layer: usize) -> usize {
+        let mut floats: usize = 0;
+        for l in 0..layer {
+            floats += self.num_features(l) * self.hidden_size;
+        }
+        floats * 4 * matrices_per_layer
+    }
+
     /// Get a feature's contiguous down vector from the mmap'd feature-major file.
     /// Returns `[hidden_size]` f32 slice — zero-copy from mmap.
     pub fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
@@ -188,8 +204,7 @@ impl VectorIndex {
             return None;
         }
 
-        let layer_floats = intermediate * self.hidden_size;
-        let layer_offset = layer * layer_floats * 4;
+        let layer_offset = self.ffn_layer_byte_offset(layer, 1);
         let feature_offset = feature * self.hidden_size * 4;
         let start = layer_offset + feature_offset;
         let end = start + self.hidden_size * 4;
@@ -215,7 +230,7 @@ impl VectorIndex {
 
         let floats_per_layer = intermediate * self.hidden_size;
         let bytes_per_layer = floats_per_layer * 4;
-        let start = layer * bytes_per_layer;
+        let start = self.ffn_layer_byte_offset(layer, 1);
         let end = start + bytes_per_layer;
         if end > mmap.len() {
             return None;
@@ -252,7 +267,7 @@ impl VectorIndex {
         }
         let floats_per_layer = intermediate * self.hidden_size;
         let bytes_per_layer = floats_per_layer * 4;
-        let start = layer * bytes_per_layer;
+        let start = self.ffn_layer_byte_offset(layer, 1);
         let end = start + bytes_per_layer;
         if end > mmap.len() {
             return None;
@@ -301,8 +316,7 @@ impl VectorIndex {
         }
         let matrix_floats = intermediate * self.hidden_size;
         let matrix_bytes = matrix_floats * 4;
-        let layer_bytes = matrix_bytes * 3; // gate + up + down
-        let start = layer * layer_bytes; // gate is first
+        let start = self.ffn_layer_byte_offset(layer, 3); // gate is first
         let end = start + matrix_bytes;
         if end > mmap.len() {
             return None;
@@ -323,8 +337,7 @@ impl VectorIndex {
         }
         let matrix_floats = intermediate * self.hidden_size;
         let matrix_bytes = matrix_floats * 4;
-        let layer_bytes = matrix_bytes * 3;
-        let start = layer * layer_bytes + matrix_bytes; // up is second
+        let start = self.ffn_layer_byte_offset(layer, 3) + matrix_bytes; // up is second
         let end = start + matrix_bytes;
         if end > mmap.len() {
             return None;
@@ -345,8 +358,7 @@ impl VectorIndex {
         }
         let matrix_floats = intermediate * self.hidden_size;
         let matrix_bytes = matrix_floats * 4;
-        let layer_bytes = matrix_bytes * 3;
-        let start = layer * layer_bytes + matrix_bytes * 2; // down is third
+        let start = self.ffn_layer_byte_offset(layer, 3) + matrix_bytes * 2; // down is third
         let end = start + matrix_bytes;
         if end > mmap.len() {
             return None;
@@ -368,7 +380,7 @@ impl VectorIndex {
             }
             let matrix_bytes = intermediate * self.hidden_size * 4;
             let layer_bytes = matrix_bytes * 3;
-            let start = layer * layer_bytes;
+            let start = self.ffn_layer_byte_offset(layer, 3);
             let end = (start + layer_bytes).min(mmap.len());
             if start >= mmap.len() {
                 return;
@@ -498,8 +510,15 @@ impl VectorIndex {
         let mmap = self.ffn.down_features_q4k_mmap.as_ref()?;
         let manifest = self.ffn.down_features_q4k_manifest.as_ref()?;
         let entry = manifest.get(layer)?;
+        // Defensive: a corrupt or stale manifest can describe a slice
+        // outside the mmap. Returning None lets callers fall back to the
+        // uniform-stride path; panicking here would abort load/query.
+        let end = entry.offset.checked_add(entry.length)?;
+        if end > mmap.len() {
+            return None;
+        }
         Some((
-            &mmap[entry.offset..entry.offset + entry.length],
+            &mmap[entry.offset..end],
             entry.format.as_str(),
             entry.padded_width,
         ))
@@ -517,6 +536,17 @@ impl VectorIndex {
         let base = layer * 3;
         if base + 2 >= manifest.len() {
             return None;
+        }
+        // Bounds-check each slice against the mmap before forming the
+        // output. A stale/corrupt manifest can name an offset+length
+        // outside the file; returning None here lets the caller fall back
+        // to the uniform-stride path instead of panicking on the slice.
+        for i in 0..3 {
+            let (offset, length, _) = &manifest[base + i];
+            let end = offset.checked_add(*length)?;
+            if end > mmap.len() {
+                return None;
+            }
         }
         let mut out: [(&[u8], &str); 3] = [(&[], ""); 3];
         for i in 0..3 {

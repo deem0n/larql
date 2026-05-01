@@ -93,9 +93,23 @@ larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" [OPTIONS]
 | `--trust-forwarded-for` | Trust first `X-Forwarded-For` IP for rate limiting. Enable only behind a trusted reverse proxy. | false |
 | `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results (0 = disabled) | 0 |
 | `--grpc-port <PORT>` | Enable gRPC server alongside HTTP | — |
+| `--uds-path <PATH>` | Bind a Unix domain socket alongside TCP for same-host MoE shard clients (~50 µs/call faster than TCP loopback). Pre-existing socket files are unlinked. Clients use `unix:///path/to/sock` URLs. | — |
+| `--experts <START-END>` | (MoE) Serve only this expert ID range across every layer (inclusive). Used to shard the expert bank across machines. | all |
+| `--units <PATH>` | (MoE, fine-grained) JSON manifest specifying per-`(layer, expert)` ownership. Mutually exclusive with `--experts`. | — |
+| `--warmup-walk-ffn` | Pre-load inference weights + prefetch every owned-layer Q4K mmap at boot (~1.3 s + 3 GB pre-allocated). Recommended for steady-state grid shards. | false |
 | `--log-level <LEVEL>` | Logging level | info |
 | `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
 | `--tls-key <PATH>` | TLS private key | — |
+
+**Environment variables for tuning the MoE remote-expert path** — see
+`README.md → Environment variables` for the full table. Most relevant:
+
+- `LARQL_MOE_NO_SPLIT=1` — opt out of gRPC streaming overlap (default-on
+  for gRPC shards; ~12% loopback gain).
+- `LARQL_MOE_WIRE_F16=1` — switch the layer-batch wire to f16 (5.5 KB
+  vs 11 KB per call; opt-in for LAN deployments).
+- `LARQL_HTTP_TIMING=1` / `LARQL_MOE_TIMING=1` — per-call / per-token
+  diagnostic timing on stderr.
 
 **Examples:**
 
@@ -451,6 +465,77 @@ List loaded models (multi-model server).
 }
 ```
 
+### 4.5 Remote MoE Expert Endpoints
+
+For hybrid-MoE models (e.g. Gemma 4 26B-A4B), the inference client runs
+attention + dense FFN + the per-layer router locally and dispatches
+selected expert work to one or more shard servers. Three wire formats are
+exposed; new deployments should default to `layer-batch` (or `-f16` on
+bandwidth-constrained links).
+
+#### POST /v1/experts/layer-batch
+
+`Content-Type: application/x-larql-experts-layer`. Single residual + K
+`(expert_id, weight)` pairs for one layer; server applies
+`pre_experts_norm` once, quantises h_norm to Q8_K once, fans out the K
+expert kernels with the shared activation via rayon, returns the
+router-weighted sum.
+
+```
+Request:  [4: layer u32 LE][4: hidden u32][4: K u32]
+          + hidden × f32  (residual, sent ONCE per call)
+          + K × [4: expert_id u32, 4: weight f32]
+
+Response: [4: hidden u32 LE][4: latency_ms f32]
+          + hidden × f32  (router-weighted sum across K experts)
+```
+
+Replaces the legacy `/v1/expert/batch` (which shipped K identical residual
+copies on the wire). Saves ~2.6 MB/token of redundant wire data plus K-1
+redundant per-call CPU work on the server.
+
+#### POST /v1/experts/layer-batch-f16
+
+`Content-Type: application/x-larql-experts-layer-f16`. Same shape as
+`layer-batch` but residual + response use IEEE-754 binary16 — halves wire
+bytes (5.5 KB request + 5.5 KB response vs 11 + 11 KB f32). Opt-in via
+`LARQL_MOE_WIRE_F16=1` on the client; server always exposes both
+endpoints. f16 quant noise is well below the Q8_K activation
+quantisation already applied in the SDOT path; end-to-end accuracy
+unchanged.
+
+#### POST /v1/expert/batch (legacy)
+
+`Content-Type: application/x-larql-expert`. Pre-2026-05-01 wire: N items
+each with `(layer, expert_id, residual)`; ships K identical residuals
+when called from `forward_moe`. Still served for back-compat. Returns N
+per-expert outputs which the client weights and sums (vs server-side
+weighting + summing in `layer-batch`).
+
+#### POST /v1/expert/{layer}/{expert_id}
+
+JSON-only single-expert dispatch. Diagnostic / smoke-test path:
+
+```
+POST /v1/expert/15/47
+{"residual": [0.12, -0.03, ...]}
+→ {"output": [0.4, 0.1, ...], "latency_ms": 0.5}
+```
+
+#### Transport options
+
+Each `--moe-shards` entry's URL scheme picks the transport:
+
+- `grpc://host:port` — persistent HTTP/2; enables fire/collect streaming
+  overlap with dense FFN GPU compute (default-on; ~12% faster on M3 Max
+  loopback). Set `LARQL_MOE_NO_SPLIT=1` to opt out.
+- `http://host:port` — TCP/HTTP. Server sets `TCP_NODELAY` on accepted
+  connections by default to avoid Nagle tail-packet stalls on real LAN.
+- `unix:///abs/path/to/sock` — manual HTTP/1.1 over a Unix domain
+  socket; ~50 µs/call faster than TCP loopback. Same wire format as
+  the TCP HTTP path. Same-host only (matches the server's
+  `--uds-path`).
+
 ---
 
 ## 5. Multi-Model Serving
@@ -715,6 +800,12 @@ docker run -v ./vindexes:/data -p 8080:8080 larql-server /data/gemma3-4b.vindex
 
 Browse-only deployment: 3 GB RAM (f16). $5-10/month on Fly.io.
 
+For **distributed MoE serving** (multi-shard Gemma 4 26B-A4B etc.) on
+fly.io, see `ROADMAP.md → F-FLY`. Open items: VM size for shards
+(`performance-cpu-4x`+ for ~10 GB RSS at warmup), vindex distribution
+strategy (full mmap vs per-shard slicing), and validation of f16-wire +
+TCP_NODELAY wins on real LAN-class RTT (untested on loopback).
+
 ### 10.3 Bare Metal / VPS
 
 ```bash
@@ -959,9 +1050,15 @@ POST /v1/walk-ffn {"layer": 20, "residual": [...]}
 
 ---
 
-### 13.4 Expert Sharding (`--experts`) — planned
+### 13.4 Expert Sharding (`--experts` / `--units`)
 
-Restrict the server to a contiguous range of expert IDs within each MoE layer. Requires vindexes using the `per_layer` expert format (§5.12 of `vindex-format-spec.md`).
+Restrict the server to a contiguous range of expert IDs within each MoE
+layer (or fine-grained per-`(layer, expert)` ownership via `--units`).
+Requires vindexes using the `per_layer` expert format (§5.12 of
+`vindex-format-spec.md`). Implemented and production-tested on Gemma 4
+26B-A4B as of 2026-05-01; see §4.5 for the wire formats and §10 for
+fly.io / multi-host deployment notes (tracked as `F-FLY` in
+`ROADMAP.md`).
 
 ```bash
 larql-server gemma4-26b-a4b.vindex --experts 0-31  --port 8080

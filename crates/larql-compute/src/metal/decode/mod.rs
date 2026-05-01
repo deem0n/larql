@@ -365,22 +365,33 @@ impl MetalBackend {
             // The qk_norm_offset is 0.0 on Gemma 4 and 1.0 on Gemma 2/3.
             // Passed as `offset` to the shader so `offset + weight[d]` does
             // the right thing for both families.
-            if let (Some(q_w), Some(k_w)) = (layer.q_norm_weight, layer.k_norm_weight) {
+            // ── Steps 1.5 + 2: QK-norm + RoPE ──
+            //
+            // When `LARQL_FUSED_QK_NORM_ROPE=1` AND the layer has
+            // QK-norm weights (Gemma 3/4), use the single fused
+            // `qk_norm_rope_fused` kernel — saves 1 dispatch per
+            // layer × 34 = ~34/tok. Falls back to the consecutive
+            // `qk_norm_qk` + `rope_at_pos_batched_qk` chain for
+            // archs without QK-norm or when the env flag is unset.
+            let use_fused_qkn_rope = std::env::var("LARQL_FUSED_QK_NORM_ROPE").is_ok();
+            let pos = kv_cache.layers[l].current_len as u32;
+            if use_fused_qkn_rope && layer.q_norm_weight.is_some() && layer.k_norm_weight.is_some()
+            {
+                let q_w = layer.q_norm_weight.unwrap();
+                let k_w = layer.k_norm_weight.unwrap();
                 let hd_val = layer_head_dim as u32;
                 let nq_val = layer_num_q_heads as u32;
                 let qk_off = layer.qk_norm_offset;
                 let eps = layer.eps;
+                let rdim = layer_rotary_dim as u32;
                 let mut tg_w: usize = 1;
                 while tg_w < layer_head_dim && tg_w < 512 {
                     tg_w <<= 1;
                 }
-
-                // Fused Q+K norm: one dispatch covers all q_heads+kv_heads.
-                // Saves 1 dispatch per layer × 34 = 34 dispatches/token.
                 let q_w_buf = self.bufs.get_f32(q_w);
                 let k_w_buf = self.bufs.get_f32(k_w);
                 let total_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
-                enc.set_compute_pipeline_state(&self.qk_norm_qk_pipeline);
+                enc.set_compute_pipeline_state(&self.qk_norm_rope_fused_pipeline);
                 enc.set_buffer(0, Some(&q_out), 0);
                 enc.set_buffer(1, Some(&k_out), 0);
                 enc.set_buffer(2, Some(&q_w_buf), 0);
@@ -389,15 +400,49 @@ impl MetalBackend {
                 enc.set_bytes(5, 4, &nq_val as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
                 enc.set_bytes(7, 4, &qk_off as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(
+                    8,
+                    4,
+                    &layer_rope_base as *const f32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(9, 4, &pos as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(10, 4, &rdim as *const u32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new(total_heads, 1, 1),
                     MTLSize::new(tg_w as u64, 1, 1),
                 );
-            }
+            } else {
+                if let (Some(q_w), Some(k_w)) = (layer.q_norm_weight, layer.k_norm_weight) {
+                    let hd_val = layer_head_dim as u32;
+                    let nq_val = layer_num_q_heads as u32;
+                    let qk_off = layer.qk_norm_offset;
+                    let eps = layer.eps;
+                    let mut tg_w: usize = 1;
+                    while tg_w < layer_head_dim && tg_w < 512 {
+                        tg_w <<= 1;
+                    }
 
-            // ── Step 2: RoPE on Q and K heads (batched — one dispatch each) ──
-            {
-                let pos = kv_cache.layers[l].current_len as u32;
+                    // Fused Q+K norm: one dispatch covers all q_heads+kv_heads.
+                    // Saves 1 dispatch per layer × 34 = 34 dispatches/token.
+                    let q_w_buf = self.bufs.get_f32(q_w);
+                    let k_w_buf = self.bufs.get_f32(k_w);
+                    let total_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
+                    enc.set_compute_pipeline_state(&self.qk_norm_qk_pipeline);
+                    enc.set_buffer(0, Some(&q_out), 0);
+                    enc.set_buffer(1, Some(&k_out), 0);
+                    enc.set_buffer(2, Some(&q_w_buf), 0);
+                    enc.set_buffer(3, Some(&k_w_buf), 0);
+                    enc.set_bytes(4, 4, &hd_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &nq_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(7, 4, &qk_off as *const f32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(total_heads, 1, 1),
+                        MTLSize::new(tg_w as u64, 1, 1),
+                    );
+                }
+
+                // ── Step 2: RoPE on Q and K heads (batched — one dispatch each) ──
                 let hd = layer_head_dim as u32;
                 let rdim = layer_rotary_dim as u32;
                 let rope_pairs = (layer_rotary_dim / 2) as u64;
@@ -538,56 +583,24 @@ impl MetalBackend {
             let has_post_norms = layer.has_post_norms;
             if has_post_norms {
                 let normed_o = &normed_scratch;
-                {
-                    use crate::metal::ops::full_pipeline::encode_rms_norm;
-                    encode_rms_norm(
-                        &enc,
-                        &self.rms_norm_pipeline,
-                        &o_out_buf,
-                        &post_attn_norm_bufs[l],
-                        normed_o,
-                        hidden,
-                        eps,
-                        norm_offset,
-                    );
-                }
                 let pre_ffn_buf = if let Some(pfn) = layer.pre_ffn_norm {
                     self.bufs.get_f32(pfn)
                 } else {
                     post_attn_norm_bufs[l].clone()
                 };
-                if ffn_uses_q4k {
-                    // Q4_K path: residual+norm → f32 output (no Q8)
-                    enc.set_compute_pipeline_state(&self.residual_norm_pipeline);
+                let use_fused_post_attn = std::env::var("LARQL_FUSED_POST_ATTN_NORM").is_ok();
+                if use_fused_post_attn && ffn_uses_q4k {
+                    // Triple-fused: post_attn_norm + residual_norm + h_post_attn
+                    // store in ONE dispatch. Replaces (rms_norm +
+                    // residual_norm_store) two-dispatch pair on the
+                    // has_post_norms path → saves 1 dispatch/layer × 34
+                    // = ~34/tok ≈ 0.24 ms/tok. ROADMAP G-3 third fusion.
+                    enc.set_compute_pipeline_state(&self.post_attn_residual_norm_store_pipeline);
                     enc.set_buffer(0, Some(h_buf), 0);
-                    enc.set_buffer(1, Some(normed_o), 0);
-                    enc.set_buffer(2, Some(&pre_ffn_buf), 0);
-                    enc.set_buffer(3, Some(&ffn_norm_out), 0);
-                    enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-                    enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(1, 1, 1),
-                        MTLSize::new(256.min(hidden as u64), 1, 1),
-                    );
-                    // h_post_attn = h + normed_o (residual_norm also writes this to buffer 3? No — residual_norm only outputs normed.
-                    // We need the pre-norm residual for the post-FFN add. Use residual_add separately.
-                    use crate::metal::ops::full_pipeline::encode_residual_add;
-                    encode_residual_add(
-                        &enc,
-                        &self.residual_add_pipeline,
-                        h_buf,
-                        normed_o,
-                        &h_post_attn,
-                        hidden,
-                    );
-                } else {
-                    enc.set_compute_pipeline_state(&self.residual_norm_q8_pipeline);
-                    enc.set_buffer(0, Some(h_buf), 0);
-                    enc.set_buffer(1, Some(normed_o), 0);
-                    enc.set_buffer(2, Some(&pre_ffn_buf), 0);
-                    enc.set_buffer(3, Some(&ffn_q8), 0);
-                    enc.set_buffer(4, Some(&ffn_q8s), 0);
+                    enc.set_buffer(1, Some(&o_out_buf), 0);
+                    enc.set_buffer(2, Some(&post_attn_norm_bufs[l]), 0);
+                    enc.set_buffer(3, Some(&pre_ffn_buf), 0);
+                    enc.set_buffer(4, Some(&ffn_norm_out), 0);
                     enc.set_buffer(5, Some(&h_post_attn), 0);
                     enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(7, 4, &eps as *const f32 as *const std::ffi::c_void);
@@ -596,7 +609,73 @@ impl MetalBackend {
                         MTLSize::new(1, 1, 1),
                         MTLSize::new(256.min(hidden as u64), 1, 1),
                     );
-                }
+                    // Skip the unfused chain below — both ffn_norm_out
+                    // and h_post_attn are already written.
+                } else {
+                    // Unfused chain: rms_norm + residual_norm_store
+                    // (or _q8). Still 1 dispatch better than the
+                    // pre-2026-05-01 3-dispatch chain.
+                    {
+                        use crate::metal::ops::full_pipeline::encode_rms_norm;
+                        encode_rms_norm(
+                            &enc,
+                            &self.rms_norm_pipeline,
+                            &o_out_buf,
+                            &post_attn_norm_bufs[l],
+                            normed_o,
+                            hidden,
+                            eps,
+                            norm_offset,
+                        );
+                    }
+                    if ffn_uses_q4k {
+                        // Q4_K path: residual+norm in ONE dispatch via
+                        // `residual_norm_store` — writes both `ffn_norm_out`
+                        // (RMS-normed sum, scaled by `pre_ffn_buf`) AND
+                        // `h_post_attn` (raw sum). Replaces the
+                        // residual_norm + residual_add two-dispatch pair
+                        // that was here pre-2026-05-01. Saves 1 dispatch
+                        // per layer × 34 = ~34/tok ≈ 0.24 ms/tok end-to-end
+                        // (same fusion mechanic as `qk_norm_rope_fused`,
+                        // ref. ROADMAP G-3 entry).
+                        //
+                        // The math is identical to the unfused pair:
+                        //   ffn_norm_out = RMS_norm(h + normed_o) * (pre_ffn_buf + offset)
+                        //   h_post_attn  = h + normed_o
+                        // (`residual_norm_store` shader in
+                        // `shaders/fused_ops.rs` was already written for the
+                        // !has_post_norms branch; just routing the
+                        // has_post_norms branch through it now.)
+                        enc.set_compute_pipeline_state(&self.residual_norm_store_pipeline);
+                        enc.set_buffer(0, Some(h_buf), 0);
+                        enc.set_buffer(1, Some(normed_o), 0);
+                        enc.set_buffer(2, Some(&pre_ffn_buf), 0);
+                        enc.set_buffer(3, Some(&ffn_norm_out), 0);
+                        enc.set_buffer(4, Some(&h_post_attn), 0);
+                        enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+                        enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(1, 1, 1),
+                            MTLSize::new(256.min(hidden as u64), 1, 1),
+                        );
+                    } else {
+                        enc.set_compute_pipeline_state(&self.residual_norm_q8_pipeline);
+                        enc.set_buffer(0, Some(h_buf), 0);
+                        enc.set_buffer(1, Some(normed_o), 0);
+                        enc.set_buffer(2, Some(&pre_ffn_buf), 0);
+                        enc.set_buffer(3, Some(&ffn_q8), 0);
+                        enc.set_buffer(4, Some(&ffn_q8s), 0);
+                        enc.set_buffer(5, Some(&h_post_attn), 0);
+                        enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(7, 4, &eps as *const f32 as *const std::ffi::c_void);
+                        enc.set_bytes(8, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(1, 1, 1),
+                            MTLSize::new(256.min(hidden as u64), 1, 1),
+                        );
+                    }
+                } // close `else { unfused chain }`
             } else if ffn_uses_q4k {
                 // Fused: residual_norm_store writes BOTH ffn_norm_out (normed,
                 // for FFN input) AND h_post_attn (raw sum, for post-FFN add).

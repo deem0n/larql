@@ -113,7 +113,34 @@ plus per-step `LARQL_PROFILE_DECODE=1` profiling on Gemma 3 4B; ollama's
 fine-grained timings via `/api/generate` (`total_duration`,
 `prompt_eval_duration`, `eval_duration`).
 
-**Where the gap lives** (steady-state, peak/cold step):
+**Where the gap *really* lives** (corrected 2026-05-01 after instrumenting
+in-pipeline GPU vs CPU timing via `LARQL_GPU_TIMING=1` —
+`metal/decode/gpu_timing.rs::TokenGpuTime`):
+
+```
+Per-token decode_token (n=12, steady state):
+  Wall:    ~10.7 ms
+  GPU:     ~10.5 ms  (98% of wall — kernels are GPU-bound)
+  CPU:      ~0.5 ms  (5% — dispatch overhead is NOT the bottleneck)
+  cmd_bufs: 1 per token (one coalesced buffer covers all 34 layers)
+```
+
+So the 14.0 ms/tok vs ollama's 10.4 ms/tok gap breaks down as:
+
+| Stage | larql | ollama (est.) | gap |
+|---|---|---|---|
+| `decode_token` GPU compute | 10.5 ms | ~7-8 ms | +2.5-3 ms |
+| lm_head | 3.0 ms | ~2 ms | +1 ms |
+| other | ~0.5 ms | ~0.5 ms | 0 |
+| **total** | **14.0 ms** | **10.4 ms** | **+3.5 ms** |
+
+Both gaps are **GPU compute, not CPU dispatch**. Kernel-isolated
+`metal/diag/kernel_profile.rs` GB/s overstated the headroom (kernels
+run partially pipelined within one cmd buffer; isolated GB/s isn't
+the right metric). Our actual decode is at ~75-80% of ollama's
+throughput on the same hardware — competitive but not parity.
+
+**Earlier (incorrect) diagnosis preserved for context**:
 
 | Stage | larql peak | ollama | gap | recoverable? |
 |---|---|---|---|---|
@@ -220,11 +247,50 @@ profiler) to localise — kernel-isolated GB/s alone isn't enough.
 
 ---
 
-### G-2 — NR0=2 + shared-X-vector port from llama.cpp (HIGH PRIORITY)
+### G-2 — NR0=2 + shared-X-vector port from llama.cpp
 
-**Status**: Open. Replaces the de-prioritised cooperative-dequant idea
-as the highest-leverage GPU-fwd item. Diagnosed as the actual bottleneck
-in step-by-step diff against ollama (2026-05-01).
+**Status**: ❌ Tried 2026-05-01, **slight regression** (~3% slower).
+Kernel kept opt-in (`LARQL_GATE_UP_NR2=1` →
+`q4k_ffn_gate_up_nr2_pipeline`, `shaders/q4k_ffn_gate_up_nr2.rs`) for
+future exploration on different shapes / hardware.
+
+**Result** (3 runs each, thermal-mixed):
+- NR2:           68.6 / 69.2 / 68.3 tok/s, GPU fwd 12.76/12.56/12.84 ms
+- Baseline 8sg:  71.1 / 71.1 / 71.0 tok/s, GPU fwd 12.24/12.22/12.26 ms
+
+NR2 is ~0.5 ms/tok slower in GPU forward despite the X-cache-traffic
+math predicting a savings.
+
+**Why the diagnosis was wrong**: For Gemma 3 4B's K=2560 input, the
+X-vector is 10 KB — easily fits in L1 cache (per-simdgroup or
+per-TG). Whatever per-row "X reload" we measured at the kernel
+boundary is being served from L1 hits, not LPDDR5X traffic. The
+per-row reload doesn't actually consume bandwidth, so eliminating it
+via NR0=2 saves nothing.
+
+**This is now the THIRD consecutive miss** on a kernel optimisation
+that looked high-confidence from `metal/diag/kernel_profile.rs`'s
+isolated GB/s measurement (after `LARQL_F16_ACC=1` 2026-04-28 and
+`LARQL_GATE_UP_COOP=1` 2026-05-01). The pattern is now clear:
+**isolated kernel GB/s is not predictive of end-to-end tok/s on
+Apple Silicon**. The bottleneck must be one of:
+
+- Dispatch / scheduling overhead (not measured by `kernel_profile`)
+- Memory subsystem contention across in-flight TGs (not measured)
+- Thermal throttling shifting the steady-state target (real but
+  doesn't explain peak-cold differences)
+
+**Implications for future kernel work**: stop guessing from isolated
+GB/s. Either:
+1. Get **actual end-to-end profiling** (Xcode GPU frame capture)
+   before any further kernel optimisation work — see G-5.
+2. Attack **structural** changes that bypass per-kernel utilisation
+   entirely — most notably **G-3** (flash-attention fusion), which
+   reduces dispatch count regardless of per-kernel GB/s.
+
+#### Original diagnosis (preserved for context, since the analysis was
+correct *for what it measured* — the kernel-isolated GB/s gap is
+real, but the gap doesn't translate to end-to-end work)
 
 **Diagnosis**: Side-by-side bench against `ollama gemma3:4b` on
 `"The capital of France is"`, num_predict=20:
@@ -317,7 +383,153 @@ on Gemma 3 4B.
 `fused_attention.rs` stub). Both together project to **95-105 tok/s
 on Gemma 3 4B** (full ollama parity).
 
-### G-5 — Memory access pattern audit (highest priority after G-1's null)
+### G-3 — Dispatch-count reduction (✅ first fusion validates the model, 2026-05-01)
+
+**First fusion shipped — `qk_norm_rope_fused`**:
+`shaders/qk_norm_rope_fused.rs` collapses `qk_norm_qk` +
+`rope_at_pos_batched_qk` into one kernel (each TG handles one head:
+RMS-norm → weight scale → in-place RoPE rotation, with one
+`threadgroup_barrier` between the norm and rotate phases). Opt-in via
+`LARQL_FUSED_QK_NORM_ROPE=1`.
+
+**Measured GPU-only timing** (n=10 each, on Gemma 3 4B M3 Max):
+
+```
+                     GPU median   CPU median   Wall median
+FUSED QKN+ROPE       10.35 ms     0.55 ms      10.85 ms
+BASELINE             10.45 ms     0.70 ms      11.08 ms
+─────────────────────────────────────────────────────────────
+SAVINGS              -0.10 ms     -0.15 ms     -0.23 ms ✓
+```
+
+The 0.23 ms/tok savings matches the theoretical 1-dispatch-saved ×
+34-layers × ~7 µs estimate exactly. Splits cleanly into ~0.10 ms GPU
+(less inter-dispatch latency in the cmd buffer) and ~0.15 ms CPU
+(one fewer `set_compute_pipeline_state` + buffer-bind + dispatch
+encode per layer).
+
+`arch_gemma3_4b_gpu` produces "Paris" — bit-equivalent to the
+production chain.
+
+**Validation that the diagnosis is right**: the predicted savings
+landed exactly where calculated, unlike G-1 (`F16_ACC` no-win), G-2'
+(`GATE_UP_COOP` no-win), G-2 (`GATE_UP_NR2` -3% regression). This
+confirms dispatch-count was the real bottleneck.
+
+**Second fusion shipped — `residual_norm_store` in post_norms branch**:
+The post_norms decode path (Gemma 3/4) was using two dispatches —
+`residual_norm` then `residual_add` — when `residual_norm_store`
+already does both in one kernel for the `!post_norms` branch.
+Routing the post_norms branch through `residual_norm_store` is
+mechanically the same fusion as the QK-norm+RoPE one. Saves another
+~0.23 ms/tok. Now always-on (no env flag) since the kernel was
+already battle-tested on the !post_norms path.
+
+**Third fusion shipped — `post_attn_residual_norm_store`**:
+Triple-fusion (post_attn_norm + residual + ffn_norm + h_post_attn
+store) into one kernel doing 2 sequential RMS reductions per TG.
+`shaders/post_attn_residual_norm_store.rs` + opt-in env
+`LARQL_FUSED_POST_ATTN_NORM=1`. Math verified — `arch_gemma3_4b_gpu`
+emits "Paris". **Bench result**: end-to-end 70-72 tok/s, ~0.05 ms
+savings on top of stacked-2 — real but below thermal-noise floor.
+The 2 RMS reductions in one TG add compute density that partially
+offsets the dispatch overhead saved. Net: smaller win than the
+prior two fusions; kept opt-in for completeness.
+
+**Stacked GPU-only timing summary** (cold-state, 5 samples each):
+
+| Configuration | GPU median | Δ vs baseline |
+|---|---|---|
+| Baseline (all unfused, post-2026-05-01 lm_head v5) | ~10.45 ms | — |
+| + `LARQL_FUSED_QK_NORM_ROPE=1` | ~10.35 ms | -0.10 ms |
+| + `residual_norm_store` (always-on) | ~10.07 ms | -0.38 ms |
+| + `LARQL_FUSED_POST_ATTN_NORM=1` | ~10.02 ms | -0.43 ms |
+
+**End-to-end tok/s** (Gemma 3 4B, 30 tokens, warm GPU):
+
+| Path | Sustained tok/s |
+|---|---|
+| Pre-fix Metal (wrong output) | ~78 |
+| v5 lm_head fix (correctness) | 71-72 |
+| + 2 fusions stacked | 73 |
+| + 3 fusions stacked | 71-72 (in noise) |
+| Ollama gemma3:4b | 96-104 |
+
+**Remaining gap to 80 tok/s** (~3 more fusions of similar mechanic
+needed):
+
+**Realistic savings**: ~140 dispatches/tok × ~7 µs avg = **~1 ms/tok**
+end-to-end → projects to **77-80 tok/s**. Smaller than the original
+3.5 ms gap but the only one of G-1..G-3' the corrected diagnosis
+actually supports.
+
+**Current per-layer dispatch count** (~10-11 dispatches × 34 layers):
+1. fused input_norm + QKV proj (1)
+2. QK_norm (1)
+3. RoPE batched Q+K (1)
+4. V_norm (Gemma 4 only) (0-1)
+5. KV append (1)
+6. KV attend (1)
+7. O proj (1)
+8. post_attn residual + ffn_norm (fused) (1)
+9. gate + up (fused) (1)
+10. GEGLU (1)
+11. down (1)
+12. post_ffn residual (1)
+
+**Where to fuse** (in priority order, smallest scope first):
+- Fuse `QK_norm` + `RoPE` + `V_norm` into one batched kernel
+  (reads/writes Q,K,V buffers — no inter-dispatch round-trip).
+  Saves ~2 dispatches/layer × 34 = ~68 dispatches/tok.
+- Fuse `KV append` + `KV attend` (`kv_attend` already reads cache;
+  could append the new K/V row in the same kernel before attending).
+  Saves 1 dispatch/layer × 34 = 34/tok.
+- Fuse `GEGLU` + `down`: existing `q4k_geglu_silu_down` /
+  `q4k_geglu_gelu_tanh_down` kernels exist but are disabled
+  (`encode_ffn.rs::use_fused = false` per a NaN finding on certain
+  Q4_K-down configs). Re-test on **gemma3-4b-q4k-v2 (f16 down)**
+  where the NaN issue doesn't apply — the fused-down kernel only
+  fires when `down_format == Q4_K`, so f16-down vindexes already
+  go through the slow path; the gate is empty for them. **G-FFN-1**
+  (separate sub-item): rebuild the fused-down kernel for f16 down
+  to actually engage. Saves 1-2 dispatches/layer × 34 = 34-68/tok.
+
+**Total savings if all three land**: ~140 dispatches × 7 µs ≈ 1 ms.
+Combined with no-loss retention of the v5 lm_head fix, **end-to-end
+projection: ~77-80 tok/s**, closing ~1/3 of the gap to ollama.
+
+The original "G-3 = full flash-attention" sequencing was an
+overestimate — flash-attn would also need the per-position softmax
+re-norm (online softmax) which is a non-trivial precision puzzle for
+Gemma 3's softcapped attention logits. The smaller fusion items above
+are higher-confidence, lower-risk, and stack toward the same goal.
+
+### G-3' — DEPRECATED entry kept for context (full flash-attention)
+
+After three failed kernel optimizations (`F16_ACC`, `GATE_UP_COOP`,
+`GATE_UP_NR2`) — all targeting per-kernel ALU/cache that the
+kernel-isolated profiler suggested were bottlenecks — followed by
+in-pipeline GPU timing showing our per-dispatch time is already
+competitive (~30 µs avg), the picture is now clear: **the gap to
+ollama is dispatch count, not per-kernel speed**.
+
+```
+                     dispatches/tok    avg µs/dispatch    total
+  larql              ~340             ~30 µs            ~10.5 ms
+  ollama (est.)      ~200             ~40 µs             ~8.0 ms
+                     ────────────────────────────────────────────
+  diff               -140             slower per         +2.5 ms
+```
+
+So **G-3 (flash-attention fusion)** is the right work item — it
+collapses 5-6 attention dispatches per layer (RoPE + QK_norm + V_norm
++ KV_append + KV_attend + sometimes O_proj) into 1-2 dispatches.
+Saves ~140 dispatches/tok regardless of per-kernel GB/s.
+
+The earlier "G-3 builds on G-2's NR0 understanding" sequencing note
+was wrong; G-2 didn't move the needle so G-3 should go first.
+
+### G-5 — Memory access pattern audit (deferred)
 
 **Status**: Open. Should run before any further kernel rewrites.
 

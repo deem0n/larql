@@ -156,6 +156,17 @@ pub struct MetalBackend {
     /// is Q4_K gate/up + Q6_K down). Mirrors the Q4_K twins above.
     pub q6k_geglu_silu_down_pipeline: KernelHandle,
     pub q6k_geglu_gelu_tanh_down_pipeline: KernelHandle,
+    /// Cached-activation Q6_K GELU-tanh + down — TG memory holds
+    /// `tg_act[256]` (one fully-activated element per super-block
+    /// position) so the inner FMA loop reads pre-computed activations
+    /// instead of recomputing `tanh()` per row. Eliminates the 4×
+    /// `tanh()` redundancy that made the original
+    /// `q6k_geglu_gelu_tanh_down` regress on Gemma 3 4B (per the
+    /// 2026-04-26 finding documented in `encode_ffn.rs`). Saves
+    /// 1 dispatch per layer × 34 = ~34/tok plus the redundant
+    /// activation compute. Opt-in via `LARQL_FUSED_Q6K_DOWN=1`. See
+    /// `shaders/q6k_geglu_gelu_tanh_down_cached.rs`.
+    pub q6k_geglu_gelu_tanh_down_cached_pipeline: KernelHandle,
     /// Production-active Q6_K matvec pipeline. Holds 8sg by default,
     /// 4sg when `LARQL_Q6K_8SG=0` is set at startup. All dispatch
     /// sites use this transparently; tests reach the explicit
@@ -191,6 +202,21 @@ pub struct MetalBackend {
     pub v_norm_batched_pipeline: ComputePipelineState,
     pub qk_norm_pipeline: ComputePipelineState,
     pub qk_norm_qk_pipeline: ComputePipelineState,
+    /// Fused QK-norm + RoPE — replaces the consecutive
+    /// `qk_norm_qk` + `rope_at_pos_batched_qk` dispatches with one
+    /// kernel: each TG handles one head, RMS-norms it, applies
+    /// per-d weight scale, then in-place RoPE. Saves 1 dispatch per
+    /// layer × 34 = ~34/tok. Opt-in via `LARQL_FUSED_QK_NORM_ROPE=1`.
+    /// See `shaders/qk_norm_rope_fused.rs`.
+    pub qk_norm_rope_fused_pipeline: ComputePipelineState,
+    /// Triple-fusion: post_attn_norm + residual + ffn_norm + h_post_attn
+    /// store. Replaces the 3-dispatch chain (rms_norm + residual_norm +
+    /// residual_add) for the `has_post_norms` decode path with a
+    /// single kernel doing two sequential RMS reductions and one
+    /// fused residual+norm+store. Saves ~34 dispatches/tok.
+    /// Opt-in via `LARQL_FUSED_POST_ATTN_NORM=1`.
+    /// See `shaders/post_attn_residual_norm_store.rs`.
+    pub post_attn_residual_norm_store_pipeline: ComputePipelineState,
     pub rope_at_pos_batched_qk_pipeline: ComputePipelineState,
     // Scale vector (per-layer scalar, Gemma 4)
     pub scale_vector_pipeline: ComputePipelineState,
@@ -346,6 +372,9 @@ impl MetalBackend {
         >(&device, &library)?;
         let q6k_geglu_silu_down_pipeline =
             KernelHandle::from_kernel::<shaders::q6k_geglu_down::SiluKernel>(&device, &library)?;
+        let q6k_geglu_gelu_tanh_down_cached_pipeline = KernelHandle::from_kernel::<
+            shaders::q6k_geglu_gelu_tanh_down_cached::Kernel,
+        >(&device, &library)?;
         let q6k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<
             shaders::q6k_geglu_down::GeluTanhKernel,
         >(&device, &library)?;
@@ -420,6 +449,11 @@ impl MetalBackend {
 
         // QK-norm (learned-weight per-head RMSNorm, Gemma 3/4)
         let qk_norm_pipeline = get_shader_pipeline::<shaders::qk_norm::Kernel>(&device, &library)?;
+        let qk_norm_rope_fused_pipeline =
+            get_shader_pipeline::<shaders::qk_norm_rope_fused::Kernel>(&device, &library)?;
+        let post_attn_residual_norm_store_pipeline = get_shader_pipeline::<
+            shaders::post_attn_residual_norm_store::Kernel,
+        >(&device, &library)?;
         let qk_norm_qk_pipeline =
             get_shader_pipeline::<shaders::qk_norm::QkKernel>(&device, &library)?;
         let rope_at_pos_batched_qk_pipeline =
@@ -466,6 +500,7 @@ impl MetalBackend {
             q4k_geglu_gelu_tanh_down_pipeline,
             q6k_geglu_silu_down_pipeline,
             q6k_geglu_gelu_tanh_down_pipeline,
+            q6k_geglu_gelu_tanh_down_cached_pipeline,
             q6k_matvec_pipeline,
             q6k_matvec_4sg_pipeline,
             q6k_matvec_8sg_pipeline,
@@ -485,6 +520,8 @@ impl MetalBackend {
             v_norm_batched_pipeline,
             qk_norm_pipeline,
             qk_norm_qk_pipeline,
+            qk_norm_rope_fused_pipeline,
+            post_attn_residual_norm_store_pipeline,
             rope_at_pos_batched_qk_pipeline,
             scale_vector_pipeline,
             kv_cache: std::sync::Mutex::new(None),

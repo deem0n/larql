@@ -138,6 +138,34 @@ async fn spawn_server(model: LoadedModel) -> String {
     format!("http://{addr}")
 }
 
+/// Spawn an in-process server bound to BOTH a TCP socket and a Unix
+/// domain socket, returning `(http_url, unix_url)`.  The two listeners
+/// share the same `AppState`, so the bench can A/B the same shard via
+/// different transports.
+async fn spawn_server_with_uds(model: LoadedModel, uds_path: &std::path::Path) -> (String, String) {
+    let state = make_app_state(model);
+    let router_tcp = single_model_router(state.clone());
+    let router_uds = single_model_router(state);
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(tcp_listener, router_tcp).await.unwrap();
+    });
+
+    // Unlink any leftover socket from a prior run.
+    let _ = std::fs::remove_file(uds_path);
+    let uds_listener = tokio::net::UnixListener::bind(uds_path).expect("UDS bind");
+    tokio::spawn(async move {
+        axum::serve(uds_listener, router_uds).await.unwrap();
+    });
+
+    (
+        format!("http://{tcp_addr}"),
+        format!("unix://{}", uds_path.display()),
+    )
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -152,15 +180,45 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_expert_server <vindex_path> [--ffn-only] [--two-shard]");
-        eprintln!("  Example:");
-        eprintln!("    cargo run --release -p larql-server --example bench_expert_server -- \\");
-        eprintln!("      output/gemma4-26b-a4b-q4k.vindex");
+        eprintln!(
+            "Usage: bench_expert_server <vindex_path> [OPTIONS]\n\n\
+             OPTIONS:\n  \
+               --ffn-only           Skip the f16 gate-vector warmup (faster boot, lazy decode)\n  \
+               --two-shard          Spin up 2 in-process shards instead of 1\n  \
+               --uds                Bind a Unix domain socket alongside TCP and route the\n                        \
+                                    forward_moe call through it (compares ~150 µs/call savings\n                        \
+                                    vs TCP loopback).  Sets `--moe-shards unix:///tmp/larql-bench.sock`.\n  \
+               --wire f32|f16       Wire format for the layer-batch endpoint.  f16 halves wire\n                        \
+                                    bytes; on loopback the f32↔f16 conversion CPU cancels the\n                        \
+                                    saving (use on real LAN).  Default f32.\n\n\
+             EXAMPLES:\n  \
+               cargo run --release -p larql-server --example bench_expert_server -- \\\n      \
+                 output/gemma4-26b-a4b-q4k.vindex\n  \
+               cargo run --release -p larql-server --example bench_expert_server -- \\\n      \
+                 output/gemma4-26b-a4b-q4k.vindex --uds --wire f16"
+        );
         std::process::exit(1);
     }
     let vindex_path = PathBuf::from(&args[1]);
     let ffn_only = args.iter().any(|a| a == "--ffn-only");
     let two_shard = args.iter().any(|a| a == "--two-shard");
+    let use_uds = args.iter().any(|a| a == "--uds");
+    let wire_f16 = args
+        .windows(2)
+        .find(|w| w[0] == "--wire")
+        .map(|w| w[1].as_str() == "f16")
+        .unwrap_or(false);
+
+    // The client picks the wire format via env var (read at the first
+    // shard.call_layer_batch call by `RemoteMoeBackend`).  Set it here
+    // before any shard-side I/O so the choice is sticky.
+    if wire_f16 {
+        // SAFETY: single-threaded — we're still in the bench's main fn
+        // before tokio is built and before any rayon work.
+        unsafe {
+            std::env::set_var("LARQL_MOE_WIRE_F16", "1");
+        }
+    }
 
     println!("LARQL Expert Server Benchmark");
     println!("══════════════════════════════");
@@ -172,6 +230,22 @@ fn main() {
     println!(
         "Shards:    {}",
         if two_shard { "2 (in-process)" } else { "1" }
+    );
+    println!(
+        "Transport: {}",
+        if use_uds {
+            "Unix domain socket"
+        } else {
+            "TCP HTTP"
+        }
+    );
+    println!(
+        "Wire:      {}",
+        if wire_f16 {
+            "f16 (LARQL_MOE_WIRE_F16=1)"
+        } else {
+            "f32 (default)"
+        }
     );
     println!();
 
@@ -413,16 +487,30 @@ fn main() {
         .build()
         .unwrap();
 
-    let url_a = runtime.block_on(spawn_server(model_a));
-    println!();
-    println!(
-        "Shard A:  {url_a}  experts={}",
-        if two_shard {
-            format!("0..{}", mid - 1)
-        } else {
-            format!("0..{}", num_experts - 1)
-        }
-    );
+    // When --uds is set, bind both TCP and UDS on shard A and route the
+    // bench client through the unix:// URL.  Two-shard mode keeps shard B
+    // on TCP only — UDS is fundamentally same-host so multi-shard UDS
+    // doesn't change the picture.
+    let uds_path_a = std::path::PathBuf::from("/tmp/larql-bench-a.sock");
+    let url_a = if use_uds {
+        let (http_url, unix_url) = runtime.block_on(spawn_server_with_uds(model_a, &uds_path_a));
+        println!();
+        println!("Shard A:  TCP {http_url}");
+        println!("          UDS {unix_url}  ← bench client routes through this");
+        unix_url
+    } else {
+        let u = runtime.block_on(spawn_server(model_a));
+        println!();
+        println!(
+            "Shard A:  {u}  experts={}",
+            if two_shard {
+                format!("0..{}", mid - 1)
+            } else {
+                format!("0..{}", num_experts - 1)
+            }
+        );
+        u
+    };
 
     let url_b = if two_shard {
         let opts_b = LoadVindexOptions {

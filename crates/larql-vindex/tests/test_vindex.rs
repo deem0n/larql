@@ -400,6 +400,7 @@ fn save_and_load_down_meta_round_trip() {
         layer_bands: None,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -498,6 +499,7 @@ fn save_config_round_trip() {
         layer_bands: None,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -790,6 +792,7 @@ fn v2_config_full_round_trip() {
             final_logit_softcapping: None,
         }),
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -879,6 +882,7 @@ fn v2_config_with_moe() {
             final_logit_softcapping: None,
         }),
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1010,6 +1014,7 @@ fn moe_layer_info_round_trip() {
             final_logit_softcapping: None,
         }),
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1058,6 +1063,7 @@ fn layer_bands_config_round_trip() {
         }),
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1217,6 +1223,7 @@ fn source_provenance_round_trip() {
         has_model_weights: true,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1263,6 +1270,8 @@ fn patch_save_and_load_round_trip() {
                 target: "Colchester".into(),
                 confidence: Some(0.85),
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "Colchester".into(),
                     top_token_id: 42,
@@ -1319,6 +1328,8 @@ fn patched_vindex_overrides_base() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "London".into(),
                 top_token_id: 300,
@@ -1380,6 +1391,8 @@ fn patched_vindex_bake_down() {
                 layer: 0,
                 feature: 0,
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "London".into(),
                     top_token_id: 300,
@@ -1429,6 +1442,8 @@ fn patched_vindex_remove_patch() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "London".into(),
                 top_token_id: 300,
@@ -1477,6 +1492,7 @@ fn weight_manifest_round_trip() {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -1517,6 +1533,7 @@ fn dtype_config_f16_round_trip() {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1610,6 +1627,8 @@ fn patch_multiple_patches_stack() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "London".into(),
                 top_token_id: 300,
@@ -1632,6 +1651,8 @@ fn patch_multiple_patches_stack() {
             layer: 0,
             feature: 1,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "Munich".into(),
                 top_token_id: 301,
@@ -1665,6 +1686,8 @@ fn patched_vindex_later_patch_overrides_earlier() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "London".into(),
                 top_token_id: 300,
@@ -1684,6 +1707,8 @@ fn patched_vindex_later_patch_overrides_earlier() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "Tokyo".into(),
                 top_token_id: 400,
@@ -1761,6 +1786,7 @@ fn full_lifecycle_build_query_mutate_save_reload() {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -2189,6 +2215,8 @@ fn extract_with_patches_bake_down() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "PATCHED".into(),
                 top_token_id: 888,
@@ -2370,6 +2398,7 @@ fn vindexfile_parse_and_build() {
         down_top_k: 5,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&base_dir, &mut config).unwrap();
 
@@ -2390,6 +2419,8 @@ fn vindexfile_parse_and_build() {
             layer: 0,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "PATCHED".into(),
                 top_token_id: 999,

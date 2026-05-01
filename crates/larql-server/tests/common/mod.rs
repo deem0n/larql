@@ -140,6 +140,7 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         expert_filter: None,
+        unit_filter: None,
     })
 }
 
@@ -169,6 +170,7 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         expert_filter: None,
+        unit_filter: None,
     })
 }
 
@@ -237,6 +239,7 @@ impl ModelBuilder {
             probe_labels: self.probe_labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             expert_filter: None,
+            unit_filter: None,
         })
     }
 }

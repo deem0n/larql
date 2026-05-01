@@ -277,6 +277,8 @@ fn main() {
             layer: 1,
             feature: 0,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "Aspirin".into(),
                 top_token_id: 500,

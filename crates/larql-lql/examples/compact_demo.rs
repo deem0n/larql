@@ -185,6 +185,8 @@ fn build_synthetic_vindex(dir: &std::path::Path) {
         down_top_k: 3,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(dir, &mut config).unwrap();
 

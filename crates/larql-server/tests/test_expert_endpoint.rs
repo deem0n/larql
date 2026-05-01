@@ -275,6 +275,7 @@ fn make_loaded_model(
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         expert_filter: None,
+        unit_filter: None,
     }
 }
 

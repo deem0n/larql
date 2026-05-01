@@ -65,6 +65,7 @@ fn main() {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 

@@ -301,7 +301,39 @@ impl MetalBackend {
             //
             // Slow path: Q6_K / Q4_KF / Q4_0 / Q8_0 → separated
             // GEGLU then format-aware down dispatch.
-            if layer.down.format == crate::QuantFormat::Q4_K {
+            // `LARQL_FUSED_Q6K_DOWN=1`: route Q6_K-down + GELU-tanh
+            // through the cached-activation fused kernel
+            // (`q6k_geglu_gelu_tanh_down_cached_pipeline`). Replaces
+            // the 2-dispatch chain (encode_geglu + q6k_matvec) with
+            // a single kernel that pre-computes all 256 activations
+            // per super-block into TG memory (1 KB / TG) — eliminating
+            // the 4× redundant tanh() that made the un-cached version
+            // regress on Gemma 3 4B (2026-04-26). Saves ~34
+            // dispatches/tok ≈ 0.24 ms + activation re-compute.
+            let use_fused_q6k_down = std::env::var("LARQL_FUSED_Q6K_DOWN").is_ok()
+                && layer.down.format == crate::QuantFormat::Q6_K
+                && matches!(layer.activation, crate::Activation::GeluTanh);
+            if use_fused_q6k_down {
+                use crate::metal::shaders::q6k_geglu_gelu_tanh_down_cached as q6k_gd;
+                let n_tgs = (hidden as u64).div_ceil(q6k_gd::ROWS_PER_TG);
+                enc.set_compute_pipeline_state(
+                    &self.q6k_geglu_gelu_tanh_down_cached_pipeline.state,
+                );
+                enc.set_buffer(0, Some(bufs.down_w), 0);
+                enc.set_buffer(1, Some(bufs.gate_out_scratch), 0);
+                enc.set_buffer(2, Some(bufs.up_out), 0);
+                enc.set_buffer(3, Some(bufs.down_out), 0);
+                enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(
+                    5,
+                    4,
+                    &inter_padded_val as *const u32 as *const std::ffi::c_void,
+                );
+                enc.dispatch_thread_groups(
+                    metal::MTLSize::new(n_tgs, 1, 1),
+                    metal::MTLSize::new(q6k_gd::THREADS_PER_TG, 1, 1),
+                );
+            } else if layer.down.format == crate::QuantFormat::Q4_K {
                 self.encode_q4k_fused_geglu_down(
                     enc,
                     layer,

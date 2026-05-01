@@ -24,6 +24,7 @@ pub mod geglu;
 pub mod graph_walk_knn;
 pub mod kv_attention;
 pub mod layer_norm;
+pub mod post_attn_residual_norm_store;
 pub mod q4_f32_matvec;
 pub mod q4_matvec_v4;
 pub mod q4_sparse_matvec;
@@ -44,11 +45,13 @@ pub mod q4k_qkv_proj_v2;
 pub mod q4kf_ffn_gate_up;
 pub mod q4kf_qkv_proj;
 pub mod q6k_geglu_down;
+pub mod q6k_geglu_gelu_tanh_down_cached;
 pub mod q6k_matvec;
 pub mod q6k_matvec_8sg;
 pub mod q8_attn_proj;
 pub mod q8_matvec;
 pub mod qk_norm;
+pub mod qk_norm_rope_fused;
 pub mod quantize_q8;
 pub mod residual_inject;
 pub mod rope;
@@ -107,6 +110,7 @@ pub fn all_shaders() -> String {
     src.push_str(q4k_geglu_down::SHADER);
     src.push_str(q4kf_ffn_gate_up::SHADER);
     src.push_str(q6k_geglu_down::SHADER);
+    src.push_str(q6k_geglu_gelu_tanh_down_cached::SHADER);
     src.push_str(q6k_matvec::SHADER);
     src.push_str(q6k_matvec_8sg::SHADER);
     // Standalone activations (non-gated FFN)
@@ -117,6 +121,8 @@ pub fn all_shaders() -> String {
     src.push_str(v_norm::SHADER);
     // QK-norm (learned-weight per-head RMS, Gemma 3/4)
     src.push_str(qk_norm::SHADER);
+    src.push_str(qk_norm_rope_fused::SHADER);
+    src.push_str(post_attn_residual_norm_store::SHADER);
     // TurboQuant (KV cache compression)
     src.push_str(turboquant_encode::SHADER);
     src.push_str(turboquant_decode::SHADER);

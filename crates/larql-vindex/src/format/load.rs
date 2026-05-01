@@ -330,7 +330,20 @@ fn synthesize_gate_from_q4k(
                 info.layer
             ))
         })?;
-        let q_bytes = &iq4_mmap[offset..offset + length];
+        let end = offset.checked_add(length).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "interleaved_q4k_manifest layer {}: offset+length overflow ({offset}+{length})",
+                info.layer
+            ))
+        })?;
+        if end > iq4_mmap.len() {
+            return Err(VindexError::Parse(format!(
+                "interleaved_q4k_manifest layer {}: gate slice {offset}..{end} exceeds mmap length {}",
+                info.layer,
+                iq4_mmap.len()
+            )));
+        }
+        let q_bytes = &iq4_mmap[offset..end];
         let n = info.num_features * hidden_size;
         let padded = n.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
             * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;

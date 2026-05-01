@@ -95,6 +95,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         expert_filter: None,
+        unit_filter: None,
     })
 }
 
@@ -170,6 +171,7 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         expert_filter: None,
+        unit_filter: None,
     })
 }
 

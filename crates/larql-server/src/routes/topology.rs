@@ -57,3 +57,61 @@ pub async fn handle_topology(
         owned_end: end_excl.saturating_sub(1), // convert exclusive→inclusive for display
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `owned_end` should be `(end_excl - 1)` to convert the half-open
+    /// `expert_filter` tuple `(start, end_excl)` into the inclusive
+    /// `[owned_start, owned_end]` range the wire format advertises.
+    #[test]
+    fn topology_response_inclusive_end() {
+        let resp = TopologyResponse {
+            model_id: "test/model".into(),
+            num_experts: 128,
+            num_layers: 30,
+            owned_start: 0,
+            owned_end: (32usize).saturating_sub(1),
+        };
+        assert_eq!(resp.owned_start, 0);
+        assert_eq!(resp.owned_end, 31);
+        // Round-trip via serde to confirm the field names match the
+        // documented wire shape.
+        let json = serde_json::to_value(&resp).expect("serialise topology");
+        assert_eq!(json["owned_start"], 0);
+        assert_eq!(json["owned_end"], 31);
+        assert_eq!(json["num_experts"], 128);
+        assert_eq!(json["num_layers"], 30);
+        assert_eq!(json["model_id"], "test/model");
+    }
+
+    /// Edge case: `expert_filter = Some((0, 1))` (single-expert shard) →
+    /// `owned_end = 0`, not underflow.
+    #[test]
+    fn topology_response_single_expert_shard() {
+        let resp = TopologyResponse {
+            model_id: "x".into(),
+            num_experts: 1,
+            num_layers: 1,
+            owned_start: 0,
+            owned_end: (1usize).saturating_sub(1),
+        };
+        assert_eq!(resp.owned_end, 0);
+    }
+
+    /// Saturating sub guards against the (illegal but possible) `(0, 0)`
+    /// `expert_filter` setting — should not panic and should give 0, not
+    /// usize::MAX.
+    #[test]
+    fn topology_response_zero_filter_saturates() {
+        let resp = TopologyResponse {
+            model_id: "x".into(),
+            num_experts: 0,
+            num_layers: 0,
+            owned_start: 0,
+            owned_end: (0usize).saturating_sub(1),
+        };
+        assert_eq!(resp.owned_end, 0);
+    }
+}

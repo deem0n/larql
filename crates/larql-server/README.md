@@ -1,9 +1,12 @@
 # larql-server
 
-HTTP server for vindex knowledge queries and inference. Loads a vindex and serves it over the network. No GPU, no ML framework, no Python. One binary.
+HTTP / gRPC / Unix-socket server for vindex knowledge queries and inference,
+plus the per-expert backend for distributed MoE generation. Loads a vindex
+and serves it over the network. No GPU, no ML framework, no Python. One
+binary.
 
 ```bash
-larql serve output/gemma3-4b.vindex --port 8080
+larql-server output/gemma3-4b.vindex --port 8080
 # Serving google/gemma-3-4b-it (348K features, 1967 probe-confirmed)
 # Listening: http://0.0.0.0:8080
 ```
@@ -13,10 +16,17 @@ curl "http://localhost:8080/v1/describe?entity=France"
 # {"entity":"France","edges":[{"relation":"capital","target":"Paris","gate_score":1436.9,"layer":27,"source":"probe"}, ...]}
 ```
 
+For Gemma 4 26B-A4B and other hybrid-MoE models, this server is also the
+**remote expert** that the inference client calls per layer. End-to-end
+~19.7 tok/s on M3 Max with one local gRPC shard (see
+`Remote MoE shard topology` below for setup, and `ROADMAP.md → F-FLY` for
+multi-host deployment.)
+
 ## Features
 
 - **Browse endpoints** — DESCRIBE, WALK, SELECT, RELATIONS, STATS (no weights needed)
 - **Inference** — full forward pass with WalkFfn (weights lazy-loaded on first request)
+- **Remote MoE expert** — `/v1/experts/layer-batch` (residual once + K experts), gRPC streaming with overlap, f16 wire opt-in, UDS transport for same-host shards
 - **Relation labels** — probe-confirmed labels from `feature_labels.json` in DESCRIBE responses
 - **Patch overlay** — apply knowledge patches via API without modifying base files
 - **Multi-model serving** — serve multiple vindexes from a directory
@@ -61,7 +71,9 @@ larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --
 | `--ffn-only` | Run as an FFN-service endpoint for `RemoteWalkBackend` clients. Skips the f16→f32 gate warmup (10× smaller startup RSS on 31B Q4_K) | false |
 | `--embed-only` | Run as an embed-service endpoint (ADR-0008). Loads only embeddings + lm_head + tokenizer; skips all FFN and attention weights. Enables `/v1/embed`, `/v1/logits`, `/v1/token/*`. Advertises `mode: embed-service`. | false |
 | `--layers <START-END>` | Serve only this layer range (inclusive). Out-of-range requests return HTTP 400. Pages outside the range are never touched. | all |
-| `--experts <START-END>` | (MoE) Serve only this expert ID range (inclusive). Used to shard the expert bank across machines: `larql-server <vindex> --experts 0-63` on host A, `--experts 64-127` on host B. Requests for out-of-range expert IDs are rejected with HTTP 400. The remote-MoE inference client (`RemoteMoeBackend` in larql-inference) handles per-expert routing across shards. See "Remote-MoE expert sharding" below. | all |
+| `--experts <START-END>` | (MoE) Serve only this expert ID range (inclusive). Used to shard the expert bank across machines: `larql-server <vindex> --experts 0-63` on host A, `--experts 64-127` on host B. Requests for out-of-range expert IDs are rejected with HTTP 400. The remote-MoE inference client (`RemoteMoeBackend` in larql-inference) handles per-expert routing across shards. See "Remote MoE shard topology" below. | all |
+| `--units <PATH>` | (MoE, fine-grained alternative to `--experts`) JSON manifest specifying per-`(layer, expert)` ownership for non-uniform shard layouts (e.g., layer-0 split into 4 shards but layer-29 into 2). Format: `{"layer_experts": {"0": [[0,31]], "1": [[0,15],[64,79]], ...}}`. Mutually exclusive with `--experts`. | — |
+| `--uds-path <PATH>` | Bind a Unix domain socket alongside the TCP listener for same-host MoE shard clients. Skips the kernel TCP stack, ~50 µs/call faster on loopback (~3% end-to-end). Pre-existing socket files are unlinked at startup. Clients reach the shard via a `unix:///path/to/sock` URL in `--moe-shards`. | — |
 | `--max-gate-cache-layers <N>` | LRU cap on decoded f16 gate layers. `0` = unlimited. Each decoded layer is ~433 MB on 31B. | 0 |
 | `--max-q4k-cache-layers <N>` | LRU cap on the legacy `q4k_ffn_layer` whole-layer dequant cache. `0` = unlimited. Recommended `1` (or 0 once the vindex has W2 feature-major down — see `--feature-major-down` at extract time). | 0 |
 | `--hnsw` | Use HNSW for gate KNN instead of brute-force matmul. Approximate (recall 80–95%); wins for high-feature MoE (e.g. 64-expert: ~230 → 60 ms/layer). Net loss for dense ≤ 10K-feature models — leave off. | false |
@@ -82,6 +94,24 @@ larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --
 | `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
 | `--tls-key <PATH>` | TLS private key for HTTPS | — |
 | `--log-level <LEVEL>` | Logging level | info |
+
+### Environment variables
+
+The server and inference client share a small set of env-var knobs for
+tuning the MoE remote-expert path. Most have data-driven defaults from
+the 2026-05-01 perf session — see `ROADMAP.md` for measurement context.
+
+| Var | Effect | Default |
+|---|---|---|
+| `LARQL_MOE_NO_SPLIT=1` | Disable the gRPC streaming overlap (fire MoE → encode dense FFN → collect). Default-on (overlap) is reliably ~12% faster steady-state on M3 Max loopback; opt out only if a new hardware/driver combo regresses. | overlap on |
+| `LARQL_MOE_WIRE_F16=1` | Use the `/v1/experts/layer-batch-f16` endpoint and ship residual + response as f16 (5.5 KB vs 11 KB). Loopback: within noise. LAN (1 Gbps): expected +3-5%. | f32 |
+| `LARQL_MOE_TIMING=1` | Per-token MoE timing summary on stderr: route+fire / collect / server compute estimate / network estimate per layer + per-token totals. | off |
+| `LARQL_HTTP_TIMING=1` | Per-call HTTP/UDS breakdown on stderr: encode / send_total / recv_body / decode µs. Server-side `[handle_layer_batch]` reports decode / spawn_overhead / compute / encode. | off |
+| `LARQL_KERNEL_TIMING=1` | Per-expert kernel breakdown on stderr: gate / up / activation / act_q8k / down µs (compute-side). | off |
+| `LARQL_MOE_FWD_TIMING=1` | Per-layer `cpu_moe_forward` breakdown: pre_par / q8k_quant / par_iter / sum / post_norm / total µs. | off |
+| `LARQL_DISABLE_Q4K_DIRECT=1` | Fall back to BLAS-on-cached-f32 instead of the SDOT direct-Q4K matvec kernel. Kernel-debug A/B only. | direct-Q4K on |
+| `LARQL_MOE_CACHE_ENTRIES=N` | Capacity of the f32 dequant cache (per server). Default 256 entries (~6 GB on Gemma 4 26B-A4B Q4_K). Mostly inert when direct-Q4K is on; matters for the BF16 fallback path. | 256 |
+| `LARQL_GRID_KEY=<key>` | Same as `--grid-key`. | — |
 
 ### Memory bounds — cheat sheet
 
@@ -181,28 +211,72 @@ larql-server <vindex> --layers 15-29 --port 8882 --no-infer \
 Clients POST to `http://router:9090/v1/walk-ffn` with `{model_id, residual,
 layers, top_k}`; the router fans out to the owning shards and merges results.
 
-### Remote-MoE expert sharding
+### Remote MoE shard topology
 
-For hybrid-MoE models (e.g. Gemma 4 26B A4B's 128 experts), shard by expert
-ID instead of layer. Each shard mmaps the full vindex but only the
-configured experts are reachable:
+For hybrid-MoE models (e.g. Gemma 4 26B-A4B's 128 experts × 30 layers),
+shard the expert bank across processes / hosts. Each shard mmaps the full
+vindex but only the configured experts are reachable; the inference client
+runs attention + dense FFN + the router locally, then POSTs the
+post-attention residual + selected expert IDs to the owning shard(s).
+
+#### Two-shard split (production-ready)
 
 ```bash
-# Shard A — experts 0..63:
-larql-server output/gemma4-26b-a4b-q4k.vindex --experts 0-63 --port 8881 \
-  --ffn-only
+# Shard A — experts 0..63, HTTP + gRPC + UDS bound for same-host clients
+larql-server output/gemma4-26b-a4b-q4k.vindex \
+  --experts 0-63 --port 8881 --grpc-port 9081 \
+  --uds-path /tmp/larql-moe-a.sock --warmup-walk-ffn
 
-# Shard B — experts 64..127:
-larql-server output/gemma4-26b-a4b-q4k.vindex --experts 64-127 --port 8882 \
-  --ffn-only
+# Shard B — experts 64..127
+larql-server output/gemma4-26b-a4b-q4k.vindex \
+  --experts 64-127 --port 8882 --grpc-port 9082 \
+  --uds-path /tmp/larql-moe-b.sock --warmup-walk-ffn
 ```
 
-Inference-side routing lives in `larql-inference::RemoteMoeBackend`
-(`crates/larql-inference/src/ffn/moe_remote.rs`) — it runs the router
-locally, picks the top-K experts per layer, groups by shard, and POSTs one
-`/v1/expert/batch` per shard in parallel via rayon. End-to-end latency for
-one MoE block on the 26B vindex is **1.91 ms warm** (single in-process
-shard, layer 15, top-K=8, hidden=2816).
+```bash
+# Inference client — gRPC + SPLIT overlap default-on
+larql run output/gemma4-26b-a4b-q4k.vindex \
+  --moe-shards "0-63=grpc://localhost:9081,64-127=grpc://localhost:9082" \
+  "Write a 100-word poem about computers." --max-tokens 100
+# → ~19.7 tok/s steady-state (M3 Max, single shard collocated with client)
+```
+
+Per-shard URL scheme decides transport:
+- `grpc://host:port` — persistent HTTP/2 channel; enables fire/collect
+  streaming overlap with dense FFN GPU compute (default-on; ~12% faster
+  than unary). Set `LARQL_MOE_NO_SPLIT=1` to opt out.
+- `http://host:port` — TCP/HTTP; goes through the
+  `/v1/experts/layer-batch` endpoint (one residual + K experts per call).
+  TCP_NODELAY is set on accepted connections by default.
+- `unix:///abs/path/to/sock` — manual HTTP/1.1 over a Unix domain socket;
+  ~50 µs/call faster than TCP loopback (~3% end-to-end). Same wire
+  format as the TCP HTTP path, identical correctness, smaller per-call
+  cost. Same-host only.
+
+#### Wire formats
+
+| Endpoint | Content-Type | Use |
+|---|---|---|
+| `POST /v1/experts/layer-batch` | `application/x-larql-experts-layer` | Default. f32 residual + K (expert_id, weight) pairs → one router-weighted-sum vector. Server applies pre_experts_norm + Q8_K quantisation once and shares across the K experts. Saves K-1 redundant per-call work vs the legacy `/v1/expert/batch`. |
+| `POST /v1/experts/layer-batch-f16` | `application/x-larql-experts-layer-f16` | Same shape with f16 residual + response. Halves wire bytes; opt-in with `LARQL_MOE_WIRE_F16=1` for LAN deployments where bandwidth matters more than the 9 µs/call f32↔f16 conversion CPU. |
+| `POST /v1/expert/batch` (legacy) | `application/x-larql-expert` | Pre-2026-05-01 path: K (layer, expert_id, residual) items per call. Still served for back-compat. |
+
+#### Performance reference (M3 Max, single local gRPC shard, Gemma 4 26B-A4B)
+
+| Path | Per-layer | tok/s | Notes |
+|---|---|---|---|
+| In-process `cpu_moe_forward` floor | 0.39 ms | (compute floor only — no client) | What the server's expert dispatch achieves with no HTTP cost |
+| HTTP unary (legacy `/v1/expert/batch`) | 0.85 ms | 17.7 | TCP/HTTP, K residual copies on the wire |
+| gRPC unary | 0.83 ms | 17.7 | Persistent HTTP/2; ties HTTP at this scale |
+| **gRPC + SPLIT (overlap, default)** | 0.83 ms | **19.7** | Dense FFN GPU work overlaps with MoE RPC. ~12% over unary. |
+| UDS + HTTP/1.1 | ~0.70 ms | 18.2 | ~150 µs/call faster than TCP loopback HTTP |
+
+End-to-end ~19.7 tok/s = 64 ms/tok, of which ~23 ms is MoE (across all 30
+layers) and ~41 ms is attention + dense FFN + lm_head + sampling on the
+client side.
+
+For multi-host topologies (LAN-class RTT ≥ 100 µs), see
+`ROADMAP.md → F-FLY` for the planned fly.io validation.
 
 ### Per-layer FFN format
 
@@ -488,6 +562,55 @@ requests, ~0.5 ms/hop faster.
 `RemoteWalkBackend` in `larql-inference` uses binary format automatically and
 exposes `forward_all_layers()` for a batched single-round-trip forward pass.
 
+### Remote MoE Expert Endpoints
+
+Used by `RemoteMoeBackend` in `larql-inference` when the inference client
+runs attention + dense FFN + router locally and dispatches per-layer
+top-K expert work to one or more shard servers. See
+`Remote MoE shard topology` above for the deployment picture.
+
+#### POST /v1/experts/layer-batch
+
+**Binary wire** (`Content-Type: application/x-larql-experts-layer`).
+Single residual + K (expert_id, weight) pairs for one layer. Server
+applies pre_experts_norm once, quantises h_norm to Q8_K once, fans out
+the K expert kernels with the shared activation via rayon, returns the
+router-weighted sum.
+
+```
+Request:  [4: layer u32 LE][4: hidden u32][4: K u32]
+          + hidden × f32  (residual, sent ONCE per call)
+          + K × [4: expert_id u32, 4: weight f32]
+
+Response: [4: hidden u32 LE][4: latency_ms f32]
+          + hidden × f32  (router-weighted sum across K experts)
+```
+
+Replaces the legacy `/v1/expert/batch` (which shipped K identical residual
+copies on the wire). Saves ~2.6 MB/token of redundant residual data plus
+the K-1 redundant pre_experts_norm + Q8_K quantisations on the server.
+
+#### POST /v1/experts/layer-batch-f16
+
+Same shape as `layer-batch` but residual + response use IEEE-754 binary16.
+Halves wire bytes (~5.5 KB request + 5.5 KB response vs 11+11 KB f32).
+f16 quant noise is well below the Q8_K activation quantisation already
+applied in the SDOT path; end-to-end accuracy unchanged.
+
+Opt-in via `LARQL_MOE_WIRE_F16=1` on the client (server always exposes
+both endpoints). Loopback: within noise (CPU conversion cancels wire
+saving). LAN (1 Gbps): expected +3-5%.
+
+#### POST /v1/expert/batch (legacy)
+
+Pre-2026-05-01 wire format: `application/x-larql-expert` carrying N items
+each with `(layer, expert_id, residual)`. Still served for back-compat.
+New deployments should use `layer-batch` for the per-call wire savings.
+
+#### POST /v1/expert/{layer}/{expert_id}
+
+JSON-only single-expert dispatch. Diagnostic / smoke-test path.
+
 ### Embed Service Endpoints (ADR-0008)
 
 Enabled on every server (including `--ffn-only` and default mode). The primary use case is `--embed-only`: offload the static embedding table and lm_head to a dedicated small server, shrinking the attention-only client from ~7 GB to ~1.9 GB on 31B models.
@@ -771,30 +894,47 @@ GET /v1/llama-3-8b/describe?entity=France
 larql-server/
 ├── Cargo.toml
 ├── README.md
+├── ROADMAP.md
 ├── examples/
-│   ├── server_demo.rs          Synthetic vindex API demo
+│   ├── server_demo.rs          Synthetic vindex API demo (no real model)
 │   ├── embed_demo.rs           Synthetic embed/logits/token demo
 │   ├── server_bench.rs         Synthetic endpoint latency benchmarks
-│   └── bench_embed_server.rs   Live vindex embed-service benchmark
-├── proto/
-│   └── vindex.proto            gRPC service definitions
+│   ├── bench_embed_server.rs   Live vindex embed-service benchmark
+│   └── bench_expert_server.rs  Live MoE expert benchmark (cpu_moe_forward
+│                               floor + forward_moe HTTP RTT + 30-layer sweep)
+├── docs/
+│   ├── server-spec.md          Full endpoint reference + wire formats
+│   └── router-spec.md          larql-router (grid coordinator) spec
+├── proto/                      gRPC service definitions
 ├── build.rs                    Proto compilation (bundled protoc)
 ├── tests/
 │   ├── common/                 Shared synthetic vindex/tokenizer fixtures
 │   ├── test_http_*.rs          HTTP route integration tests
 │   ├── test_grpc.rs            Direct gRPC handler tests
-│   └── test_unit_*.rs          Focused unit tests
+│   ├── test_expert_endpoint.rs Per-expert MoE endpoint tests
+│   └── test_unit_*.rs          Focused unit tests (band_utils, state,
+│                               protocol parsing)
 └── src/
-    ├── main.rs                 CLI parsing, vindex loading, server startup
+    ├── main.rs                 CLI parsing, vindex loading, listener setup
+    │                           (TCP + optional UDS via --uds-path,
+    │                           TCP_NODELAY on accepted conns)
+    ├── lib.rs                  Crate-public exports
     ├── bootstrap.rs            Testable boot/discovery/load helpers
-    ├── state.rs                AppState: loaded models, probe labels, lazy weights
+    ├── state.rs                AppState: loaded models, probe labels, lazy
+    │                           weights, expert_filter / unit_filter
     ├── error.rs                ServerError → HTTP status codes
     ├── auth.rs                 API key Bearer token middleware
     ├── ratelimit.rs            Per-IP token bucket rate limiting
     ├── cache.rs                TTL cache for DESCRIBE results
     ├── session.rs              Per-session PatchedVindex isolation
     ├── etag.rs                 ETag generation for CDN caching
-    ├── grpc.rs                 gRPC service (tonic, all endpoints)
+    ├── http.rs                 Shared HTTP route + content-type constants
+    ├── ffn_l2_cache.rs         Per-model FFN L2 score cache
+    ├── embed_store.rs          mmap-backed f16 embedding lookup (--embed-only)
+    ├── band_utils.rs           Layer band parsing + filter helpers
+    ├── announce.rs             Grid `--join` announce + heartbeat loop
+    ├── grpc.rs                 gRPC service (tonic, all browse/infer endpoints)
+    ├── grpc_expert.rs          gRPC MoE expert dispatch (used with grpc:// shards)
     └── routes/
         ├── mod.rs              Router setup (single + multi-model)
         ├── describe.rs         GET /v1/describe (cached, ETag, relation labels)
@@ -803,9 +943,18 @@ larql-server/
         ├── relations.rs        GET /v1/relations
         ├── stats.rs            GET /v1/stats
         ├── infer.rs            POST /v1/infer (walk/dense/compare)
+        ├── explain.rs          POST /v1/explain-infer (per-layer attention/FFN)
         ├── stream.rs           WS /v1/stream (layer-by-layer streaming)
-        ├── walk_ffn.rs         POST /v1/walk-ffn (decoupled inference)
+        ├── walk_ffn.rs         POST /v1/walk-ffn (decoupled FFN dispatch)
+        ├── expert.rs           POST /v1/expert/{layer}/{id},
+        │                       POST /v1/expert/batch (legacy MoE wire),
+        │                       POST /v1/experts/layer-batch (residual once),
+        │                       POST /v1/experts/layer-batch-f16 (f16 wire)
+        ├── topology.rs         GET /v1/expert/topology (shard advertisement)
+        ├── embed.rs            POST /v1/embed, /v1/logits, /v1/token/*
+        ├── insert.rs           POST /v1/insert (knowledge mutation)
         ├── patches.rs          POST/GET/DELETE /v1/patches (session-aware)
+        ├── warmup.rs           POST /v1/warmup (manual weight + mmap warmup)
         ├── health.rs           GET /v1/health
         └── models.rs           GET /v1/models
 ```
@@ -825,23 +974,42 @@ larql-server/
 ## Testing
 
 ```bash
-# Unit/integration tests
+# Unit + integration tests (~494 tests across lib + 14 test files)
 cargo test -p larql-server
 
-# Demo (synthetic data, no real vindex needed)
+# Synthetic demos (no real vindex)
 cargo run -p larql-server --example server_demo
-
-# Benchmarks (synthetic data)
-cargo run -p larql-server --example server_bench --release
-
-# Embed endpoint demo (synthetic data)
 cargo run -p larql-server --example embed_demo
 
+# Synthetic endpoint latency benchmark
+cargo run -p larql-server --example server_bench --release
+
 # Live embed benchmark (requires a real vindex)
-cargo run --release -p larql-server --example bench_embed_server -- output/model.vindex
+cargo run --release -p larql-server --example bench_embed_server -- \
+  output/gemma3-4b-q4k-v2.vindex
+
+# Live MoE expert benchmark — measures cpu_moe_forward floor + forward_moe
+# HTTP RTT + 30-layer sweep against a real hybrid-MoE vindex
+cargo run --release -p larql-server --example bench_expert_server -- \
+  output/gemma4-26b-a4b-q4k.vindex
 
 # Router/grid route-table checks
 cargo test -p larql-router
+```
+
+Per-call timing for the MoE remote-expert path is opt-in via env var:
+
+```bash
+# Server-side per-handler breakdown (decode / spawn_overhead / compute / encode)
+LARQL_HTTP_TIMING=1 ./target/release/larql-server <vindex> --uds-path /tmp/m.sock
+
+# Client-side per-call breakdown (encode / send_total / recv_body / decode)
+LARQL_HTTP_TIMING=1 ./target/release/larql run <vindex> \
+  --moe-shards "0-127=unix:///tmp/m.sock" "test" --max-tokens 30
+
+# Per-layer MoE summary (route+fire / collect / server compute estimate / network)
+LARQL_MOE_TIMING=1 ./target/release/larql run <vindex> \
+  --moe-shards "0-127=grpc://localhost:9081" "test" --max-tokens 30
 ```
 
 ## Deployment
@@ -881,6 +1049,16 @@ WantedBy=multi-user.target
 ```
 
 Browse-only (f16): ~3 GB RAM. No GPU needed.
+
+### Multi-host MoE shard topology (fly.io / similar)
+
+Distributing a hybrid-MoE model across multiple VMs for production
+serving is on the roadmap as `F-FLY` (see `ROADMAP.md` for VM-sizing
+considerations, vindex distribution strategy, and the open questions on
+which CPU optimisations win on real LAN-class RTT). Concrete recipe TBD;
+the building blocks (sharding flags, gRPC streaming with overlap, f16
+wire opt-in for bandwidth-constrained links) are all in place from the
+2026-05-01 perf session.
 
 ## License
 

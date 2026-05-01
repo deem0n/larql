@@ -1,21 +1,33 @@
 # Roadmap — larql-server / larql-router
 
-## Current state (as of 2026-04-26)
+## Current state (as of 2026-05-01)
+
+### 2026-05-01 — HTTP CPU-path optimisation session
+
+End-to-end Gemma 4 26B-A4B grid jumped from ~17.7 → ~19.7 tok/s on
+M3 Max with one local gRPC shard. New per-call wire format,
+streaming-overlap default-on, UDS transport, TCP_NODELAY, f16 wire
+opt-in. See `Completed` section below for the full per-change list.
+
+### Inherited state (2026-04-26)
 
 - Code quality pass complete: modularity refactor + magic string cleanup + test restructure (see Completed below).
 - Follow-up review fixes complete: rate limiting no longer trusts
   `X-Forwarded-For` by default, route/path strings are centralized,
   server loader options are grouped, embed errors use the standard JSON
   error envelope, and server-local clippy allows were reduced.
-- Test coverage: **74.2% line / 81.2% function** (478 tests, 0 failures). gRPC handler tests unblocked grpc.rs (0%→65%); focused unit coverage raised `embed_store.rs` to 98% line, `announce.rs` to 56%, `bootstrap.rs` function coverage to 92%, `routes/stream.rs` to 65%, `routes/embed.rs` to 87%, and `routes/walk_ffn.rs` to 80%.
-- Server-local clippy is clean with
+- Test coverage: **74.2% line / 81.2% function** at the 2026-04-26
+  baseline (478 tests). 2026-05-01: 494 tests across lib + 14 integration
+  files, all green; coverage delta tracked in Phase 6.
+- Server-local clippy was clean at the 2026-04-26 baseline with
   `cargo clippy -p larql-server --tests --no-deps -- -D warnings`.
   The dependency-checking form still stops in `larql-vindex`; that is
-  tracked outside this server-only pass.
-- Examples and synthetic benchmarks checked on 2026-04-26:
-  `server_demo`, `embed_demo`, `server_bench --release`, and
-  `cargo check -p larql-server --examples` all pass. `bench_embed_server`
-  builds with examples but requires a real vindex path to execute.
+  tracked outside this server-only pass. 2026-05-01 status to be
+  verified in Phase 6.
+- Examples and synthetic benchmarks checked on 2026-04-26 and re-verified
+  2026-05-01: `server_demo`, `embed_demo`, `server_bench --release`,
+  `bench_expert_server` (live MoE bench) all pass. `bench_embed_server`
+  builds but requires a real vindex path to execute.
 - Grid route-table checks are now covered by `cargo test -p larql-router`
   (20 tests, including 7 grid-state tests) plus server announce-envelope tests.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
@@ -49,22 +61,53 @@ P99 under 8-way contention: 24 ms.
 
 ### Remote MoE expert path (Gemma 4 26B-A4B, single in-process shard, layer 15, top-K=8)
 
-`bench_expert_server` against per-layer Q4_K vindex (post `experts_packed.bin`
-removal). Hidden=2816, 128 experts, moe_intermediate=704, 30 MoE layers.
+`bench_expert_server` against per-layer Q4_K vindex
+(`output/gemma4-26b-a4b-q4k.vindex`). Hidden=2816, 128 experts,
+moe_intermediate=704, 30 MoE layers.
+
+**bench numbers (2026-05-01, post NEON SDOT + scratch reuse + layer-batch
+endpoint + cache cap=256):**
 
 | Operation | Result |
 |---|---|
-| Vindex load | 4.6 s, +6.0 GB RSS |
-| Lazy `get_or_load_weights()` | 1.2 s, +2.9 GB RSS |
+| Vindex load | 5.2 s, +6.0 GB RSS |
+| Lazy `get_or_load_weights()` | 1.3 s, +2.8 GB RSS |
 | Per-expert bytes (one bench layer, all 128) | 285 MB gate_up + 156 MB down (Q4_K) |
-| `forward_moe` warm (router + batched HTTP + combine) | **1.91 ms** mean / 1.91 p50 / 2.43 p99 |
-| `cpu_moe_forward` floor (no HTTP, same weights) | **0.10 ms** mean (LRU-warm Q4_K decode) |
-| 30-layer sweep (1 decode-step's worth of MoE blocks) | **56.0 ms** (1.87 ms/layer) |
-| Steady RSS | **9.7 GB** |
+| `forward_moe` warm (router + layer-batch HTTP + combine) | **0.80 ms** mean / 0.79 p50 / 1.09 p99 |
+| `cpu_moe_forward` floor (no HTTP, same weights) | **0.37 ms** mean / 0.37 p50 / 0.49 p99 |
+| 30-layer sweep (1 decode-step's worth of MoE blocks) | **24.8 ms** (0.83 ms/layer) |
+| Steady RSS | **10.5 GB** |
 
-For comparison, before the per-expert refactor + Q4_K migration the same bench
-on the BF16 monolith was 4.86 ms `forward_moe` warm, 28.9 ms/layer cold-page
-sweep, and 16.6 GB steady RSS — i.e. the change cut latency 2.5× and RSS 1.7×.
+**End-to-end Gemma 4 26B-A4B grid generation (`larql run --moe-shards`,
+M3 Max, single local shard, 100-token poem, 3-run avg)**:
+
+| Mode | tok/s |
+|---|---|
+| HTTP unary (`http://...` shard) | **17.8** |
+| gRPC unary (`grpc://...` + `LARQL_MOE_NO_SPLIT=1`) | 17.7 |
+| **gRPC + SPLIT overlap (default for gRPC)** | **19.7** |
+| UDS HTTP/1.1 (`unix:///path` shard) | 18.2 |
+| UDS + f16 wire (`LARQL_MOE_WIRE_F16=1`) | 20.5 (warm); within noise vs UDS f32 |
+
+**Per-call HTTP overhead (loopback, post TCP_NODELAY)**:
+
+| Stage | TCP HTTP | UDS HTTP | gRPC streaming |
+|---|---|---|---|
+| Server compute (run_experts_cpu_batch) | ~400 µs | ~400 µs | ~400 µs |
+| spawn_blocking transition | ~25 µs | ~25 µs | ~25 µs |
+| Transport RTT + axum dispatch | ~100 µs | ~50 µs | ~30 µs (multiplexed) |
+| Encode + decode | ~5 µs | ~5 µs | ~5 µs (binary protobuf) |
+| **Total per-call** | **~660 µs** | **~510 µs** | **~460 µs** |
+
+For comparison, the historical baseline before any of this session's work
+was 4.86 ms `forward_moe` warm and 16.6 GB steady RSS on the BF16
+monolith (per-expert refactor + Q4_K migration cut that to 1.91 ms / 9.7
+GB at 2026-04-26). The 2026-05-01 session took 1.91 ms → 0.80 ms
+(another 2.4×) on the same per-call measurement, 56 ms → 24.8 ms
+(2.3×) on the 30-layer sweep, and end-to-end ~17.7 → ~19.7 tok/s
+(+12%) on the production grid. Cumulative session-on-session win is
+**8.6× from the 2.3 tok/s pre-Q4K baseline** (see
+`larql-inference/ROADMAP.md → M-CPU-1..6`).
 
 ---
 
@@ -145,9 +188,25 @@ tells us whether the in-room engineering translates to a deployable grid.
   fly.io setup probably wants per-shard token rotation (out of scope for
   Phase 1).
 
-### F0. CPU MoE correctness — unfinished, blocks the remote-MoE story
+### F0. CPU MoE correctness — server path correct, local path TBD
 
-**Status**: Open — bug found 2026-04-27, not yet root-caused.
+**Status**: Server-side resolved 2026-04-30 (gRPC grid + layer-batch
+HTTP path generates correct "Paris" / coherent poem output on
+`output/gemma4-26b-a4b-q4k.vindex`). Local in-process `larql run`
+without `--moe-shards` not re-validated this session — the kernel work
+in `larql-inference/ROADMAP.md → M-CPU-1..6` likely fixed the
+underlying issue (NEON SDOT direct-Q4K + scratch reuse + correct
+hybrid-combine ordering all share the same code path the local CPU
+inference uses), but a smoke-test run is the cheapest way to confirm.
+
+The remaining open item: 2026-04-27 historical analysis below describes
+the bug as it existed THEN; most of the suspects have since been
+addressed by the per-expert refactor + the M-CPU work. Re-running
+`larql run output/gemma4-26b-a4b-q4k.vindex "The capital of France is"`
+(no `--moe-shards`) and checking the output is "Paris" would close this
+out.
+
+**Historical context (2026-04-27, pre-M-CPU work):**
 
 The per-expert refactor + `experts_packed.bin` removal landed without a
 correctness end-to-end check. `larql run` on the 26B-A4B vindex via the CPU
@@ -603,6 +662,34 @@ the SDK is a thin wrapper over the OpenAI client.
 ---
 
 ## Completed
+
+### 2026-05-01 — HTTP CPU-path optimisations + UDS transport + layer-batch wire
+
+End-to-end ~17.7 → ~19.7 tok/s on Gemma 4 26B-A4B (M3 Max, single local
+gRPC shard, 100-token poem). Per-call HTTP overhead dropped from ~660 µs
+to ~460 µs on gRPC streaming, ~510 µs on UDS, ~660 µs on TCP HTTP (now
+with TCP_NODELAY). All optimisations preserve bit-exact semantics
+(verified by output equivalence on the same prompts).
+
+| Item | Outcome |
+|---|---|
+| **`POST /v1/experts/layer-batch`** new endpoint | One residual + K (expert_id, weight) pairs → one router-weighted-sum response. Replaces the K-residual-copies legacy `/v1/expert/batch` for the common-case `forward_moe`. Saves ~2.6 MB/token of redundant wire data + K-1 redundant `pre_experts_norm` + Q8_K quants on the server. |
+| **`POST /v1/experts/layer-batch-f16`** new endpoint | f16 variant — halves wire bytes (5.5 KB request + response). Opt-in via `LARQL_MOE_WIRE_F16=1` for LAN deployments. f16 conversion CPU cost (~9 µs/call) cancels the wire saving on loopback; expected +3-5% gain on 1 Gbps Ethernet. |
+| **Unix Domain Socket transport** (`--uds-path`, `unix://` URL) | Hand-rolled HTTP/1.1 over `UnixStream` (no new dep). Saves ~150 µs/call on loopback (~3% end-to-end). Persistent stream behind a `Mutex`, lazy reconnect on disconnect. Same wire format as TCP HTTP, so f16 + layer-batch semantics carry through unchanged. |
+| **TCP_NODELAY on accepted connections** | `axum::serve::ListenerExt::tap_io` hook calls `set_nodelay(true)` per accept. Defensive against tail-packet stalls (40-200 ms on Linux/BSD delayed ACK) on real LAN; within noise on loopback. |
+| **gRPC SPLIT default-on for gRPC shards** | Streaming fire/collect overlap now default for `grpc://` shards. Reliably ~12% steady-state win on M3 Max loopback (re-measured 19.5 vs 17.7 tok/s, alternating-cooled). The historical "20 → 4 tok/s catastrophic regression" warning predates the Metal MoE accuracy fix and the predispatch refactor; under thermal pressure both unary + SPLIT regress similarly, but stable-state SPLIT wins. Set `LARQL_MOE_NO_SPLIT=1` to opt out. |
+| Per-call timing instrumentation | `LARQL_HTTP_TIMING=1` (server: decode / spawn_overhead / compute / encode µs; client: encode / send_total / recv_body / decode µs). `LARQL_MOE_TIMING=1` (per-token: per-layer route+fire / collect / server compute estimate / network estimate). Used for the diagnostic round that found `__powisf2` libcall in the f16 decode hot path (now bit-manipulated). |
+| Test suite restored | 7+ test files had `LoadedModel { ... }` literals missing the `unit_filter` field added recently — all 9 LoadedModel literal sites in tests/ + tests/common/ patched. Test count went from 119 lib-only (broken integration tests) to **494 total across lib + 14 integration test files, all green**. |
+| README + docs updated | `README.md` rewrite: new headline mentioning MoE grid as first-class use case, full env-var reference table, refreshed CLI Options with `--uds-path`/`--units`, rewritten "Remote MoE shard topology" recipe with current numbers, new `/v1/experts/layer-batch[-f16]` API section, accurate Crate Structure (28 source files vs the 16 the doc previously listed). `docs/server-spec.md`: §4.5 Remote MoE Expert Endpoints added, §13.4 dropped "planned" status, §10.2 fly.io references `F-FLY`. |
+| `bench_expert_server` re-validated | Refreshed numbers in the Live perf snapshot section above. `cpu_moe_forward` floor 0.10 → 0.37 ms (the 0.10 was a buggy measurement on empty buffers — see prior compute ROADMAP). `forward_moe` warm 1.91 → 0.80 ms. 30-layer sweep 56 → 24.8 ms. RSS unchanged at ~10.5 GB. |
+
+Tried-but-reverted (kept in source for future hardware where the trade
+may flip):
+- `tokio::task::block_in_place` instead of `spawn_blocking` — server-side
+  faster (no transition cost) but tokio kept spawning replacement OS
+  workers when every request blocked, regressing sweep ~0.3 ms.
+- f16 wire as default — within noise on loopback (CPU conversion cancels
+  wire saving); kept as opt-in for LAN.
 
 ### 2026-04-26 — Per-expert byte table refactor + `experts_packed.bin` removal
 

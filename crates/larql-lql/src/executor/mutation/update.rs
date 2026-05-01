@@ -96,6 +96,8 @@ impl Session {
                     layer: *layer,
                     feature: *feature,
                     gate_vector_b64: None,
+                    up_vector_b64: None,
+                    down_vector_b64: None,
                     down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                         top_token: meta.top_token.clone(),
                         top_token_id: meta.top_token_id,

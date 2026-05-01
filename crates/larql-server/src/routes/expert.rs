@@ -115,8 +115,7 @@ pub fn run_experts_cpu_batch(
     }
     let inter = arch.moe_intermediate_size();
     let activation = larql_inference::activation_from_arch(arch);
-    let inter_padded = if let Some(per_layer) = weights.has_per_layer_ffn().then_some(()) {
-        let _ = per_layer;
+    let inter_padded = if weights.has_per_layer_ffn() {
         let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
         inter.div_ceil(block) * block
     } else {
@@ -977,4 +976,74 @@ pub async fn handle_experts_layer_batch_f16(
     }
 
     Ok(resp)
+}
+
+#[cfg(test)]
+mod layer_batch_wire_tests {
+    use larql_inference::ffn::moe_remote::{
+        decode_layer_batch_request, decode_layer_batch_request_f16, encode_layer_batch_request,
+        encode_layer_batch_request_f16, encode_layer_batch_response,
+        encode_layer_batch_response_f16,
+    };
+
+    /// Server-side `decode_layer_batch_request` round-trips a request encoded
+    /// by the client.  The actual handlers (`handle_experts_layer_batch{,_f16}`)
+    /// gate on this returning `Some` — short-circuit-friendly truncation
+    /// detection is critical for handler correctness, so we exercise it here.
+    #[test]
+    fn server_decodes_layer_batch_request_f32() {
+        let layer = 7usize;
+        let residual: Vec<f32> = (0..256).map(|i| i as f32 * 0.0125).collect();
+        let expert_ids: Vec<u32> = vec![1, 5, 23, 42];
+        let weights: Vec<f32> = vec![0.4, 0.3, 0.2, 0.1];
+        let bytes = encode_layer_batch_request(layer, &residual, &expert_ids, &weights);
+        let (l, r, ids, ws) = decode_layer_batch_request(&bytes).expect("decode round-trip");
+        assert_eq!(l, layer);
+        assert_eq!(r, residual);
+        assert_eq!(ids, expert_ids);
+        assert_eq!(ws, weights);
+    }
+
+    #[test]
+    fn server_rejects_truncated_layer_batch_request() {
+        let bytes = encode_layer_batch_request(0, &[1.0; 256], &[0u32], &[1.0]);
+        for trunc in [0usize, 8, 12, bytes.len() - 1] {
+            assert!(
+                decode_layer_batch_request(&bytes[..trunc]).is_none(),
+                "expected None on {} bytes (full = {})",
+                trunc,
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn server_decodes_layer_batch_request_f16() {
+        let layer = 11usize;
+        let residual: Vec<f32> = (0..256).map(|i| (i as f32 * 0.013).sin() * 5.0).collect();
+        let expert_ids: Vec<u32> = vec![3, 17];
+        let weights: Vec<f32> = vec![0.6, 0.4];
+        let bytes = encode_layer_batch_request_f16(layer, &residual, &expert_ids, &weights);
+        let (l, r, ids, ws) =
+            decode_layer_batch_request_f16(&bytes).expect("f16 decode round-trip");
+        assert_eq!(l, layer);
+        assert_eq!(ids, expert_ids);
+        assert_eq!(ws, weights);
+        assert_eq!(r.len(), residual.len());
+        // f16 round-trip → ~3 decimal digits; tolerate 0.1% relative.
+        for (a, b) in residual.iter().zip(r.iter()) {
+            let tol = (a.abs() * 1e-3).max(1e-3);
+            assert!((a - b).abs() < tol, "f16 drift {a} vs {b}");
+        }
+    }
+
+    /// Response encoders shouldn't panic on edge dims.  Empty (hidden=0)
+    /// returns a fixed-size 8-byte header (hidden u32 + latency f32).
+    #[test]
+    fn server_response_encoders_handle_empty() {
+        let bytes_f32 = encode_layer_batch_response(&[], 0.0);
+        assert_eq!(bytes_f32.len(), 8);
+        let bytes_f16 = encode_layer_batch_response_f16(&[], 0.0);
+        assert_eq!(bytes_f16.len(), 8);
+    }
 }

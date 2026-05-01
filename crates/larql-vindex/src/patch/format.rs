@@ -52,6 +52,16 @@ pub enum PatchOp {
         /// Base64-encoded f32 gate vector.
         #[serde(default)]
         gate_vector_b64: Option<String>,
+        /// Base64-encoded f32 up vector. Compose-mode INSERT writes a
+        /// norm-matched up override alongside gate; persisting it here
+        /// lets `apply_patch` reconstruct the install when the .vlp is
+        /// reapplied (without it `COMPILE INTO VINDEX` baked nothing).
+        #[serde(default)]
+        up_vector_b64: Option<String>,
+        /// Base64-encoded f32 down vector (column at the inserted slot).
+        /// Same rationale as `up_vector_b64`.
+        #[serde(default)]
+        down_vector_b64: Option<String>,
         #[serde(default)]
         down_meta: Option<PatchDownMeta>,
     },
@@ -60,6 +70,10 @@ pub enum PatchOp {
         feature: usize,
         #[serde(default)]
         gate_vector_b64: Option<String>,
+        #[serde(default)]
+        up_vector_b64: Option<String>,
+        #[serde(default)]
+        down_vector_b64: Option<String>,
         #[serde(default)]
         down_meta: Option<PatchDownMeta>,
     },
@@ -296,6 +310,8 @@ mod tests {
             target: "Paris".into(),
             confidence: None,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         };
         assert_eq!(op.key(), Some((3, 42)));
@@ -307,6 +323,8 @@ mod tests {
             layer: 5,
             feature: 7,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         };
         assert_eq!(op.key(), Some((5, 7)));
@@ -376,6 +394,8 @@ mod tests {
                 target: "B".into(),
                 confidence: None,
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             },
             PatchOp::Insert {
@@ -386,12 +406,16 @@ mod tests {
                 target: "D".into(),
                 confidence: None,
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             },
             PatchOp::Update {
                 layer: 0,
                 feature: 2,
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             },
             PatchOp::Delete {
@@ -441,6 +465,8 @@ mod tests {
             target: "Paris".into(),
             confidence: Some(0.95),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }];
         let patch = VindexPatch {
