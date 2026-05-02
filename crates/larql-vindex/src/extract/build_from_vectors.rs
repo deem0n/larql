@@ -301,14 +301,15 @@ pub fn build_vindex_from_vectors(
     // ── 6. Determine embed_scale from model family ──
     // Gemma models use sqrt(hidden_size), others use 1.0
     let intermediate_size = layer_feature_counts.values().max().copied().unwrap_or(0);
-    let embed_scale = if model_name.contains("gemma") {
+    let model_family_hint = model_name.to_ascii_lowercase();
+    let embed_scale = if model_family_hint.contains("gemma") {
         (hidden_size as f32).sqrt()
     } else {
         1.0
     };
-    let family = if model_name.contains("gemma") {
+    let family = if model_family_hint.contains("gemma") {
         "gemma3"
-    } else if model_name.contains("llama") || model_name.contains("Llama") {
+    } else if model_family_hint.contains("llama") {
         "llama"
     } else {
         "unknown"

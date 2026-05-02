@@ -20,6 +20,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::extract::stage_labels::STAGE_RELATION_CLUSTERS;
+use crate::format::filenames::{FEATURE_CLUSTERS_JSONL, RELATION_CLUSTERS_JSON};
 
 use larql_models::ModelWeights;
 use ndarray::Array2;
@@ -292,10 +293,10 @@ pub(super) fn run_clustering_pipeline(
 
     let clusters_json = serde_json::to_string_pretty(&cluster_result)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(output_dir.join("relation_clusters.json"), clusters_json)?;
+    std::fs::write(output_dir.join(RELATION_CLUSTERS_JSON), clusters_json)?;
 
     // Write per-feature cluster assignments
-    let assign_path = output_dir.join("feature_clusters.jsonl");
+    let assign_path = output_dir.join(FEATURE_CLUSTERS_JSONL);
     let mut assign_file = BufWriter::new(std::fs::File::create(&assign_path)?);
     for (i, &(layer, feat)) in data.features.iter().enumerate() {
         let record = serde_json::json!({ "l": layer, "f": feat, "c": assignments[i] });

@@ -13,14 +13,18 @@ use std::path::Path;
 
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::{
-    capture_donor_state, embedding_neighbors as li_embedding_neighbors,
+    capture_donor_state_with_ffn, embedding_neighbors as li_embedding_neighbors,
     embedding_row as li_embedding_row, embedding_row_scaled as li_embedding_row_scaled,
-    generate_cached_hooked, logit_lens_topk, patch_and_trace,
+    generate_cached_hooked, logit_lens_topk, patch_and_trace_with_ffn,
     project_through_unembed as li_project_through_unembed, trace_forward_full_hooked,
     track_race as li_track_race, track_token as li_track_token,
     unembedding_row as li_unembedding_row, RecordHook, SteerHook, ZeroAblateHook,
 };
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
+use larql_vindex::format::filenames::{
+    ATTN_WEIGHTS_BIN, DOWN_WEIGHTS_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, LM_HEAD_BIN,
+    MODEL_WEIGHTS_BIN, NORMS_BIN, UP_WEIGHTS_BIN, WEIGHT_MANIFEST_JSON,
+};
 use larql_vindex::{
     load_vindex_config, load_vindex_tokenizer, tokenizers, SilentLoadCallbacks, VectorIndex,
 };
@@ -68,11 +72,11 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
     let mut mmap_index: HashMap<String, usize> = HashMap::new();
 
     let weight_files = [
-        "attn_weights.bin",
-        "up_weights.bin",
-        "down_weights.bin",
-        "norms.bin",
-        "lm_head.bin",
+        ATTN_WEIGHTS_BIN,
+        UP_WEIGHTS_BIN,
+        DOWN_WEIGHTS_BIN,
+        NORMS_BIN,
+        LM_HEAD_BIN,
     ];
     for fname in &weight_files {
         let path = dir.join(fname);
@@ -85,7 +89,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
     }
 
     // Mmap embeddings
-    let embed_file = std::fs::File::open(dir.join("embeddings.bin")).map_err(|e| e.to_string())?;
+    let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN)).map_err(|e| e.to_string())?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file) }.map_err(|e| e.to_string())?;
     let embed_idx = mmaps.len();
     mmaps.push(WeightMmap {
@@ -94,7 +98,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
     });
 
     // Mmap gate_vectors
-    let gate_file = std::fs::File::open(dir.join("gate_vectors.bin")).map_err(|e| e.to_string())?;
+    let gate_file = std::fs::File::open(dir.join(GATE_VECTORS_BIN)).map_err(|e| e.to_string())?;
     let gate_mmap = unsafe { memmap2::Mmap::map(&gate_file) }.map_err(|e| e.to_string())?;
     let gate_idx = mmaps.len();
     mmaps.push(WeightMmap {
@@ -104,7 +108,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
 
     // Read manifest
     let manifest_text =
-        std::fs::read_to_string(dir.join("weight_manifest.json")).map_err(|e| e.to_string())?;
+        std::fs::read_to_string(dir.join(WEIGHT_MANIFEST_JSON)).map_err(|e| e.to_string())?;
 
     #[derive(serde::Deserialize)]
     struct Entry {
@@ -127,7 +131,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
 
     for entry in &entries {
         let fname = if entry.file.is_empty() {
-            "model_weights.bin"
+            MODEL_WEIGHTS_BIN
         } else {
             &entry.file
         };
@@ -522,8 +526,9 @@ impl PyWalkModel {
 
     /// Capture a complete residual stream trace.
     ///
-    /// Runs a full forward pass, recording the residual, attn_delta, and ffn_delta
-    /// at every layer. Returns a ResidualTrace object.
+    /// Runs a full forward pass through WalkFfn, recording the residual,
+    /// attn_delta, and post-attention ffn_delta at every layer. Returns a
+    /// ResidualTrace object.
     ///
     /// Args:
     ///     prompt: Input text
@@ -534,7 +539,14 @@ impl PyWalkModel {
     ///     t.answer_trajectory("Paris")
     #[pyo3(signature = (prompt, positions="last"))]
     fn trace(&self, prompt: &str, positions: &str) -> PyResult<trace_py::PyResidualTrace> {
-        trace_py::capture_trace(&self.weights, &self.tokenizer, prompt, positions)
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        trace_py::capture_trace_with_ffn(
+            &self.weights,
+            &self.tokenizer,
+            prompt,
+            positions,
+            &walk_ffn,
+        )
     }
 
     // ── Mechanistic interp surface (lazarus parity) ────────────────────────
@@ -693,8 +705,8 @@ impl PyWalkModel {
     /// coords. Returns last-token residuals at `capture_layers` (post-
     /// patch).
     ///
-    /// Mirrors lazarus's `patch_activations`. Uses dense FFN for
-    /// faithfulness (not the walk path).
+    /// Mirrors lazarus's `patch_activations`. Uses the vindex WalkFfn path
+    /// so patches are measured against the same mechanism as inference.
     #[pyo3(signature = (donor_prompt, recipient_prompt, coords, capture_layers))]
     fn patch_activations<'py>(
         &self,
@@ -707,8 +719,15 @@ impl PyWalkModel {
         let donor_tokens = self.encode(donor_prompt)?;
         let recipient_tokens = self.encode(recipient_prompt)?;
 
-        let donor = capture_donor_state(&self.weights, &donor_tokens, &coords);
-        let trace = patch_and_trace(&self.weights, &recipient_tokens, &donor, &capture_layers);
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let donor = capture_donor_state_with_ffn(&self.weights, &donor_tokens, &coords, &walk_ffn);
+        let trace = patch_and_trace_with_ffn(
+            &self.weights,
+            &recipient_tokens,
+            &donor,
+            &capture_layers,
+            &walk_ffn,
+        );
 
         let out = PyDict::new(py);
         for (layer, residual) in trace.residuals {

@@ -238,7 +238,7 @@ pub fn load_model_weights_with_opts(
         }
 
         let filename = if entry.file.is_empty() {
-            "model_weights.bin".to_string()
+            crate::format::filenames::MODEL_WEIGHTS_BIN.to_string()
         } else {
             entry.file.clone()
         };

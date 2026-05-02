@@ -192,7 +192,9 @@ pub fn predict_split_pass(
         if let Some(q4_mmap) = gate_index.interleaved_q4_mmap_ref() {
             let intermediate = gate_index.num_features(layer_range.start);
             if intermediate > 0 {
-                let q4_bytes_per_matrix = intermediate * hidden / 32 * 18;
+                let q4_bytes_per_matrix = larql_compute::QuantFormat::Q4_0
+                    .packed_matrix_bytes(intermediate, hidden)
+                    .expect("Q4_0 interleaved FFN format must have packed geometry");
                 let q4_bytes_per_layer = q4_bytes_per_matrix * 3;
 
                 // Collect Q4 data slices for all walk layers
@@ -422,18 +424,15 @@ pub fn predict_honest(
             let intermediate = gate_index.num_features(layer_range.start);
             let hidden = weights.hidden_size;
             if intermediate > 0 && (has_q4k || has_q8) {
-                // Q4_K (GGUF): 144B/256vals, Q4_0: 18B/32vals
-                let q4_ffn_per_matrix = if ffn_is_q4k {
-                    (intermediate * hidden).div_ceil(256) * 144
-                } else {
-                    intermediate * hidden / 32 * 18
-                };
-                // q4_ffn_per_layer computed inside build_pipeline_layers
                 let ffn_format = if ffn_is_q4k {
                     larql_compute::QuantFormat::Q4_K
                 } else {
                     larql_compute::QuantFormat::Q4_0
                 };
+                let q4_ffn_per_matrix = ffn_format
+                    .packed_matrix_bytes(intermediate, hidden)
+                    .expect("Q4 interleaved FFN format must have packed geometry");
+                // q4_ffn_per_layer computed inside build_pipeline_layers
                 let arch = &*weights.arch;
 
                 let layers = super::pipeline_layer::build_pipeline_layers(

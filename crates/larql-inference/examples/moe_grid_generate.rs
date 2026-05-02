@@ -16,7 +16,8 @@
 extern crate blas_src;
 
 use larql_inference::{
-    encode_prompt, layer_graph::grid::generate_with_remote_moe, RemoteMoeBackend, ShardConfig,
+    encode_prompt, layer_graph::grid::generate_with_remote_moe, EosConfig, RemoteMoeBackend,
+    ShardConfig,
 };
 use larql_vindex::{load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex};
 use std::sync::Arc;
@@ -102,8 +103,9 @@ fn main() -> Result<(), BoxErr> {
     print!("{prompt}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
+    let eos = EosConfig::from_vindex_dir(&vindex_path);
     let result = generate_with_remote_moe(
-        &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &backend,
+        &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &backend, &eos,
     )?;
 
     for (tok, ms) in result.tokens.iter().zip(result.decode_ms.iter()) {

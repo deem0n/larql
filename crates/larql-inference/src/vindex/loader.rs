@@ -36,16 +36,11 @@
 use std::path::Path;
 
 use crate::error::InferenceError;
+use larql_vindex::format::filenames::{
+    ATTN_WEIGHTS_Q4K_BIN as ATTN_Q4K_BIN, ATTN_WEIGHTS_Q8_BIN as ATTN_Q8_BIN, INTERLEAVED_Q4K_BIN,
+    INTERLEAVED_Q4_BIN, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
+};
 use larql_vindex::{SilentLoadCallbacks, VectorIndex, VindexError};
-
-/// Vindex sub-files probed by [`open_inference_vindex`]. Names mirror
-/// `larql_vindex::format::filenames` so renames stay in sync.
-const ATTN_Q4K_BIN: &str = "attn_weights_q4k.bin";
-const ATTN_Q8_BIN: &str = "attn_weights_q8.bin";
-const INTERLEAVED_Q4K_BIN: &str = "interleaved_q4k.bin";
-const INTERLEAVED_Q4_BIN: &str = "interleaved_q4.bin";
-const LM_HEAD_BIN: &str = "lm_head.bin";
-const LM_HEAD_Q4_BIN: &str = "lm_head_q4.bin";
 
 /// Open a vindex for inference: load core, lm_head (best-effort),
 /// attention weights (strict), FFN weights (strict).

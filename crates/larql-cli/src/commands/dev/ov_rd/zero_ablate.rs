@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use larql_inference::{encode_prompt, hidden_to_raw_logits};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex,
@@ -42,9 +42,21 @@ pub(super) struct ZeroAblateArgs {
     #[arg(long, default_value_t = 8)]
     top_heads: usize,
 
+    /// Stage-0 statistic used to rank --top-heads.
+    #[arg(long, value_enum, default_value_t = Stage0Rank::RawVariance)]
+    stage0_rank: Stage0Rank,
+
     /// Limit prompts for bounded gate runs.
     #[arg(long)]
     max_prompts: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Stage0Rank {
+    /// Rank by raw pre-W_O variance.
+    RawVariance,
+    /// Rank by W_O-visible residual contribution variance.
+    WoVisibleVariance,
 }
 
 #[derive(Debug)]
@@ -245,9 +257,8 @@ fn select_zero_ablation_heads(
         let report: CaptureReport = serde_json::from_reader(file)?;
         let mut candidates = report.heads;
         candidates.sort_by(|a, b| {
-            b.stats
-                .variance
-                .partial_cmp(&a.stats.variance)
+            stage0_rank_score(b, args.stage0_rank)
+                .partial_cmp(&stage0_rank_score(a, args.stage0_rank))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates
@@ -263,6 +274,17 @@ fn select_zero_ablation_heads(
     heads.sort_by_key(|h| (h.layer, h.head));
     heads.dedup();
     Ok(heads)
+}
+
+fn stage0_rank_score(head: &super::reports::HeadReport, rank: Stage0Rank) -> f64 {
+    match rank {
+        Stage0Rank::RawVariance => head.stats.variance,
+        Stage0Rank::WoVisibleVariance => head
+            .wo_visible_stats
+            .as_ref()
+            .map(|stats| stats.variance)
+            .unwrap_or(f64::NEG_INFINITY),
+    }
 }
 
 pub(super) fn forward_q4k_zero_pre_o_head(

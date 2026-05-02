@@ -31,6 +31,8 @@
 //! suites: missing vindexes return early with a skip note unless
 //! `LARQL_ARCH_STRICT=1`.
 
+#![cfg(feature = "metal")]
+
 use std::path::PathBuf;
 
 use larql_compute::ComputeBackend;

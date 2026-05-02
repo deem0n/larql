@@ -426,17 +426,15 @@ pub fn generate_with_remote_moe(
         })?;
     let ffn_is_q4k = gate_index.interleaved_q4k_mmap_ref().is_some();
 
-    let intermediate = gate_index.num_features(0);
-    let q4_ffn_per_matrix = if ffn_is_q4k {
-        (intermediate * hidden).div_ceil(256) * 144
-    } else {
-        intermediate * hidden / 32 * 18
-    };
     let ffn_format = if ffn_is_q4k {
         larql_compute::QuantFormat::Q4_K
     } else {
         larql_compute::QuantFormat::Q4_0
     };
+    let intermediate = gate_index.num_features(0);
+    let q4_ffn_per_matrix = ffn_format
+        .packed_matrix_bytes(intermediate, hidden)
+        .ok_or_else(|| RemoteMoeError::BadResponse("unsupported interleaved FFN format".into()))?;
 
     let layers = build_pipeline_layers(
         weights,
@@ -859,16 +857,14 @@ pub fn generate_with_remote_moe_batch(
         .ok_or_else(|| RemoteMoeError::BadResponse("no interleaved Q4 FFN mmap".into()))?;
     let ffn_is_q4k = gate_index.interleaved_q4k_mmap_ref().is_some();
     let intermediate = gate_index.num_features(0);
-    let q4_ffn_per_matrix = if ffn_is_q4k {
-        (intermediate * hidden).div_ceil(256) * 144
-    } else {
-        intermediate * hidden / 32 * 18
-    };
     let ffn_format = if ffn_is_q4k {
         larql_compute::QuantFormat::Q4_K
     } else {
         larql_compute::QuantFormat::Q4_0
     };
+    let q4_ffn_per_matrix = ffn_format
+        .packed_matrix_bytes(intermediate, hidden)
+        .ok_or_else(|| RemoteMoeError::BadResponse("unsupported interleaved FFN format".into()))?;
     let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
         weights,
         index,

@@ -28,6 +28,39 @@ runtime contracts are stable.
 
 ---
 
+## P0: Best-in-class mechanistic interpretability engine
+
+**Status**: In progress as of 2026-05-02.
+
+The target is not just "TRACE runs"; the target is that every mechanism LARQL
+can execute is also queryable, attributable, patchable, and reproducible as a
+research artifact.
+
+| # | Item | Status |
+|---|------|--------|
+| MI0 | Faithful residual DAG: TRACE routes through the canonical layer runner and `residual[L] = residual[L-1] + attn_delta + ffn_delta` is test-pinned | shipped 2026-05-02 |
+| MI1 | Python `WalkModel.trace()` and `patch_activations()` use vindex `WalkFfn`, not dense fallback | shipped 2026-05-02 |
+| MI2 | Backend-parametric activation patching helpers for donor capture and recipient intervention | shipped 2026-05-02 |
+| MI3 | Trace artifact contract: complete ordered chains only, exact file length checks, `TRACE SAVE` requires `POSITIONS ALL` | shipped 2026-05-02 |
+| MI4 | Golden parity tests: TRACE final residual/logits match canonical forward across dense, WalkFfn, patched vindex, Q4K, and MoE paths | partial — dense/custom backend pinned |
+| MI5 | Rich attribution objects: per-head attention writes, per-feature FFN activations, router/expert decisions, and path-level provenance | planned |
+| MI6 | Expanded causal operators: head patching, feature patching, FFN feature ablation, router/expert patching, and KV/residual boundary patching | planned |
+| MI7 | Q4K/MoE interpretability parity: trace and patch support for quantized dense and routed expert paths, with clear precision caveats | planned |
+| MI8 | Python experiment ergonomics: batched prompts, donor/recipient alignment helpers, causal effect metrics, artifact metadata, and reproducibility stamps | planned |
+
+Near-term order:
+
+1. Finish MI4 for WalkFfn and patched-vindex paths, because dense and custom
+   backend parity are now pinned.
+2. Add attribution records where the forward path already exposes data:
+   attention captures, WalkFfn feature dispatch, and activation top-k.
+3. Extend patching operators one mechanism at a time, starting with
+   post-attention/head writes and FFN feature activations.
+4. Only then promote Q4K/MoE trace/patch support to first-class status, because
+   those paths need parity tests before they can be trusted as evidence.
+
+---
+
 ## ✅ Metal lm_head — stride-32 Q4_K matvec, f16 GEMV fallback (correctness + perf fix, 2026-05-01)
 
 > **2026-05-02 follow-up — the root cause was wrong.** What was diagnosed
@@ -1235,9 +1268,9 @@ From the 2026-05-02 interpretability review. These items are correctness
 requirements for using TRACE as evidence, not polish.
 
 ### Route decomposed TRACE through the real layer sequence
-**Status**: Planned  
+**Status**: Shipped 2026-05-02
 **Files**: `trace/capture.rs`, `forward/layer.rs`, `trace/types.rs`,
-`crates/larql-lql/src/executor/trace.rs`  
+`crates/larql-lql/src/executor/trace.rs`
 `trace_residuals` currently records attention and FFN deltas but stops at
 `h_post_ffn`, while the production layer path also applies per-layer embeddings
 and layer scalar. Rework trace capture so the recorded residual is the same
@@ -1246,12 +1279,28 @@ state the next layer actually sees. Either add explicit `ple_delta` /
 derive all deltas from the canonical runner.
 
 ### Python WalkModel.trace must use vindex FFN
-**Status**: Planned  
-**Files**: `crates/larql-python/src/walk.rs`, `crates/larql-python/src/trace_py.rs`  
+**Status**: Shipped 2026-05-02
+**Files**: `crates/larql-python/src/walk.rs`, `crates/larql-python/src/trace_py.rs`
 `WalkModel.trace()` should construct a `WalkFfn` from `self.index` and preserve
 patch/overlay semantics. The current dense `WeightFfn` trace is useful as a
 baseline, but it is not the trace of the vindex-backed model the user is
 querying.
+
+### Trace save contract must fail loudly on incomplete artifacts
+**Status**: Shipped 2026-05-02
+**Files**: `trace/store.rs`, `trace/types.rs`,
+`crates/larql-lql/src/executor/trace.rs`
+Persisted chain traces now require complete ordered token chains and exact file
+lengths. `TRACE ... SAVE` requires `POSITIONS ALL` so downstream mmap readers do
+not silently consume partial traces as if they were complete context graphs.
+
+### Golden parity tests for TRACE as evidence
+**Status**: Partial — dense and custom backend parity shipped 2026-05-02
+**Files**: `trace/capture.rs`, `tests/test_trace.rs`, Python binding tests
+Final trace residuals now project to the same logits as the canonical dense
+raw-forward path, and a custom `FfnBackend` trace matches the generic hooked
+forward runner. Extend the matrix to WalkFfn, patched-vindex, Q4K, and MoE as
+those test fixtures become cheap enough to run in CI.
 
 ### Rank displayed gate features by contribution, not raw |dot|
 **Status**: Planned  

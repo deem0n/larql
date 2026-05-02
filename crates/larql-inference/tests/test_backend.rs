@@ -4,7 +4,7 @@
 //! attention projections, QK^T, FFN up/down, and final logits.
 
 use larql_compute::CpuBackend;
-use larql_compute::{default_backend, ComputeBackend, MatMulOp};
+use larql_compute::{default_backend, MatMul, MatMulOp};
 use ndarray::Array2;
 
 /// Deterministic f32 data generator.

@@ -44,6 +44,7 @@ memmap2 = "0.9"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+base64 = "0.22"
 
 [features]
 default = []

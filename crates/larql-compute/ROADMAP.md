@@ -87,12 +87,14 @@ time, Metal experts give 3-4× speedup vs CPU experts).
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **78–79** | ~12.7ms | corrected baseline (see ⚠ note below) |
-| **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **94–98** | ~10.5ms | reference (same hardware, same prompt) |
-| **Gap** | LARQL is **~1.27×** slower | ~2.2ms/tok | per-stage decomposition below |
-| **LARQL Metal** (gemma4-26B-A4B, MoE Q4K GPU dispatch) | **5.1** | ~194ms | Phase 1 shipped; Phase 2 open — see P0 below |
-| **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; expert dispatch accounts for ~179ms gap |
+| **LARQL Metal** (gemma3-4b-q4k-v2, post 2026-05-02 dispatch fix) | **83–84** | 11.9ms | current baseline; lm_head 1.85ms (was 2.95ms), gap to ollama 1.18× |
+| **LARQL Metal** (gemma3-4b-q4k-v2, pre 2026-05-02) | 76 | 13.1ms | pre-fix baseline; stride-32 lm_head workaround |
+| **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | 70.1 | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
+| **Ollama** gemma3:4b | 98.5–99.7 | ~10.0ms | reference (same hardware, same prompt) |
+| **Gap** | LARQL is **~1.18×** slower | ~2.0ms/tok | per-stage decomposition below |
+| **LARQL Metal** (gemma4-26B-A4B, MoE Q4K, post 2026-05-02 fix) | **19.4** | ~52ms | dispatch geometry corrected; output coherent multilingual |
+| **LARQL Metal** (gemma4-26B-A4B, pre 2026-05-02) | 5.1 | ~194ms | bug-locked under dispatch-geometry mismatch; degraded output |
+| **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; remaining ~37ms expert work |
 
 > ⚠ **The earlier "81–84 tok/s" number was on broken code.** Bisected
 > 2026-04-28: commit `077884b "working on performance"` (2026-04-27)
@@ -210,7 +212,24 @@ Concrete next investigation: try different threadgroup configurations (more simd
 
 ## P0: Production gap closers
 
-Remaining gap: **~1.30×** (~76 vs ~99 tok/s, ~3ms/tok).
+Remaining gap: **~1.18×** (~84 vs ~99 tok/s, ~2ms/tok) post 2026-05-02
+dispatch geometry fix. Was ~1.30× pre-fix. The historical diagnosis
+below was on the pre-fix baseline — kept for context.
+
+### Open decode-side levers (post 2026-05-02)
+
+| # | Lever | Estimated win | Status | File / approach |
+|---|---|---|---|---|
+| **D-ATTN-MTG** | Multi-TG `attn_fused` retry — preserve 12 TGs while fusing qk_norm_rope + kv_append + attend | 0.2–0.4 ms/tok within the 3.48 ms attention bucket | Open. First attempt regressed −1.45 ms because the merge collapsed TG count 12→8; the multi-TG-per-head variant (split QKV+attend across 2 TGs/head, total ≥12) is untried. ADR-015 § "Lesson — diagnostic order" applies. | `metal/shaders/attn_fused.rs` rewrite; gated on `LARQL_FUSED_ATTN=1` until verified |
+| **D-FFN-PROFILE** | Split `encode_ffn` profiler boundary (gate_up vs activation+down) | Diagnostic, not perf. Tells us whether the 6.13 ms FFN bucket is gate+up-bound or down-bound, which informs whether **D-FFN-FUSE** is worth pursuing | Open. `LARQL_PROFILE_SPLIT=1` currently reports attn vs full-FFN; finer granularity needs a commit/wait boundary inserted between gate+up and down inside `encode_q4k_ffn`. | `metal/decode/encode_ffn.rs` + `metal/decode/profile.rs` |
+| **D-FFN-FUSE** | Q6_K geglu+down fusion with cheaper-activation variant | ~0.2 ms/tok | Open. First attempt (`q6k_geglu_gelu_tanh_down`) regressed because `tanh` was recomputed 2560× per output row. Needs precomputed activation in a small kernel, then a `q6k_matvec_f32in` variant. | `metal/shaders/q6k_geglu_*` |
+| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | 3–4× prefill speedup on long prompts (closes 4–14× prefill gap to ollama) | Open. Kernel + parity tests shipped; only O-proj wired (within-noise impact). FFN sites are clean per-position matvec → matmul swaps; QKV requires a fused QKV matmul or fallback to per-projection matmul. | `metal/ops/full_pipeline/{stages,ffn}.rs` |
+
+**Sequencing rationale**: do **D-FFN-PROFILE** first (cheap, diagnostic).
+If gate+up dominates → D-ATTN-MTG won't move much, prioritise FFN. If
+down dominates → D-FFN-FUSE earns its complexity. Either way, the
+profiler split is the next decision before chasing the smaller wins.
+**D-PREFILL-MM** is independent (prefill-only, doesn't touch decode).
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)
 
@@ -898,10 +917,31 @@ weight cache utilisation. GPU layer_scalar skipped for MoE layers in the
 dispatch; the callback applies it correctly after combining dense + MoE.
 `kv_copy::populate_kv_one_layer` added for per-layer KV cache population.
 
-### GPU expert dispatch — Phase 2: pre-allocated staging buffers (ACTIVE 2026-04-26)
+### GPU expert dispatch — Phase 2: pre-allocated staging buffers (DONE; baseline corrected 2026-05-02)
 
-**Status**: ACTIVE — the single remaining fix to reach ~15–20 tok/s on Gemma 4 26B A4B  
-**Measured**: Phase 1 shipped 5.1 tok/s. Phase 2 expected ~4× gain. GPU-only ceiling: 56.8 tok/s.
+**Status**: SHIPPED. `MoeScratch::new` (in `metal/moe_dispatch.rs`)
+pre-allocates all expert staging buffers once per model shape and caches
+by `(top_k, hidden, intermediate_size)` on the backend. Per-layer
+`gpu_moe_dispatch_with_scratch` only memcpys expert bytes into existing
+buffer contents — no `bufs.output(...)` calls in the hot path.
+
+**Measured 2026-05-02 (post Phase 2 + dispatch-geometry fix)**:
+- 26B A4B Metal: **19.4 tok/s** (was 5.1 pre-2026-05-02 — bug-locked under
+  the dispatch-geometry mismatch in the same `moe_dispatch.rs` sites; the
+  "Phase 1 shipped 5.1 tok/s" baseline was attributing the bug-locked
+  number to Phase 1, which was wrong).
+- GPU-only ceiling (`SKIP_MOE=1`): **56.8 tok/s**.
+- Remaining headroom (19.4 → 56.8): genuine expert dispatch work
+  (240/token = 8 experts × 30 layers × 1 fused gate+up + 1 GEGLU + 1 down)
+  + 30 commit/wait syncs. Real shader/dispatch work, not allocation.
+
+The pre-2026-05-02 "Phase 2 expected ~4× gain" estimate happened to
+match the actual 5.1 → 19.4 perf jump — not because Phase 2 was the
+load-bearing fix, but because the dispatch-geometry mismatch was masking
+the same ~4× of real perf as 240 broken expert dispatches. With both
+fixes in, the new ceiling estimate for 26B A4B is ~25–30 tok/s if the
+expert-dispatch fusion levers in `larql-server/ROADMAP.md§F-LOCAL-MOE`
+land.
 
 **Scope (single landing):**
 

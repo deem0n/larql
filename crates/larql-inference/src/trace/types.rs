@@ -15,7 +15,11 @@ pub struct TraceNode {
     pub residual: Vec<f32>,
     /// What attention added at this layer. Zero for embedding layer.
     pub attn_delta: Vec<f32>,
-    /// What FFN added at this layer. Zero for embedding layer.
+    /// What the post-attention path added at this layer. Zero for embedding
+    /// layer. On plain decoder blocks this is the FFN residual write; on
+    /// architectures with PLE/post norms/layer scales it includes those
+    /// model-specific terms so that:
+    /// `residual[layer] = residual[layer-1] + attn_delta + ffn_delta`.
     pub ffn_delta: Vec<f32>,
 }
 
@@ -173,7 +177,6 @@ impl ResidualTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attention::AttentionWeights;
 
     fn node(layer: i32, position: usize) -> TraceNode {
         TraceNode {

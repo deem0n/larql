@@ -116,8 +116,25 @@ pub struct CompletionChoice {
     pub text: String,
     pub index: usize,
     pub finish_reason: &'static str,
-    /// Always `null` in this slice (logprobs F18).
-    pub logprobs: Option<()>,
+    /// Populated when the request set `logprobs: int`. `None`
+    /// (serialised as `null`) otherwise.
+    pub logprobs: Option<CompletionLogprobs>,
+}
+
+/// Legacy `/v1/completions` logprobs shape — parallel arrays of
+/// per-token info. Different from chat completions' nested-content
+/// envelope, but the inner data is the same.
+///
+/// `top_logprobs` is one map per token of `{candidate → logprob}`;
+/// empty maps until the inference layer exposes top-K alternatives
+/// (follow-up). The picked-token entry alone preserves wire shape so
+/// existing eval harnesses parse cleanly.
+#[derive(Serialize)]
+pub struct CompletionLogprobs {
+    pub tokens: Vec<String>,
+    pub token_logprobs: Vec<f64>,
+    pub top_logprobs: Vec<std::collections::BTreeMap<String, f64>>,
+    pub text_offset: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -211,6 +228,7 @@ pub async fn handle_completions(
     }
 
     // Non-streaming: the existing buffered path.
+    let logprobs_requested = req.logprobs;
     let (choices, prompt_tokens, completion_tokens) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
             run_completions_loop(
@@ -222,6 +240,7 @@ pub async fn handle_completions(
                 seed,
                 &stop_strings,
                 echo,
+                logprobs_requested,
             )
         })
         .await
@@ -378,6 +397,7 @@ fn run_completions_loop(
     seed: Option<u64>,
     stop_strings: &[String],
     echo: bool,
+    logprobs_requested: Option<usize>,
 ) -> Result<(Vec<CompletionChoice>, usize, usize), ServerError> {
     // Take an exclusive write guard on the weights. Each prompt in
     // the batch is generated in turn under the same guard so the
@@ -431,11 +451,11 @@ fn run_completions_loop(
         );
 
         let mut completion_text = String::new();
-        let mut completion_token_count = 0usize;
+        let mut completion_tokens: Vec<(String, f64)> = Vec::new();
         let mut finish_reason = "length";
-        for (text, _prob) in &result.tokens {
+        for (text, prob) in &result.tokens {
             completion_text.push_str(text);
-            completion_token_count += 1;
+            completion_tokens.push((text.clone(), *prob));
             if larql_inference::vindex::is_end_of_turn(text) {
                 finish_reason = "stop";
                 break;
@@ -444,9 +464,22 @@ fn run_completions_loop(
         if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
             completion_text = trim_at_stop(&completion_text, stop_strings);
             finish_reason = "stop";
+            // Drop tokens past the byte boundary so logprobs and text stay
+            // length-aligned.
+            let target = completion_text.len();
+            let mut acc = 0usize;
+            completion_tokens.retain(|(t, _)| {
+                if acc >= target {
+                    return false;
+                }
+                acc += t.len();
+                true
+            });
         }
 
-        total_completion_tokens += completion_token_count;
+        total_completion_tokens += completion_tokens.len();
+
+        let logprobs = logprobs_requested.map(|_| build_completion_logprobs(&completion_tokens));
 
         let text_out = if echo {
             format!("{prompt}{completion_text}")
@@ -458,11 +491,43 @@ fn run_completions_loop(
             text: text_out,
             index: idx,
             finish_reason,
-            logprobs: None,
+            logprobs,
         });
     }
 
     Ok((choices, total_prompt_tokens, total_completion_tokens))
+}
+
+/// Map per-token `(text, prob)` pairs to OpenAI's legacy completions
+/// `logprobs` envelope. `prob` from the inference layer is currently a
+/// `1.0` placeholder (per-token softmax not yet exposed), so logprob
+/// resolves to `0.0` for every token. `top_logprobs` is an empty map
+/// per token until top-K alternatives are surfaced (follow-up).
+fn build_completion_logprobs(tokens: &[(String, f64)]) -> CompletionLogprobs {
+    use std::collections::BTreeMap;
+
+    let mut text_offset = Vec::with_capacity(tokens.len());
+    let mut acc = 0usize;
+    for (text, _) in tokens {
+        text_offset.push(acc);
+        acc += text.len();
+    }
+    CompletionLogprobs {
+        tokens: tokens.iter().map(|(t, _)| t.clone()).collect(),
+        token_logprobs: tokens
+            .iter()
+            .map(|(_, p)| p.max(f64::MIN_POSITIVE).ln())
+            .collect(),
+        top_logprobs: tokens
+            .iter()
+            .map(|(t, p)| {
+                let mut m: BTreeMap<String, f64> = BTreeMap::new();
+                m.insert(t.clone(), p.max(f64::MIN_POSITIVE).ln());
+                m
+            })
+            .collect(),
+        text_offset,
+    }
 }
 
 #[cfg(test)]
@@ -487,5 +552,22 @@ mod tests {
             CompletionPrompt::Batch(v) => assert_eq!(v, vec!["a", "b"]),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn build_completion_logprobs_aligns_offsets_and_arrays() {
+        let toks = vec![
+            ("Paris".to_string(), 1.0),
+            (" is".to_string(), 1.0),
+        ];
+        let lp = build_completion_logprobs(&toks);
+        assert_eq!(lp.tokens, vec!["Paris".to_string(), " is".to_string()]);
+        assert_eq!(lp.token_logprobs.len(), 2);
+        assert_eq!(lp.text_offset, vec![0, 5]);
+        assert_eq!(lp.top_logprobs.len(), 2);
+        // prob=1.0 → logprob=0.0.
+        assert!((lp.token_logprobs[0] - 0.0).abs() < 1e-6);
+        // top_logprobs[i] currently contains just the picked token.
+        assert!(lp.top_logprobs[0].contains_key("Paris"));
     }
 }

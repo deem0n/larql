@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::error::LqlError;
 use crate::executor::helpers::{dir_size, format_bytes};
 use crate::executor::Session;
+use larql_vindex::format::filenames::TOKENIZER_JSON;
 
 use super::collect_memit_facts_with_recording;
 
@@ -118,8 +119,8 @@ impl Session {
         larql_vindex::write_model_weights(&weights, &output_dir, &mut build_cb)
             .map_err(|e| LqlError::exec("failed to write model", e))?;
 
-        let tok_src = vindex_path.join("tokenizer.json");
-        let tok_dst = output_dir.join("tokenizer.json");
+        let tok_src = vindex_path.join(TOKENIZER_JSON);
+        let tok_dst = output_dir.join(TOKENIZER_JSON);
         if tok_src.exists() {
             std::fs::copy(&tok_src, &tok_dst)
                 .map_err(|e| LqlError::exec("failed to copy tokenizer", e))?;

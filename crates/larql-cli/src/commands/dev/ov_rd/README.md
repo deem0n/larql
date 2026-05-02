@@ -67,6 +67,11 @@ Keep Rust code here when it needs exact model/vindex behavior:
 - model-native discrete address probes whose inputs are already produced by a
   real forward pass, for example previous-layer FFN top-feature IDs and
   attention/relation summaries or learned attention-pattern cluster IDs
+- targeted majority/stratum controls for selected PQ groups, so scale-up
+  diagnostics do not need full 48-group importance sweeps
+- W_O-visible Stage-0 ranking controls, for example
+  `zero-ablate --stage0-rank wo-visible-variance`, so Gate 1 promotes heads by
+  residual-space impact rather than raw pre-W_O variance when available
 - canonical JSON artifacts that other tools consume
 
 The command should remain an orchestrator plus faithful runtime validator. It

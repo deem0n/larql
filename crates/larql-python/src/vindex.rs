@@ -16,8 +16,9 @@ use pyo3::types::PyDict;
 
 use larql_vindex::patch::knn_store::KnnStore;
 use larql_vindex::{
-    load_vindex_config, load_vindex_embeddings, load_vindex_tokenizer, tokenizers, FeatureMeta,
-    SilentLoadCallbacks, VectorIndex, VindexConfig, WalkHit,
+    format::filenames::KNN_STORE_BIN, load_vindex_config, load_vindex_embeddings,
+    load_vindex_tokenizer, tokenizers, FeatureMeta, SilentLoadCallbacks, VectorIndex, VindexConfig,
+    WalkHit,
 };
 
 use larql_lql::relations::RelationClassifier;
@@ -366,7 +367,7 @@ impl PyVindex {
         let classifier = RelationClassifier::from_vindex(dir);
 
         // Load the arch-B KNN store if the compiled vindex bundled one.
-        let knn_path = dir.join("knn_store.bin");
+        let knn_path = dir.join(KNN_STORE_BIN);
         let knn_store = if knn_path.exists() {
             match KnnStore::load(&knn_path) {
                 Ok(store) => Some(store),

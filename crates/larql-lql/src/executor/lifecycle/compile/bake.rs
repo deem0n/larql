@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::LqlError;
+use larql_vindex::format::filenames::{DOWN_WEIGHTS_BIN, GATE_VECTORS_BIN, WEIGHT_MANIFEST_JSON};
 
 pub(super) fn copy_for_patch(src: &std::path::Path, dst: &std::path::Path) -> Result<(), LqlError> {
     let _ = std::fs::remove_file(dst);
@@ -23,8 +24,8 @@ pub(super) fn patch_down_weights(
     config: &larql_vindex::VindexConfig,
     overrides: &HashMap<(usize, usize), Vec<f32>>,
 ) -> Result<(), LqlError> {
-    let src = source_dir.join("down_weights.bin");
-    let dst = dest_dir.join("down_weights.bin");
+    let src = source_dir.join(DOWN_WEIGHTS_BIN);
+    let dst = dest_dir.join(DOWN_WEIGHTS_BIN);
     if !src.exists() {
         return Err(LqlError::Execution(
             "source vindex has no down_weights.bin — cannot bake overrides".into(),
@@ -119,7 +120,7 @@ pub(super) fn apply_memit_deltas_to_down_weights(
     config: &larql_vindex::VindexConfig,
     results: &[larql_inference::MemitResult],
 ) -> Result<(), LqlError> {
-    let dst = dest_dir.join("down_weights.bin");
+    let dst = dest_dir.join(DOWN_WEIGHTS_BIN);
     if !dst.exists() {
         return Err(LqlError::Execution(
             "apply_memit_deltas: down_weights.bin not found in output dir".into(),
@@ -239,8 +240,8 @@ pub(super) fn patch_gate_vectors(
     if gate_overrides.is_empty() {
         return Ok(());
     }
-    let src = source_dir.join("gate_vectors.bin");
-    let dst = dest_dir.join("gate_vectors.bin");
+    let src = source_dir.join(GATE_VECTORS_BIN);
+    let dst = dest_dir.join(GATE_VECTORS_BIN);
     if !src.exists() {
         return Err(LqlError::Execution(
             "source vindex has no gate_vectors.bin — cannot bake gate overrides".into(),
@@ -347,7 +348,7 @@ pub(super) fn patch_up_weights(
 
     // Read the weight manifest from the SOURCE vindex — the dest copy
     // was hard-linked from source and we haven't modified the manifest.
-    let manifest_path = source_dir.join("weight_manifest.json");
+    let manifest_path = source_dir.join(WEIGHT_MANIFEST_JSON);
     if !manifest_path.exists() {
         // Manifestless vindex — we can't safely locate the up tensors.
         // Log and skip. The compiled vindex will still have baked

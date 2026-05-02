@@ -52,6 +52,10 @@ impl TraceHeader {
     fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Self {
         unsafe { std::mem::transmute(*bytes) }
     }
+
+    fn expected_file_len(&self) -> usize {
+        HEADER_SIZE + self.n_tokens as usize * self.chain_size()
+    }
 }
 
 /// Read-only mmap'd trace store.
@@ -81,6 +85,17 @@ impl TraceStore {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported version",
+            ));
+        }
+        let expected_len = header.expected_file_len();
+        if mmap.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "trace file length mismatch: expected {} bytes from header, got {} bytes",
+                    expected_len,
+                    mmap.len()
+                ),
             ));
         }
 
@@ -217,9 +232,26 @@ impl TraceWriter {
         if header.magic != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
         }
+        if header.version != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported version",
+            ));
+        }
 
-        // Seek to end for appending
-        file.seek(io::SeekFrom::End(0))?;
+        let expected_len = header.expected_file_len() as u64;
+        let actual_len = file.metadata()?.len();
+        if actual_len != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "trace file length mismatch: expected {} bytes from header, got {} bytes",
+                    expected_len, actual_len
+                ),
+            ));
+        }
+
+        file.seek(io::SeekFrom::Start(expected_len))?;
 
         Ok(Self {
             file,
@@ -242,18 +274,10 @@ impl TraceWriter {
         }
 
         let hidden = self.header.hidden_size as usize;
+        validate_chain(nodes, hidden)?;
 
         // Write vectors in order: for each waypoint, [residual, attn_delta, ffn_delta]
         for node in nodes {
-            if node.residual.len() != hidden
-                || node.attn_delta.len() != hidden
-                || node.ffn_delta.len() != hidden
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("vector size mismatch: expected {}", hidden),
-                ));
-            }
             let r_bytes = unsafe {
                 std::slice::from_raw_parts(node.residual.as_ptr() as *const u8, hidden * 4)
             };
@@ -283,7 +307,7 @@ impl TraceWriter {
         let n_positions = trace.tokens.len();
         let n_waypoints = self.header.n_layers as usize + 1;
 
-        let mut written = 0;
+        let mut chains = Vec::with_capacity(n_positions);
         for pos in 0..n_positions {
             // Collect nodes for this position, ordered by layer
             let mut chain: Vec<&TraceNode> =
@@ -291,15 +315,27 @@ impl TraceWriter {
             chain.sort_by_key(|n| n.layer);
 
             if chain.len() != n_waypoints {
-                continue; // skip positions without full chains
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "incomplete trace chain for position {}: expected {} nodes, got {}",
+                        pos,
+                        n_waypoints,
+                        chain.len()
+                    ),
+                ));
             }
 
             let owned: Vec<TraceNode> = chain.into_iter().cloned().collect();
-            self.append_chain(&owned)?;
-            written += 1;
+            validate_chain(&owned, self.header.hidden_size as usize)?;
+            chains.push(owned);
         }
 
-        Ok(written)
+        for chain in &chains {
+            self.append_chain(chain)?;
+        }
+
+        Ok(chains.len())
     }
 
     /// Finish writing — flush and return the path.
@@ -313,12 +349,52 @@ impl TraceWriter {
     }
 }
 
+fn validate_chain(nodes: &[TraceNode], hidden: usize) -> io::Result<()> {
+    let Some(first) = nodes.first() else {
+        return Ok(());
+    };
+    let position = first.position;
+
+    for (i, node) in nodes.iter().enumerate() {
+        let expected_layer = i as i32 - 1;
+        if node.layer != expected_layer {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "trace chain layer mismatch at waypoint {}: expected {}, got {}",
+                    i, expected_layer, node.layer
+                ),
+            ));
+        }
+        if node.position != position {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "trace chain position mismatch: expected {}, got {}",
+                    position, node.position
+                ),
+            ));
+        }
+        if node.residual.len() != hidden
+            || node.attn_delta.len() != hidden
+            || node.ffn_delta.len() != hidden
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("vector size mismatch: expected {}", hidden),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 // Need Seek for TraceWriter
 use std::io::Seek;
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::TraceNode;
+    use super::super::types::{ResidualTrace, TraceNode};
     use super::*;
 
     fn zero_node(layer: i32, position: usize, hidden: usize) -> TraceNode {
@@ -432,6 +508,43 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_chain_returns_error() {
+        let path = std::env::temp_dir().join("larql_trace_test_bad_order.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        let mut chain = make_chain(2, 0, 4);
+        chain.swap(1, 2);
+
+        let result = writer.append_chain(&chain);
+        assert!(
+            result.is_err(),
+            "layer order should be part of the contract"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_trace_rejects_incomplete_position_without_partial_write() {
+        let path = std::env::temp_dir().join("larql_trace_test_incomplete_trace.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        let mut nodes = make_chain(2, 0, 4);
+        nodes.push(zero_node(-1, 1, 4));
+        let trace = ResidualTrace {
+            prompt: "test".into(),
+            tokens: vec!["a".into(), "b".into()],
+            token_ids: vec![1, 2],
+            n_layers: 2,
+            hidden_size: 4,
+            nodes,
+            attention: Vec::new(),
+        };
+
+        let result = writer.write_trace(&trace);
+        assert!(result.is_err(), "incomplete chains should fail loudly");
+        assert_eq!(writer.n_tokens(), 0, "failed write should not append");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn node_accessor_reconstructs_trace_node() {
         let path = std::env::temp_dir().join("larql_trace_test_node.trac");
         let hidden = 4;
@@ -460,6 +573,26 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write");
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "bad magic should return error");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_truncated_trace_returns_error() {
+        let path = std::env::temp_dir().join("larql_trace_test_truncated.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        writer.append_chain(&make_chain(2, 0, 4)).expect("append");
+        writer.finish().expect("finish");
+
+        let expected_len = std::fs::metadata(&path).expect("metadata").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_len(expected_len - 4)
+            .expect("truncate");
+
+        let result = TraceStore::open(&path);
+        assert!(result.is_err(), "truncated trace should not open");
         let _ = std::fs::remove_file(&path);
     }
 }

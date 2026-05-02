@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use larql_vindex::format::filenames::TOKENIZER_CONFIG_JSON;
 use minijinja::{context, Environment, Value};
 use serde_json::Value as JsonValue;
 
@@ -22,7 +23,7 @@ pub fn render_user_prompt(
     base_dir: &Path,
     user_prompt: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let cfg_path = base_dir.join("tokenizer_config.json");
+    let cfg_path = base_dir.join(TOKENIZER_CONFIG_JSON);
     if !cfg_path.exists() {
         return Err(format!(
             "tokenizer_config.json not found in {} — cannot apply chat template",

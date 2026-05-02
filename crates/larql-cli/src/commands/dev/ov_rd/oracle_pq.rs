@@ -88,6 +88,20 @@ pub(super) struct OraclePqArgs {
     #[arg(long, default_value = "0")]
     address_key_groups: String,
 
+    /// Optional comma-separated simple-key probe names for
+    /// --address-key-group-probe. Empty evaluates all simple-key probes.
+    #[arg(long, default_value = "")]
+    address_key_group_probe_names: String,
+
+    /// Evaluate selected PQ groups by replacing them with train-set majority
+    /// codes while all unselected groups remain oracle-correct.
+    #[arg(long)]
+    address_majority_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-majority-group-probe.
+    #[arg(long, default_value = "0")]
+    address_majority_groups: String,
+
     /// Evaluate how sensitive Mode D is to address corruption.
     ///
     /// This keeps a prefix of oracle PQ groups and replaces the rest with
@@ -193,6 +207,11 @@ pub(super) struct OraclePqArgs {
     #[arg(long, default_value = "16,32")]
     address_attention_cluster_ks: String,
 
+    /// Optional comma-separated attention-cluster probe names. Empty evaluates
+    /// all cluster probe names for the selected k values.
+    #[arg(long, default_value = "")]
+    address_attention_cluster_probe_names: String,
+
     /// Comma-separated PQ groups whose centroids are fit separately per
     /// prompt stratum. This is a codebook-layout diagnostic for cases where a
     /// single global PQ group carries a hard prose/structured tail.
@@ -252,6 +271,7 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     let mut key_groups = parse_usize_list(&args.address_key_groups)?;
     key_groups.sort_unstable();
     key_groups.dedup();
+    let key_group_probe_names = parse_string_list(&args.address_key_group_probe_names);
     if args.address_key_group_probe {
         if key_groups.is_empty() {
             return Err(
@@ -263,6 +283,25 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                 if group >= config.groups {
                     return Err(format!(
                         "--address-key-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut majority_groups = parse_usize_list(&args.address_majority_groups)?;
+    majority_groups.sort_unstable();
+    majority_groups.dedup();
+    if args.address_majority_group_probe {
+        if majority_groups.is_empty() {
+            return Err("--address-majority-group-probe requires at least one --address-majority-groups value".into());
+        }
+        for config in &configs {
+            for &group in &majority_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-majority-groups includes group {group}, but config {:?} has only {} groups",
                         config, config.groups
                     )
                     .into());
@@ -407,6 +446,8 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     let mut attention_cluster_ks = parse_usize_list(&args.address_attention_cluster_ks)?;
     attention_cluster_ks.sort_unstable();
     attention_cluster_ks.dedup();
+    let attention_cluster_probe_names =
+        parse_string_list(&args.address_attention_cluster_probe_names);
     if args.address_attention_cluster_group_probe {
         if attention_cluster_groups.is_empty() {
             return Err("--address-attention-cluster-group-probe requires at least one --address-attention-cluster-groups value".into());
@@ -674,11 +715,15 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     if args.address_group_importance && !args.mode_d_check {
         return Err("--address-group-importance requires --mode-d-check".into());
     }
+    if args.address_majority_group_probe && !args.mode_d_check {
+        return Err("--address-majority-group-probe requires --mode-d-check".into());
+    }
     let majority_codes = if args.address_corruption_sweep
         || args.address_group_importance
         || args.address_lsh_group_probe
         || args.address_supervised_group_probe
         || args.address_key_group_probe
+        || args.address_majority_group_probe
         || args.address_prev_ffn_feature_group_probe
         || args.address_attention_relation_group_probe
         || args.address_attention_cluster_group_probe
@@ -879,6 +924,11 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                                 );
                         }
                         if args.address_key_group_probe {
+                            if !key_group_probe_names.is_empty()
+                                && !key_group_probe_names.contains(&probe_model.name)
+                            {
+                                continue;
+                            }
                             let group_majority =
                                 majority_codes.get(&(*head, config)).ok_or_else(|| {
                                     format!(
@@ -943,6 +993,61 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                             }
                         }
                     }
+                }
+
+                if args.address_majority_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for majority group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for majority group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let predicted_codes_by_position = oracle_codes_by_position
+                        .iter()
+                        .map(|oracle_codes| {
+                            let mut codes = oracle_codes.clone();
+                            for &group in &majority_groups {
+                                codes[group] = group_majority[group];
+                            }
+                            codes
+                        })
+                        .collect::<Vec<_>>();
+                    let prompt_report = evaluate_predicted_address(
+                        &mut weights,
+                        &token_ids,
+                        &index,
+                        *head,
+                        mode_d_table,
+                        &predicted_codes_by_position,
+                        stratum,
+                        label,
+                        &baseline_logp,
+                        baseline_top1,
+                        &oracle_codes_by_position,
+                    )?;
+                    let selected_group_keys = (0..config.groups)
+                        .map(|group| {
+                            if majority_groups.contains(&group) {
+                                "majority".to_string()
+                            } else {
+                                "oracle".to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    accumulators
+                        .get_mut(&(*head, config))
+                        .expect("oracle PQ accumulator missing")
+                        .add_address_probe(
+                            &format!("majority_groups_{:?}_oracle_rest", majority_groups),
+                            &selected_group_keys,
+                            prompt_report,
+                        );
                 }
 
                 if args.address_group_importance {
@@ -1348,6 +1453,11 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                     let attention_rows =
                         capture_attention_relation_rows(&mut weights, &token_ids, &index, *head)?;
                     for cluster_model in cluster_models {
+                        if !attention_cluster_probe_names.is_empty()
+                            && !attention_cluster_probe_names.contains(&cluster_model.name)
+                        {
+                            continue;
+                        }
                         let selected_group_keys = cluster_model.selected_group_keys.clone();
                         for (probe_name, use_oracle_rest) in [
                             (
@@ -1547,6 +1657,17 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_key_group_probe_names: if args.address_key_group_probe {
+            key_group_probe_names
+        } else {
+            Vec::new()
+        },
+        address_majority_group_probe: args.address_majority_group_probe,
+        address_majority_groups: if args.address_majority_group_probe {
+            majority_groups
+        } else {
+            Vec::new()
+        },
         address_corruption_sweep: args.address_corruption_sweep,
         address_group_importance: args.address_group_importance,
         address_lsh_group_probe: args.address_lsh_group_probe,
@@ -1596,6 +1717,11 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_attention_cluster_probe_names: if args.address_attention_cluster_group_probe {
+            attention_cluster_probe_names
+        } else {
+            Vec::new()
+        },
         stratum_conditioned_pq_groups,
         selected_heads,
         heads: head_reports,
@@ -1607,4 +1733,12 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     eprintln!("Wrote {}", out_path.display());
 
     Ok(())
+}
+
+fn parse_string_list(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }

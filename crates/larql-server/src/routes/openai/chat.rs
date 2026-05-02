@@ -66,19 +66,29 @@ const CHAT_COMPLETION_CHUNK_OBJECT: &str = "chat.completion.chunk";
 const ASSISTANT_ROLE: &str = "assistant";
 const SYSTEM_ROLE: &str = "system";
 const USER_ROLE: &str = "user";
+const TOOL_ROLE: &str = "tool";
 const DEFAULT_MAX_TOKENS: usize = 256;
 
 #[derive(Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
-    /// OpenAI tool-call fields — accepted for shape-compat in slice 2,
-    /// but `tool_calls`/`tool_call_id` non-null returns 400 (tools land
-    /// in slice 4).
+    /// Free-text content. Optional because assistant messages that
+    /// emitted tool_calls send `content: null` per OpenAI's wire shape.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Echoed back on `role: "assistant"` messages in multi-turn
+    /// conversations so the model can see its own prior tool dispatch.
     #[serde(default)]
     pub tool_calls: Option<serde_json::Value>,
+    /// Set on `role: "tool"` messages — the call id this result
+    /// corresponds to.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Optional `function.name` echoed on tool messages by some clients.
+    /// Treated as informational; we already get the name from the
+    /// matching `tool_calls[i].function.name` when available.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,7 +148,33 @@ pub struct ChatCompletionsRequest {
 #[derive(Serialize)]
 pub struct ChatChoiceMessage {
     pub role: &'static str,
-    pub content: String,
+    /// Always present, but `null` when the assistant emitted tool_calls
+    /// rather than free text. Serialised as `content: null` in that case
+    /// (OpenAI's contract).
+    pub content: Option<String>,
+    /// One or more tool calls produced by constrained decoding when
+    /// `tools` was on the request. Omitted entirely for plain text
+    /// completions so non-tools responses stay shape-clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// OpenAI's tool-call shape on the response side: `id`, `type`,
+/// `function: {name, arguments}`. `arguments` is JSON-stringified.
+#[derive(Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// JSON-encoded string, not a nested object — preserves the wire
+    /// shape SDKs expect.
+    pub arguments: String,
 }
 
 #[derive(Serialize)]
@@ -146,8 +182,30 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatChoiceMessage,
     pub finish_reason: &'static str,
-    /// Always null in slice 2 (logprobs F18).
-    pub logprobs: Option<()>,
+    /// Populated when the request set `logprobs: true`. `None`
+    /// (serialised as `null`) otherwise — the OpenAI default.
+    pub logprobs: Option<ChatLogprobs>,
+}
+
+/// `choices[i].logprobs` payload for chat completions. Mirrors
+/// OpenAI's `{content: [{token, logprob, bytes, top_logprobs}]}`.
+#[derive(Serialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<TokenLogprob>,
+}
+
+/// One per-token entry in a logprobs payload (chat or completions —
+/// the chat shape is identical for the inner item).
+///
+/// `top_logprobs` is an empty array until the inference layer exposes
+/// per-step top-K alternatives (follow-up). Until then we still emit
+/// the picked-token entry so client parsers don't break on the field.
+#[derive(Serialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f64,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<TokenLogprob>,
 }
 
 #[derive(Serialize)]
@@ -178,30 +236,17 @@ pub async fn handle_chat_completions(
             "n>1 not yet supported; only n=1 (single completion per prompt)".into(),
         ));
     }
-    if req
-        .tools
-        .as_ref()
-        .is_some_and(|v| !v.is_null() && !is_empty_json_array(v))
-        || req.tool_choice.is_some()
-    {
-        return Err(ServerError::BadRequest(
-            "tools / tool_choice not yet supported; arrives in N0 slice 4 \
-             (constrained decoding). See ROADMAP."
-                .into(),
-        ));
-    }
-    let constrained_schema = schema_for_response_format(req.response_format.as_ref())?;
-    for (i, m) in req.messages.iter().enumerate() {
-        if m.tool_calls
-            .as_ref()
-            .is_some_and(|v| !v.is_null() && !is_empty_json_array(v))
-            || m.tool_call_id.is_some()
-        {
-            return Err(ServerError::BadRequest(format!(
-                "messages[{i}] contains tool_calls / tool_call_id; tools land in N0 slice 4"
-            )));
-        }
-    }
+    // Tools take precedence over response_format. If tools are
+    // present and not disabled by `tool_choice="none"`, the model is
+    // constrained to emit JSON matching one of the supplied function
+    // schemas; the response is then reshaped into `tool_calls`.
+    let (constrained_schema, tools_active) = match resolve_tools(&req)? {
+        Some(schema) => (Some(schema), true),
+        None => (
+            schema_for_response_format(req.response_format.as_ref())?,
+            false,
+        ),
+    };
 
     let model = state.model_or_err(req.model.as_deref())?;
     if model.infer_disabled {
@@ -213,11 +258,52 @@ pub async fn handle_chat_completions(
         return Err(ServerError::BadRequest("messages is empty".into()));
     }
     for (i, m) in req.messages.iter().enumerate() {
-        if !matches!(m.role.as_str(), USER_ROLE | ASSISTANT_ROLE | SYSTEM_ROLE) {
+        if !matches!(
+            m.role.as_str(),
+            USER_ROLE | ASSISTANT_ROLE | SYSTEM_ROLE | TOOL_ROLE
+        ) {
             return Err(ServerError::BadRequest(format!(
-                "messages[{i}].role must be 'user' | 'assistant' | 'system' (got {:?})",
+                "messages[{i}].role must be 'user' | 'assistant' | 'system' | 'tool' (got {:?})",
                 m.role
             )));
+        }
+        // Per-role shape validation — only enforce constraints OpenAI
+        // clients can violate; missing-content + tool_calls is normal
+        // for assistant turns, missing tool_call_id is an error on
+        // tool turns.
+        match m.role.as_str() {
+            TOOL_ROLE => {
+                if m.tool_call_id.is_none() {
+                    return Err(ServerError::BadRequest(format!(
+                        "messages[{i}] role=tool requires tool_call_id"
+                    )));
+                }
+                if m.content.is_none() {
+                    return Err(ServerError::BadRequest(format!(
+                        "messages[{i}] role=tool requires content"
+                    )));
+                }
+            }
+            ASSISTANT_ROLE => {
+                let has_tool_calls = m
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|v| !v.is_null() && !is_empty_json_array(v));
+                if !has_tool_calls && m.content.is_none() {
+                    return Err(ServerError::BadRequest(format!(
+                        "messages[{i}] role=assistant requires content (or tool_calls)"
+                    )));
+                }
+            }
+            USER_ROLE | SYSTEM_ROLE => {
+                if m.content.is_none() {
+                    return Err(ServerError::BadRequest(format!(
+                        "messages[{i}] role={} requires content",
+                        m.role
+                    )));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -235,6 +321,14 @@ pub async fn handle_chat_completions(
     let messages = req.messages;
 
     if req.stream.unwrap_or(false) {
+        if tools_active {
+            return Err(ServerError::BadRequest(
+                "tools + stream=true not yet supported. Send the request with \
+                 stream=false to get the tool_calls response, or omit tools to \
+                 stream free-text content."
+                    .into(),
+            ));
+        }
         return Ok(stream_chat_completion(
             model_arc,
             messages,
@@ -249,21 +343,48 @@ pub async fn handle_chat_completions(
         .into_response());
     }
 
-    let (text, finish_reason, prompt_tokens, completion_tokens) =
-        tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
-            run_chat_completion(
-                &model_arc,
-                &messages,
-                max_tokens,
-                temperature,
-                top_p,
-                seed,
-                &stop_strings,
-                constrained_schema,
-            )
-        })
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))??;
+    let logprobs_requested = req.logprobs.unwrap_or(false);
+    let output = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        run_chat_completion(
+            &model_arc,
+            &messages,
+            max_tokens,
+            temperature,
+            top_p,
+            seed,
+            &stop_strings,
+            constrained_schema,
+        )
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))??;
+
+    let logprobs = if logprobs_requested && !tools_active {
+        Some(build_chat_logprobs(&output.tokens))
+    } else {
+        None
+    };
+
+    let (message, finish_reason) = if tools_active {
+        match build_tool_call_message(&output.text) {
+            Ok(m) => (m, "tool_calls"),
+            Err(e) => {
+                return Err(ServerError::Internal(format!(
+                    "tool_call output failed to parse: {e}; raw: {:?}",
+                    output.text
+                )));
+            }
+        }
+    } else {
+        (
+            ChatChoiceMessage {
+                role: ASSISTANT_ROLE,
+                content: Some(output.text),
+                tool_calls: None,
+            },
+            output.finish_reason,
+        )
+    };
 
     Ok(Json(ChatCompletionsResponse {
         id: format!("chatcmpl-{}", new_id_suffix()),
@@ -272,20 +393,36 @@ pub async fn handle_chat_completions(
         model: model_id,
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatChoiceMessage {
-                role: ASSISTANT_ROLE,
-                content: text,
-            },
+            message,
             finish_reason,
-            logprobs: None,
+            logprobs,
         }],
         usage: ChatUsage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens: output.prompt_tokens,
+            completion_tokens: output.completion_tokens,
+            total_tokens: output.prompt_tokens + output.completion_tokens,
         },
     })
     .into_response())
+}
+
+/// Map per-token `(text, prob)` pairs to OpenAI's `ChatLogprobs`
+/// envelope. `prob` is currently `1.0` placeholder from the inference
+/// layer until per-token softmax is exposed; logprob then becomes
+/// `0.0` for every token. `top_logprobs` is empty until top-K
+/// alternatives are surfaced in a follow-up.
+fn build_chat_logprobs(tokens: &[(String, f64)]) -> ChatLogprobs {
+    ChatLogprobs {
+        content: tokens
+            .iter()
+            .map(|(text, prob)| TokenLogprob {
+                token: text.clone(),
+                logprob: prob.max(f64::MIN_POSITIVE).ln(),
+                bytes: text.as_bytes().to_vec(),
+                top_logprobs: Vec::new(),
+            })
+            .collect(),
+    }
 }
 
 /// SSE stream for `/v1/chat/completions`. First chunk emits
@@ -476,7 +613,7 @@ fn run_chat_completion(
     seed: Option<u64>,
     stop_strings: &[String],
     constrained_schema: Option<Schema>,
-) -> Result<(String, &'static str, usize, usize), ServerError> {
+) -> Result<ChatGenerationOutput, ServerError> {
     // Take an exclusive write guard on the weights for the duration
     // of generation. `larql_inference::layer_graph::generate` mutates
     // `weights.tensors` (the per-layer Q4_K dequant cache), so other
@@ -539,11 +676,11 @@ fn run_chat_completion(
     };
 
     let mut completion_text = String::new();
-    let mut completion_token_count = 0usize;
+    let mut completion_tokens: Vec<(String, f64)> = Vec::new();
     let mut finish_reason: &'static str = "length";
-    for (text, _prob) in &result.tokens {
+    for (text, prob) in &result.tokens {
         completion_text.push_str(text);
-        completion_token_count += 1;
+        completion_tokens.push((text.clone(), *prob));
         if larql_inference::vindex::is_end_of_turn(text) {
             finish_reason = "stop";
             break;
@@ -552,14 +689,48 @@ fn run_chat_completion(
     if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
         completion_text = trim_at_stop(&completion_text, stop_strings);
         finish_reason = "stop";
+        // Also trim the per-token list to the same length so logprobs
+        // align with the truncated text. We can't perfectly reverse the
+        // textual trim, but discarding tokens past the byte boundary is
+        // a good approximation.
+        completion_tokens = trim_tokens_to_text(&completion_tokens, &completion_text);
     }
 
-    Ok((
-        completion_text,
+    let completion_token_count = completion_tokens.len();
+    Ok(ChatGenerationOutput {
+        text: completion_text,
+        tokens: completion_tokens,
         finish_reason,
-        prompt_token_count,
-        completion_token_count,
-    ))
+        prompt_tokens: prompt_token_count,
+        completion_tokens: completion_token_count,
+    })
+}
+
+/// Output of [`run_chat_completion`]. Carries per-token info so the
+/// handler can emit logprobs without re-running generation.
+struct ChatGenerationOutput {
+    text: String,
+    tokens: Vec<(String, f64)>,
+    finish_reason: &'static str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+/// Truncate `tokens` so concatenated surface forms cover at most the
+/// byte length of `truncated_text`. Used after `trim_at_stop` chops
+/// the joined string to keep `tokens.len()` matching `text.len()`.
+fn trim_tokens_to_text(tokens: &[(String, f64)], truncated_text: &str) -> Vec<(String, f64)> {
+    let target_len = truncated_text.len();
+    let mut acc = 0usize;
+    let mut out = Vec::with_capacity(tokens.len());
+    for (t, p) in tokens {
+        if acc >= target_len {
+            break;
+        }
+        acc += t.len();
+        out.push((t.clone(), *p));
+    }
+    out
 }
 
 // ── Template selection ───────────────────────────────────────────────────────
@@ -581,20 +752,162 @@ fn pick_template(model: &LoadedModel) -> larql_inference::prompt::ChatTemplate {
 }
 
 /// Adapter: convert our wire `ChatMessage` list to the `(role, content)`
-/// shape `ChatTemplate::render_messages` accepts. Pure plumbing — no
-/// rendering logic lives here any more.
+/// shape `ChatTemplate::render_messages` accepts. The chat templates
+/// natively handle `system` / `user` / `assistant` only, so tool turns
+/// are flattened into text content that fits within those slots:
+///
+/// - Assistant message with `tool_calls` (and `content: null`) →
+///   assistant turn whose content is a serialised summary of the tool
+///   calls (`Tool call: <name>(<arguments>)`). Any prior `content`
+///   takes precedence when both are set.
+/// - Tool message → user turn with `[Tool result for <id>: <content>]`,
+///   so the model sees the result inline before generating the next
+///   assistant turn.
 fn render(template: larql_inference::prompt::ChatTemplate, messages: &[ChatMessage]) -> String {
-    template.render_messages(
-        messages
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_str())),
-    )
+    let pairs: Vec<(String, String)> = messages
+        .iter()
+        .map(|m| match m.role.as_str() {
+            TOOL_ROLE => (
+                USER_ROLE.to_string(),
+                format_tool_result(m.tool_call_id.as_deref(), m.content.as_deref()),
+            ),
+            ASSISTANT_ROLE => {
+                if let Some(c) = m.content.as_deref() {
+                    (ASSISTANT_ROLE.to_string(), c.to_string())
+                } else if let Some(tc) = m.tool_calls.as_ref() {
+                    (ASSISTANT_ROLE.to_string(), format_tool_calls(tc))
+                } else {
+                    (ASSISTANT_ROLE.to_string(), String::new())
+                }
+            }
+            other => (other.to_string(), m.content.clone().unwrap_or_default()),
+        })
+        .collect();
+    template.render_messages(pairs.iter().map(|(r, c)| (r.as_str(), c.as_str())))
+}
+
+/// Render a tool-result message as a user-side text turn so the model
+/// sees the tool output before the next assistant generation.
+fn format_tool_result(tool_call_id: Option<&str>, content: Option<&str>) -> String {
+    let id = tool_call_id.unwrap_or("?");
+    let body = content.unwrap_or("");
+    format!("[Tool result for {id}]: {body}")
+}
+
+/// Render an assistant `tool_calls` echo as text. Multiple parallel
+/// tool calls are listed; arguments stay JSON-encoded.
+fn format_tool_calls(tool_calls: &serde_json::Value) -> String {
+    let arr = match tool_calls.as_array() {
+        Some(a) => a,
+        None => return String::new(),
+    };
+    let mut out = String::new();
+    for (i, tc) in arr.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let name = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("?");
+        let args = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        out.push_str(&format!("[Tool call: {name}({args})]"));
+    }
+    out
 }
 
 // ── chat-only request validation helper ─────────────────────────────────────
 
 fn is_empty_json_array(v: &serde_json::Value) -> bool {
     v.as_array().map(|a| a.is_empty()).unwrap_or(false)
+}
+
+/// Resolve `tools` + `tool_choice` into a synthesised `Schema`.
+///
+/// Returns `Ok(None)` when no tools are bound (or `tool_choice="none"`)
+/// so the caller falls through to `response_format` /unconstrained.
+/// Returns `Ok(Some(schema))` with the discriminated-union shape over
+/// each function (one branch per tool); the chat handler then post-
+/// parses the JSON output into `tool_calls`.
+fn resolve_tools(req: &ChatCompletionsRequest) -> Result<Option<Schema>, ServerError> {
+    use super::schema::{resolve_tool_choice, synth_tools_schema};
+
+    let tools_present = req
+        .tools
+        .as_ref()
+        .is_some_and(|v| !v.is_null() && !is_empty_json_array(v));
+
+    let tool_names: Vec<String> = req
+        .tools
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mode = resolve_tool_choice(tools_present, req.tool_choice.as_ref(), &tool_names)
+        .map_err(ServerError::BadRequest)?;
+
+    if !tools_present || matches!(mode, super::schema::ToolMode::None) {
+        return Ok(None);
+    }
+
+    let tools = req
+        .tools
+        .as_ref()
+        .expect("tools_present checked above")
+        .clone();
+    let result = synth_tools_schema(&tools, &mode).map_err(ServerError::BadRequest)?;
+    Ok(result.map(|(schema, _names)| schema))
+}
+
+/// Parse a constrained-decoder output back into a `ChatChoiceMessage`
+/// with `tool_calls` populated. Constrained decoding guarantees a
+/// well-formed JSON object, but we still tolerate incidental leading
+/// or trailing whitespace.
+fn build_tool_call_message(text: &str) -> Result<ChatChoiceMessage, String> {
+    let trimmed = text.trim();
+    let (start, end) = trimmed
+        .find('{')
+        .and_then(|s| trimmed.rfind('}').map(|e| (s, e + 1)))
+        .ok_or_else(|| "no `{...}` JSON object in tool output".to_string())?;
+    let json_slice = &trimmed[start..end];
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_slice).map_err(|e| format!("invalid JSON: {e}"))?;
+    let name = parsed
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "tool output missing `name`".to_string())?
+        .to_string();
+    let arguments_value = parsed
+        .get("arguments")
+        .ok_or_else(|| "tool output missing `arguments`".to_string())?;
+    // OpenAI sends arguments as a JSON-stringified object — reserialise
+    // to canonical compact form so SDKs `json.loads` cleanly.
+    let arguments = serde_json::to_string(arguments_value)
+        .map_err(|e| format!("failed to serialise arguments: {e}"))?;
+    Ok(ChatChoiceMessage {
+        role: ASSISTANT_ROLE,
+        content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: format!("call_{}", new_id_suffix()),
+            kind: "function",
+            function: ToolCallFunction { name, arguments },
+        }]),
+    })
 }
 
 /// Map an OpenAI `response_format` field to the `Schema` the FSM
@@ -726,5 +1039,62 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.max_tokens, Some(50));
         assert_eq!(req.temperature, Some(0.0));
+    }
+
+    #[test]
+    fn format_tool_result_includes_call_id_and_body() {
+        let s = format_tool_result(Some("call_abc"), Some("23 C"));
+        assert!(s.contains("call_abc"));
+        assert!(s.contains("23 C"));
+    }
+
+    #[test]
+    fn format_tool_calls_summarises_function_calls() {
+        let tc = serde_json::json!([
+            {"id": "call_1", "type": "function",
+             "function": {"name": "calc", "arguments": "{\"a\":1}"}}
+        ]);
+        let out = format_tool_calls(&tc);
+        assert!(out.contains("calc"), "missing name in {out}");
+        assert!(out.contains("{\"a\":1}"), "missing args in {out}");
+    }
+
+    #[test]
+    fn build_chat_logprobs_emits_one_entry_per_token() {
+        let toks = vec![
+            ("Paris".to_string(), 1.0),
+            (".".to_string(), 1.0),
+        ];
+        let lp = build_chat_logprobs(&toks);
+        assert_eq!(lp.content.len(), 2);
+        assert_eq!(lp.content[0].token, "Paris");
+        assert_eq!(lp.content[0].bytes, b"Paris".to_vec());
+        assert!(lp.content[0].top_logprobs.is_empty());
+        // prob=1.0 → logprob=0.0 (placeholder until inference exposes
+        // real per-token softmax probs).
+        assert!((lp.content[0].logprob - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deserialize_chat_message_with_tool_call_replay() {
+        // Multi-turn shape OpenAI clients send back: assistant tool-call
+        // + tool result + (next) assistant turn the model would emit.
+        let json = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"London\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "23C"}
+            ]
+        });
+        let req: ChatCompletionsRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.messages.len(), 3);
+        assert!(req.messages[1].content.is_none());
+        assert!(req.messages[1].tool_calls.is_some());
+        assert_eq!(req.messages[2].role, "tool");
+        assert_eq!(req.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(req.messages[2].content.as_deref(), Some("23C"));
     }
 }

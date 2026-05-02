@@ -6,6 +6,9 @@
 use larql_inference::ndarray::{Array1, Array2};
 use larql_inference::tokenizers::Tokenizer;
 use larql_vindex::clustering::ClusterResult;
+use larql_vindex::format::filenames::{
+    FEATURE_CLUSTERS_JSONL, FEATURE_LABELS_JSON, RELATION_CLUSTERS_JSON,
+};
 
 /// Classifies edges into relation types using discovered clusters
 /// or embedding-space direction matching.
@@ -24,9 +27,9 @@ impl RelationClassifier {
     /// Build a classifier from discovered clusters + probe labels in a vindex directory.
     /// Returns Some even if only probe labels exist (no clusters needed).
     pub fn from_vindex(vindex_path: &std::path::Path) -> Option<Self> {
-        let clusters_path = vindex_path.join("relation_clusters.json");
-        let assignments_path = vindex_path.join("feature_clusters.jsonl");
-        let probe_labels_path = vindex_path.join("feature_labels.json");
+        let clusters_path = vindex_path.join(RELATION_CLUSTERS_JSON);
+        let assignments_path = vindex_path.join(FEATURE_CLUSTERS_JSONL);
+        let probe_labels_path = vindex_path.join(FEATURE_LABELS_JSON);
 
         // Clusters are optional — probe labels work without them
         let clusters: Option<ClusterResult> = std::fs::read_to_string(&clusters_path)

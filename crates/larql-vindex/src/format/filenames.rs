@@ -15,7 +15,15 @@
 pub const INDEX_JSON: &str = "index.json";
 pub const TOKENIZER_JSON: &str = "tokenizer.json";
 pub const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
+pub const GENERATION_CONFIG_JSON: &str = "generation_config.json";
 pub const WEIGHT_MANIFEST_JSON: &str = "weight_manifest.json";
+pub const KNN_STORE_BIN: &str = "knn_store.bin";
+pub const MODEL_WEIGHTS_BIN: &str = "model_weights.bin";
+
+// ── Labels / clustering sidecars ───────────────────────────────────────
+pub const RELATION_CLUSTERS_JSON: &str = "relation_clusters.json";
+pub const FEATURE_CLUSTERS_JSONL: &str = "feature_clusters.jsonl";
+pub const FEATURE_LABELS_JSON: &str = "feature_labels.json";
 
 // ── Embeddings + norms (always present) ────────────────────────────────
 pub const EMBEDDINGS_BIN: &str = "embeddings.bin";
@@ -130,7 +138,13 @@ mod tests {
             INDEX_JSON,
             TOKENIZER_JSON,
             TOKENIZER_CONFIG_JSON,
+            GENERATION_CONFIG_JSON,
             WEIGHT_MANIFEST_JSON,
+            KNN_STORE_BIN,
+            MODEL_WEIGHTS_BIN,
+            RELATION_CLUSTERS_JSON,
+            FEATURE_CLUSTERS_JSONL,
+            FEATURE_LABELS_JSON,
             EMBEDDINGS_BIN,
             NORMS_BIN,
             GATE_VECTORS_BIN,

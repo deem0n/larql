@@ -186,12 +186,37 @@ async fn demo_embeddings(app: &Router, model_id: &str) {
     println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
     println!("{}", pretty(&trim_arrays_for_print(&body, 3)));
 
-    section("POST /v1/embeddings — base64 (returns 400 in slice 1)");
-    let req = serde_json::json!({"model": model_id, "input": "x", "encoding_format": "base64"});
+    section("POST /v1/embeddings — base64 encoding");
+    let req = serde_json::json!({
+        "model": model_id,
+        "input": "France",
+        "encoding_format": "base64",
+    });
     let t = Instant::now();
     let (status, body) = post_json(app, "/v1/embeddings", &req).await;
     println!("Status: {status}  ({} ms)", t.elapsed().as_millis());
-    println!("{}", pretty(&body));
+    // Don't pretty-print the full base64 string — just show the head
+    // and length so the demo output stays scannable.
+    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+        if let Some(s) = arr
+            .first()
+            .and_then(|e| e.get("embedding"))
+            .and_then(|v| v.as_str())
+        {
+            println!(
+                "data[0].embedding: \"{}…\" (length {} chars, ~{} f32s)",
+                &s[..s.len().min(48)],
+                s.len(),
+                // base64 → 4 bytes per 3 chars; 4 bytes per f32.
+                s.len() * 3 / 16,
+            );
+        }
+    }
+    println!(
+        "\nNote: same vector as the float form, encoded as little-endian\n\
+         f32 bytes, base64-stringified. ~33% smaller wire than the JSON\n\
+         array. Many production OpenAI clients default to base64."
+    );
 }
 
 async fn demo_completions(app: &Router, model_id: &str) {

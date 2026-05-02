@@ -7,7 +7,10 @@ use std::sync::Arc;
 use crate::embed_store::EmbedStoreF16;
 
 use larql_models::ModelWeights;
-use larql_vindex::{ndarray::Array2, tokenizers, PatchedVindex, VindexConfig};
+use larql_vindex::{
+    format::filenames::FEATURE_LABELS_JSON, ndarray::Array2, tokenizers, PatchedVindex,
+    VindexConfig,
+};
 use tokio::sync::RwLock;
 
 use crate::cache::DescribeCache;
@@ -246,7 +249,7 @@ pub fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// Load probe-confirmed feature labels from feature_labels.json.
 /// Format: {"L{layer}_F{feature}": "relation_name", ...}
 pub fn load_probe_labels(vindex_path: &std::path::Path) -> HashMap<(usize, usize), String> {
-    let path = vindex_path.join("feature_labels.json");
+    let path = vindex_path.join(FEATURE_LABELS_JSON);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return HashMap::new(),

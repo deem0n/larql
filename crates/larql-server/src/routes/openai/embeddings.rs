@@ -30,13 +30,16 @@
 //!
 //! ## Encoding format
 //!
-//! `encoding_format: "float"` (default) is supported. `"base64"` returns
-//! HTTP 400 — follow-up. For now, clients should request floats.
+//! - `encoding_format: "float"` (default) — JSON array of f32.
+//! - `encoding_format: "base64"` — base64-encoded little-endian f32
+//!   bytes (~33% smaller wire than the JSON array form). Many
+//!   production OpenAI clients default to base64 for embeddings.
 
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::Json;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
@@ -46,6 +49,25 @@ use crate::routes::embed::embed_tokens;
 
 const EMBEDDING_OBJECT: &str = "embedding";
 const LIST_OBJECT: &str = "list";
+
+/// Choice between the OpenAI `"float"` (default) and `"base64"` wire
+/// formats. `Float` produces `embedding: [f32, ...]`; `Base64` produces
+/// `embedding: "<base64 of LE f32 bytes>"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodingFormat {
+    Float,
+    Base64,
+}
+
+/// Per-request `embedding` field — `Vec<f32>` for float mode, `String`
+/// for base64. Untagged so serde picks a single shape per object based
+/// on which variant was constructed.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingValue {
+    Floats(Vec<f32>),
+    Base64(String),
+}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -62,7 +84,7 @@ pub struct EmbeddingsRequest {
     /// single-model mode).
     pub model: Option<String>,
     pub input: EmbeddingInput,
-    /// Only `"float"` is currently supported. `"base64"` returns 400.
+    /// `"float"` (default) or `"base64"`. Anything else returns 400.
     #[serde(default)]
     pub encoding_format: Option<String>,
     /// Optional caller-supplied dimensionality. Larql ignores this — the
@@ -78,7 +100,7 @@ pub struct EmbeddingsRequest {
 #[derive(Serialize)]
 pub struct EmbeddingObject {
     pub object: &'static str,
-    pub embedding: Vec<f32>,
+    pub embedding: EmbeddingValue,
     pub index: usize,
 }
 
@@ -102,13 +124,15 @@ pub async fn handle_embeddings(
 ) -> Result<Json<EmbeddingsResponse>, ServerError> {
     state.bump_requests();
 
-    if let Some(fmt) = req.encoding_format.as_deref() {
-        if fmt != "float" {
+    let encoding = match req.encoding_format.as_deref() {
+        None | Some("float") => EncodingFormat::Float,
+        Some("base64") => EncodingFormat::Base64,
+        Some(fmt) => {
             return Err(ServerError::BadRequest(format!(
-                "encoding_format='{fmt}' not supported yet (only 'float'); base64 follow-up"
+                "encoding_format='{fmt}' is not supported (expected 'float' or 'base64')"
             )));
         }
-    }
+    };
 
     let model = state.model_or_err(req.model.as_deref())?;
 
@@ -140,9 +164,13 @@ pub async fn handle_embeddings(
         let h = embed_tokens(model_ref, ids)?;
         let pooled = mean_pool(&h);
         total_tokens += ids.len();
+        let value = match encoding {
+            EncodingFormat::Float => EmbeddingValue::Floats(pooled),
+            EncodingFormat::Base64 => EmbeddingValue::Base64(encode_floats_base64(&pooled)),
+        };
         data.push(EmbeddingObject {
             object: EMBEDDING_OBJECT,
-            embedding: pooled,
+            embedding: value,
             index: idx,
         });
     }
@@ -164,6 +192,17 @@ fn tokenize_one(model: &LoadedModel, text: &str) -> Result<Vec<u32>, ServerError
         .encode(text, false)
         .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?;
     Ok(enc.get_ids().to_vec())
+}
+
+/// Encode a float vector as base64 of its little-endian f32 bytes.
+/// Wire shape OpenAI clients expect when `encoding_format="base64"`:
+/// `len(vector) * 4` bytes → standard-alphabet base64 string.
+fn encode_floats_base64(values: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
 }
 
 /// Mean pool a `[seq_len × hidden]` matrix to a `[hidden]` vector.
@@ -254,5 +293,39 @@ mod tests {
             EmbeddingInput::BatchTokens(v) => assert_eq!(v, vec![vec![1, 2], vec![3, 4]]),
             _ => panic!("expected BatchTokens"),
         }
+    }
+
+    #[test]
+    fn encode_floats_base64_round_trip() {
+        let v = vec![1.0f32, -2.5, 3.14, 0.0];
+        let encoded = encode_floats_base64(&v);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("base64 decode");
+        // 4 bytes per f32, little-endian.
+        assert_eq!(decoded.len(), v.len() * 4);
+        let recovered: Vec<f32> = decoded
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for (a, b) in v.iter().zip(recovered.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn embedding_value_serialises_floats_as_array() {
+        let v = EmbeddingValue::Floats(vec![1.0, 2.0, 3.0]);
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json[0], 1.0);
+    }
+
+    #[test]
+    fn embedding_value_serialises_base64_as_string() {
+        let v = EmbeddingValue::Base64("AAA=".to_string());
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(json.is_string());
+        assert_eq!(json.as_str().unwrap(), "AAA=");
     }
 }

@@ -287,6 +287,9 @@ pub(super) struct OraclePqReport {
     pub(super) address_mixed_key_probe: bool,
     pub(super) address_key_group_probe: bool,
     pub(super) address_key_groups: Vec<usize>,
+    pub(super) address_key_group_probe_names: Vec<String>,
+    pub(super) address_majority_group_probe: bool,
+    pub(super) address_majority_groups: Vec<usize>,
     pub(super) address_corruption_sweep: bool,
     pub(super) address_group_importance: bool,
     pub(super) address_lsh_group_probe: bool,
@@ -308,6 +311,7 @@ pub(super) struct OraclePqReport {
     pub(super) address_attention_cluster_group_probe: bool,
     pub(super) address_attention_cluster_groups: Vec<usize>,
     pub(super) address_attention_cluster_ks: Vec<usize>,
+    pub(super) address_attention_cluster_probe_names: Vec<String>,
     pub(super) stratum_conditioned_pq_groups: Vec<usize>,
     pub(super) selected_heads: Vec<HeadId>,
     pub(super) heads: Vec<OraclePqHeadReport>,
@@ -414,7 +418,22 @@ pub(super) struct AddressProbeReport {
     pub(super) max_kl: f64,
     pub(super) top1_agreement: f64,
     pub(super) top5_contains_baseline_top1: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) by_stratum: Vec<AddressProbeStratumReport>,
     pub(super) worst_examples: Vec<AddressProbePromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct AddressProbeStratumReport {
+    pub(super) stratum: String,
+    pub(super) prompts: usize,
+    pub(super) positions: usize,
+    pub(super) group_accuracy: f64,
+    pub(super) mean_kl: f64,
+    pub(super) p95_kl: f64,
+    pub(super) max_kl: f64,
+    pub(super) top1_agreement: f64,
+    pub(super) top5_contains_baseline_top1: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

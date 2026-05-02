@@ -27,7 +27,7 @@
 use super::hooks::{LayerHook, RecordHook};
 use super::trace::trace_forward_full_hooked;
 use super::TraceResult;
-use crate::ffn::WeightFfn;
+use crate::ffn::{FfnBackend, WeightFfn};
 use crate::model::ModelWeights;
 use ndarray::Array2;
 use std::collections::HashMap;
@@ -62,6 +62,18 @@ pub fn capture_donor_state(
     tokens: &[u32],
     coords: &[(usize, usize)],
 ) -> DonorState {
+    let ffn = WeightFfn { weights };
+    capture_donor_state_with_ffn(weights, tokens, coords, &ffn)
+}
+
+/// Backend-parametric donor capture. Use this when a trace must match a
+/// specific inference path, e.g. vindex `WalkFfn` rather than dense weights.
+pub fn capture_donor_state_with_ffn(
+    weights: &ModelWeights,
+    tokens: &[u32],
+    coords: &[(usize, usize)],
+    ffn: &dyn FfnBackend,
+) -> DonorState {
     if coords.is_empty() {
         return DonorState {
             records: HashMap::new(),
@@ -73,7 +85,6 @@ pub fn capture_donor_state(
     let layer_vec: Vec<usize> = layers.iter().copied().collect();
 
     let mut record = RecordHook::for_layers(layers.iter().copied());
-    let ffn = WeightFfn { weights };
     let _ = trace_forward_full_hooked(
         weights,
         tokens,
@@ -81,7 +92,7 @@ pub fn capture_donor_state(
         false,
         0,
         false,
-        &ffn,
+        ffn,
         &mut record,
     );
 
@@ -148,6 +159,19 @@ pub fn patch_and_trace(
     capture_layers: &[usize],
 ) -> TraceResult {
     let ffn = WeightFfn { weights };
+    patch_and_trace_with_ffn(weights, recipient_tokens, donor, capture_layers, &ffn)
+}
+
+/// Backend-parametric activation patching. Donor and recipient passes should
+/// use the same FFN backend so the causal intervention is interpreted in the
+/// same mechanism the caller is studying.
+pub fn patch_and_trace_with_ffn(
+    weights: &ModelWeights,
+    recipient_tokens: &[u32],
+    donor: &DonorState,
+    capture_layers: &[usize],
+    ffn: &dyn FfnBackend,
+) -> TraceResult {
     let mut hook = PatchHook::from_donor(donor);
     trace_forward_full_hooked(
         weights,
@@ -156,7 +180,7 @@ pub fn patch_and_trace(
         false,
         0,
         false,
-        &ffn,
+        ffn,
         &mut hook,
     )
 }

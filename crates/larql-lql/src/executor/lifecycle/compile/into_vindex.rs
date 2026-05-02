@@ -9,6 +9,11 @@ use crate::ast::CompileConflict;
 use crate::error::LqlError;
 use crate::executor::helpers::{dir_size, format_bytes};
 use crate::executor::Session;
+use larql_vindex::format::filenames::{
+    ATTN_WEIGHTS_BIN, DOWN_FEATURES_BIN, DOWN_META_BIN, DOWN_WEIGHTS_BIN, EMBEDDINGS_BIN,
+    FEATURE_CLUSTERS_JSONL, FEATURE_LABELS_JSON, KNN_STORE_BIN, NORMS_BIN, RELATION_CLUSTERS_JSON,
+    TOKENIZER_JSON, UP_FEATURES_BIN, UP_WEIGHTS_BIN, WEIGHT_MANIFEST_JSON,
+};
 
 use super::bake::{
     apply_memit_deltas_to_down_weights, patch_down_weights, patch_gate_vectors, patch_up_weights,
@@ -219,15 +224,15 @@ impl Session {
         // which is the exact behaviour the runtime patch overlay
         // produces.
         const UNCHANGING: &[&str] = &[
-            "attn_weights.bin",
-            "up_weights.bin",
-            "norms.bin",
-            "weight_manifest.json",
-            "embeddings.bin",
-            "tokenizer.json",
-            "up_features.bin",
-            "down_meta.bin",
-            "down_features.bin",
+            ATTN_WEIGHTS_BIN,
+            UP_WEIGHTS_BIN,
+            NORMS_BIN,
+            WEIGHT_MANIFEST_JSON,
+            EMBEDDINGS_BIN,
+            TOKENIZER_JSON,
+            UP_FEATURES_BIN,
+            DOWN_META_BIN,
+            DOWN_FEATURES_BIN,
         ];
         for name in UNCHANGING {
             let src = path.join(name);
@@ -244,9 +249,9 @@ impl Session {
 
         // Label files (small, copy is fine).
         for name in &[
-            "relation_clusters.json",
-            "feature_clusters.jsonl",
-            "feature_labels.json",
+            RELATION_CLUSTERS_JSON,
+            FEATURE_CLUSTERS_JSONL,
+            FEATURE_LABELS_JSON,
         ] {
             let src = path.join(name);
             let dst = output_dir.join(name);
@@ -290,8 +295,8 @@ impl Session {
         // by default because on Gemma it corrupts template-sharing
         // natives; it remains opt-in for v11 where it is validated.
         if down_overrides.is_empty() {
-            let src = path.join("down_weights.bin");
-            let dst = output_dir.join("down_weights.bin");
+            let src = path.join(DOWN_WEIGHTS_BIN);
+            let dst = output_dir.join(DOWN_WEIGHTS_BIN);
             if src.exists() {
                 let _ = std::fs::remove_file(&dst);
                 // Copy (not hard-link) when MEMIT will edit bytes.
@@ -356,7 +361,7 @@ impl Session {
         if knn_count > 0 {
             patched
                 .knn_store
-                .save(&output_dir.join("knn_store.bin"))
+                .save(&output_dir.join(KNN_STORE_BIN))
                 .map_err(|e| LqlError::exec("failed to save knn_store", e))?;
         }
 

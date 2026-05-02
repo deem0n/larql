@@ -26,7 +26,9 @@ impl<'a> WalkFfn<'a> {
         let hidden = x.shape()[1];
         let seq_len = x.shape()[0];
 
-        let q4_bytes_per_matrix = intermediate * hidden / 32 * 18;
+        let q4_bytes_per_matrix = larql_compute::QuantFormat::Q4_0
+            .packed_matrix_bytes(intermediate, hidden)
+            .expect("Q4_0 interleaved FFN format must have packed geometry");
         let q4_bytes_per_layer = q4_bytes_per_matrix * 3;
         let layer_start = layer * q4_bytes_per_layer;
 

@@ -39,6 +39,8 @@
 //! Skip semantics mirror the golden / parity tests: missing vindexes
 //! return Ok with a skip note.
 
+#![cfg(feature = "metal")]
+
 use std::path::PathBuf;
 
 use larql_inference::residual_diff::{compare_captures, ParityThreshold, ResidualCapture};

@@ -203,19 +203,14 @@ where
         };
     }
 
-    // Q4_K GGUF layout: 144 bytes per 256-value superblock.
-    // Q4_0: 18 bytes per 32-value block (2-byte f16 scale + 16 bytes of nibbles).
-    let q4_ffn_per_matrix = if ffn_is_q4k {
-        (intermediate * hidden).div_ceil(256) * 144
-    } else {
-        intermediate * hidden / 32 * 18
-    };
-
     let ffn_format = if ffn_is_q4k {
         larql_compute::QuantFormat::Q4_K
     } else {
         larql_compute::QuantFormat::Q4_0
     };
+    let q4_ffn_per_matrix = ffn_format
+        .packed_matrix_bytes(intermediate, hidden)
+        .expect("Q4 interleaved FFN format must have packed geometry");
 
     let num_layers = weights.num_layers;
     let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
@@ -818,16 +813,14 @@ where
         };
     }
 
-    let q4_ffn_per_matrix = if ffn_is_q4k {
-        (intermediate * hidden).div_ceil(256) * 144
-    } else {
-        intermediate * hidden / 32 * 18
-    };
     let ffn_format = if ffn_is_q4k {
         larql_compute::QuantFormat::Q4_K
     } else {
         larql_compute::QuantFormat::Q4_0
     };
+    let q4_ffn_per_matrix = ffn_format
+        .packed_matrix_bytes(intermediate, hidden)
+        .expect("Q4 interleaved FFN format must have packed geometry");
 
     let num_layers = weights.num_layers;
     let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(

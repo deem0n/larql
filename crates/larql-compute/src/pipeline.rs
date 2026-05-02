@@ -5,6 +5,10 @@
 //! The compute backends read these fields per-layer — no hardcoded
 //! model assumptions in the execution path.
 
+/// Bytes per Q4_KF pre-baked super-block. Q4_KF keeps the 256-element
+/// Q4_K block shape but expands packed scale/min metadata for faster decode.
+pub const Q4_KF_BLOCK_BYTES: usize = 160;
+
 /// Quantization format for a weight tensor.
 /// Names match GGUF conventions (Q4_K, Q6_K, etc.).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -21,6 +25,34 @@ pub enum QuantFormat {
 }
 
 impl QuantFormat {
+    /// Packed block geometry as `(elements_per_block, bytes_per_block)`.
+    ///
+    /// This is the compute-side mirror of the GGML layout constants used by
+    /// the quantizers. Callers that need byte offsets should ask the format
+    /// instead of spelling `256 * 144` or `32 * 18` locally.
+    pub fn packed_block_layout(self) -> Option<(usize, usize)> {
+        use larql_models::quant::ggml;
+
+        match self {
+            Self::Q4_0 => Some((ggml::Q4_0_BLOCK_ELEMS, ggml::Q4_0_BLOCK_BYTES)),
+            Self::Q4_K => Some((ggml::Q4_K_BLOCK_ELEMS, ggml::Q4_K_BLOCK_BYTES)),
+            Self::Q4_KF => Some((ggml::Q4_K_BLOCK_ELEMS, Q4_KF_BLOCK_BYTES)),
+            Self::Q6_K => Some((ggml::Q6_K_BLOCK_ELEMS, ggml::Q6_K_BLOCK_BYTES)),
+            _ => None,
+        }
+    }
+
+    /// Byte length for a packed row-major matrix with `rows * cols` values.
+    ///
+    /// Current interleaved FFN fallback stores each matrix contiguously, so
+    /// this intentionally preserves the historical flat packing calculation.
+    /// Manifest-aware paths should prefer recorded offsets and lengths.
+    pub fn packed_matrix_bytes(self, rows: usize, cols: usize) -> Option<usize> {
+        let elems = rows.checked_mul(cols)?;
+        let (block_elems, block_bytes) = self.packed_block_layout()?;
+        Some(elems.div_ceil(block_elems) * block_bytes)
+    }
+
     /// Whether this format uses the GGUF "Q4_K family" 256-element
     /// super-block layout that flows through the dedicated Q4_K /
     /// Q4_KF / Q6_K matvec dispatchers (vs the legacy block-32
@@ -428,6 +460,15 @@ mod tests {
         assert!(QuantFormat::Q4_KF.is_q4kf());
         assert!(!QuantFormat::Q4_K.is_q4kf());
         assert!(!QuantFormat::Q6_K.is_q4kf());
+    }
+
+    #[test]
+    fn quant_format_reports_packed_matrix_bytes() {
+        assert_eq!(QuantFormat::Q4_0.packed_matrix_bytes(2, 32), Some(36));
+        assert_eq!(QuantFormat::Q4_K.packed_matrix_bytes(2, 256), Some(288));
+        assert_eq!(QuantFormat::Q4_KF.packed_matrix_bytes(2, 256), Some(320));
+        assert_eq!(QuantFormat::Q6_K.packed_matrix_bytes(2, 256), Some(420));
+        assert_eq!(QuantFormat::F16.packed_matrix_bytes(2, 256), None);
     }
 
     /// `..Default::default()` must work with stack-local borrowed data —

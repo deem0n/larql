@@ -20,15 +20,22 @@
 //! and the head-to-head timing, which is what "diagnose perf + accuracy"
 //! usually means in practice.
 
+#[cfg(feature = "metal")]
 extern crate blas_src;
 
+#[cfg(feature = "metal")]
 use std::path::PathBuf;
+#[cfg(feature = "metal")]
 use std::time::Instant;
 
+#[cfg(feature = "metal")]
 use larql_inference::layer_graph::generate::generate;
+#[cfg(feature = "metal")]
 use larql_inference::layer_graph::CachedLayerGraph;
+#[cfg(feature = "metal")]
 use larql_inference::wrap_chat_prompt;
 
+#[cfg(feature = "metal")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
@@ -207,4 +214,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// "how far do the two backends agree before diverging".
 fn shared_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(not(feature = "metal"))]
+fn main() {
+    eprintln!("cpu_gpu_diag requires `--features metal`.");
 }

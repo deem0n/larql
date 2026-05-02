@@ -32,18 +32,30 @@ Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec
 ## Performance vs Ollama
 
 Live `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b`
-on M3 Max (2026-04-26):
+on M3 Max (2026-05-02, post dispatch-geometry fix):
 
 ```
-  larql-metal  75–79 tok/s   ~13ms/tok    (GPU fwd ~11ms, lm_head ~2.3ms)
-  ollama       98–103 tok/s  10.0ms/tok
-  gap          1.27–1.34×    ~3ms/tok
+  larql-metal  83–84 tok/s   11.9ms/tok   (GPU fwd ~11.16ms, lm_head ~1.85ms)
+  ollama       98.5–99.7 tok/s  10.0ms/tok
+  gap          1.18×          ~2.0ms/tok
 ```
 
 Reproduce: `larql bench <vindex> --backends metal --ollama <tag>`.
-See `PERFORMANCE.md` for full breakdown and per-kernel profiling.
+See `PERFORMANCE.md` for the full breakdown, the "Decision: lm_head dispatch
+order" decision-log entry, and ADR-015 for the diagnostic order rule
+("dispatch-geometry first, kernel second, reduction tree last") that drove
+the 2026-05-02 fix.
 
-### Key optimisations (62 → 77 tok/s, 2026-04-25/26)
+### Key optimisations
+
+**2026-05-02 — dispatch geometry fix (+8 tok/s on Gemma 3 4B, +14 tok/s on Gemma 4 26B A4B)**
+
+| Optimization | Savings | Technique |
+|---|---|---|
+| `q4k_matvec` dispatch geometry from bound pipeline | **+7.7 tok/s on 4B / +14.3 tok/s on 26B** | Use `pipeline.rows_per_tg` / `threads_per_tg` instead of hardcoded 4sg shader-module constants; the 8sg pipeline (default since 2026-04-28) was being under-dispatched, leaving simdgroups 4..7 idle and half the rows unwritten. **Same family as 077884b's "81–84 tok/s on broken Q4_K dispatch"** — second confirmed instance. ADR-015 § "Lesson — diagnostic order for 'fast but wrong' results" |
+| Promoted `lm_head_knn_backend` (q4k_matvec first) to default | (within above) | Stride-32 was the workaround for the pre-fix argmax drift; production now goes through the now-correct, faster q4k_matvec → f16 → f32 chain. `LARQL_LM_HEAD_SKIP_Q4K=1` for diagnostic A/B |
+
+**Earlier optimisations (2026-04-25 → 2026-05-01)**
 
 | Optimization | Savings | Technique |
 |---|---|---|
@@ -58,17 +70,19 @@ See `PERFORMANCE.md` for full breakdown and per-kernel profiling.
 | Q4_KF FFN routing | −8ms | llama.cpp-exact kernel (2026-04-09) |
 | Buffer pre-allocation | −2ms | Eliminated 550 allocs/decode (2026-04-08) |
 
-### Bottleneck analysis (from `diag_profile_kernels`)
+### Bottleneck analysis (from `diag_shader_bench`, post 2026-05-02)
 
 | Kernel | Batched GB/s | ms/tok | Bound by |
 |---|---|---|---|
-| q6k_matvec (FFN down, K=10240) | ~315 GB/s | 2.34ms | bandwidth (LPDDR5X) |
-| q4k_ffn_gate_up (gate+up, K=2560) | ~272 GB/s | 3.68ms | **compute** (Q4_K dequant at K=2560) |
-| f32_gemv (lm_head, 262K×2560) | ~370 GB/s | — | bandwidth (near peak) |
+| q6k_matvec (FFN down, K=10240) | ~312 GB/s | 2.35ms | bandwidth (84% of LPDDR5X peak) |
+| q4k_ffn_gate_up_8sg (gate+up, K=2560) | ~275 GB/s | 3.64ms | bandwidth (74% of peak) |
+| q4k_matvec (lm_head, 262K×2560) | (Q4_K, post fix) | 1.85ms | bandwidth + dequant |
+| f32_gemv (legacy lm_head fallback) | ~387 GB/s | — | bandwidth (at peak) |
 
-Gate+up is compute-bound because Q4_K at K=2560 has the lowest bytes/element
-(0.5625 B/elem) — the GPU spends more cycles on nibble dequant than waiting for
-LPDDR5X. These two kernels account for ~6ms of the ~11ms GPU fwd.
+Both big FFN kernels are bandwidth-bound at 74–84% of LPDDR5X peak; no
+single-kernel headroom remains. The remaining 1.18× gap to ollama is
+distributed across dispatch overhead + the ~30 ms/tok of CPU-side ops
+(routing, KV append, sampling) — not a hot kernel waiting to be tuned.
 
 ### Architecture
 

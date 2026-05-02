@@ -414,12 +414,14 @@ fn check_golden(
     Ok(())
 }
 
+#[cfg(feature = "metal")]
 fn metal_backend() -> Option<larql_compute::metal::MetalBackend> {
     larql_compute::metal::MetalBackend::new()
 }
 
 // ── Per-architecture × backend tests ───────────────────────────────────────
 
+#[cfg(feature = "metal")]
 fn run_metal(vindex: &str) {
     let Some(metal) = metal_backend() else {
         eprintln!("skip: Metal backend unavailable");
@@ -435,6 +437,7 @@ fn run_cpu(vindex: &str) {
     check_golden(g, "cpu", &CpuBackend).unwrap_or_else(|e| panic!("{e}"));
 }
 
+#[cfg(feature = "metal")]
 #[test]
 fn logits_golden_gemma3_4b_metal() {
     run_metal("gemma3-4b-q4k-v2");
@@ -443,6 +446,7 @@ fn logits_golden_gemma3_4b_metal() {
 fn logits_golden_gemma3_4b_cpu() {
     run_cpu("gemma3-4b-q4k-v2");
 }
+#[cfg(feature = "metal")]
 #[test]
 fn logits_golden_gemma4_31b_dense_metal() {
     run_metal("gemma4-31b-q4k");
@@ -451,6 +455,7 @@ fn logits_golden_gemma4_31b_dense_metal() {
 fn logits_golden_gemma4_31b_dense_cpu() {
     run_cpu("gemma4-31b-q4k");
 }
+#[cfg(feature = "metal")]
 #[test]
 fn logits_golden_llama2_7b_metal() {
     run_metal("llama2-7b-q4k");
@@ -459,6 +464,7 @@ fn logits_golden_llama2_7b_metal() {
 fn logits_golden_llama2_7b_cpu() {
     run_cpu("llama2-7b-q4k");
 }
+#[cfg(feature = "metal")]
 #[test]
 fn logits_golden_mistral_7b_metal() {
     run_metal("mistral-7b-v0.1-q4k");
@@ -469,6 +475,7 @@ fn logits_golden_mistral_7b_cpu() {
 }
 // Q4_K down variants — exercise the separated geglu + q4k_matvec path
 // after the fused-kernel default flip.
+#[cfg(feature = "metal")]
 #[test]
 fn logits_golden_gemma3_4b_q4k_down_metal() {
     run_metal("gemma3-4b-q4k-downq4k");
@@ -478,6 +485,7 @@ fn logits_golden_gemma3_4b_q4k_down_cpu() {
     run_cpu("gemma3-4b-q4k-downq4k");
 }
 // Gemma 4 31B Q6_K-down variant.
+#[cfg(feature = "metal")]
 #[test]
 fn logits_golden_gemma4_31b_q6kdown_metal() {
     run_metal("gemma4-31b-q4k-q6kdown");

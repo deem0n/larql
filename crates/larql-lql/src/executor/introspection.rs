@@ -6,6 +6,7 @@ use super::helpers::{dir_size, format_bytes, format_number, is_content_token};
 use super::Session;
 use crate::ast::*;
 use crate::error::LqlError;
+use larql_vindex::format::filenames::INDEX_JSON;
 
 impl Session {
     pub(crate) fn exec_show_compact_status(&self) -> Result<Vec<String>, LqlError> {
@@ -448,7 +449,7 @@ impl Session {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    let index_json = path.join("index.json");
+                    let index_json = path.join(INDEX_JSON);
                     if index_json.exists() {
                         if let Ok(config) = larql_vindex::load_vindex_config(&path) {
                             let size = dir_size(&path);

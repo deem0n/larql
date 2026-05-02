@@ -23,7 +23,7 @@ use std::path::Path;
 pub const SNAPSHOT_FILES: &[&str] = &[
     TOKENIZER_CONFIG_JSON,
     "special_tokens_map.json",
-    "generation_config.json",
+    GENERATION_CONFIG_JSON,
     // Newer HF convention (Gemma 4, etc.): the chat template is a
     // standalone `chat_template.jinja` file rather than a field inside
     // `tokenizer_config.json`. Ship it alongside so the runtime can pick

@@ -79,6 +79,22 @@ openblas-src = { version = "0.10", features = ["system"] }
 default = []
 metal = ["larql-compute/metal"]
 
+[[example]]
+name = "cpu_gpu_diag"
+required-features = ["metal"]
+
+[[example]]
+name = "decode_vs_prefill"
+required-features = ["metal"]
+
+[[example]]
+name = "residual_diff"
+required-features = ["metal"]
+
+[[example]]
+name = "stage_bisect"
+required-features = ["metal"]
+
 [dev-dependencies]
 assert_approx_eq = "1"
 tempfile = "3"

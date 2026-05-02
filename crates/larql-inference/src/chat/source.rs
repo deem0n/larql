@@ -21,6 +21,7 @@
 
 use std::path::Path;
 
+use larql_vindex::format::filenames::TOKENIZER_CONFIG_JSON;
 use serde_json::Value;
 
 use super::render::render_chat_template;
@@ -97,7 +98,7 @@ fn finish_render(
 /// non-fatal — many models ship without a config, and the template itself
 /// might be purely self-contained.
 pub(super) fn load_tokenizer_config(vindex_dir: &Path) -> Value {
-    let path = vindex_dir.join("tokenizer_config.json");
+    let path = vindex_dir.join(TOKENIZER_CONFIG_JSON);
     if !path.is_file() {
         return Value::Object(Default::default());
     }

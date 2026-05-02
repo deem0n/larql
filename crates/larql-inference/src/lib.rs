@@ -96,6 +96,7 @@ pub use larql_compute::MetalBackend;
 pub use attention::AttentionWeights;
 pub use capture::{
     CaptureCallbacks, CaptureConfig, InferenceModel, TopKEntry, VectorFileHeader, VectorRecord,
+    DEFAULT_ACTIVATION_TOP_K, DEFAULT_RESIDUAL_TOP_K,
 };
 pub use chat::{wrap_chat_prompt, wrap_prompt_raw, wrap_with_vindex_template, ChatWrap};
 pub use error::InferenceError;

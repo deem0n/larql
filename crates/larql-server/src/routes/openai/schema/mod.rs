@@ -17,8 +17,10 @@ pub mod ast;
 pub mod fsm;
 pub mod mask;
 pub mod parser;
+pub mod tools;
 
 pub use ast::{ArraySchema, NumberSchema, ObjectSchema, Schema, StringSchema};
 pub use fsm::{Fsm, StepResult};
 pub use mask::build_mask;
 pub use parser::{parse_schema, parse_schema_with, ParseOptions};
+pub use tools::{resolve_tool_choice, synth_tools_schema, ToolMode};

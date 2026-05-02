@@ -185,7 +185,7 @@ t.top_k(24)              # top-5 predictions at L24
 t.rank_of("Paris", 23)   # rank of Paris at L23
 t.residual(24)            # raw residual vector at L24
 t.attn_delta(24)          # what attention added at L24
-t.ffn_delta(24)           # what FFN added at L24
+t.ffn_delta(24)           # post-attention contribution at L24
 t.summary()               # per-layer compact summary
 
 # Multi-position trace (all token positions)

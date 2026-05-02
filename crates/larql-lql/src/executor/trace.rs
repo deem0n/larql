@@ -127,6 +127,12 @@ impl super::Session {
             Some(TracePositionMode::All) => larql_inference::TracePositions::All,
             _ => larql_inference::TracePositions::Last,
         };
+        if save.is_some() && !matches!(positions, Some(TracePositionMode::All)) {
+            return Err(LqlError::Execution(
+                "TRACE SAVE requires POSITIONS ALL so the mmap trace contains complete token chains"
+                    .into(),
+            ));
+        }
 
         let start = std::time::Instant::now();
         let mut trace = larql_inference::trace_residuals(weights, &token_ids, pos, false, ffn);

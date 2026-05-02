@@ -562,7 +562,22 @@ logic in the request entry points.
 
 ### F-COLLECT. Parallelize shard collection in `forward_moe_stream_collect_with_timing`
 
-**Status**: Not started.
+**Status**: ✅ **Shipped 2026-05-02.** Both halves of the gRPC dispatch are
+now parallel across shards:
+- `forward_moe_stream_collect_with_timing` uses `std::thread::scope`,
+  one OS thread per stream, joined into a single result vector.
+  `ShardStream::result_rx` was wrapped in `std::sync::Mutex` to make
+  `ShardStream: Sync` (the type-system requirement for parallel borrow).
+- `forward_moe_stream_fire` uses `rayon::par_iter().enumerate().try_for_each(...)`
+  with a single-shard fast path. The blocking residual-bytes / post-norm-bytes
+  clones now happen across rayon workers instead of serially.
+
+Verified on 2-shard local-loopback: per-layer collect ≈ 21 ms (~ equal to
+1-shard collect time), confirming `collect ≈ max(per_shard.wall)` rather
+than `sum` — the structural win. Real-network validation pending under
+**F-FLY** below; loopback can't show the absolute tok/s improvement
+because both shards finish nearly simultaneously and the savings sit
+under M3 Max P-core saturation noise.
 
 **Driver**: 2026-05-02 bottleneck analysis on the local Metal MoE path
 vs the CPU/grid path (single shard, colocated). Both land at ~19 tok/s

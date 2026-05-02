@@ -355,12 +355,49 @@ async fn http_openai_embeddings_pretokenised_single_works() {
 }
 
 #[tokio::test]
-async fn http_openai_embeddings_base64_format_returns_400() {
+async fn http_openai_embeddings_base64_format_returns_string() {
+    // base64 is now supported — the embedding field is a base64 string
+    // of the LE f32 bytes instead of a JSON array. Use pretokenised
+    // input so the synthetic tokenizer doesn't gate the test path.
     let app = single_model_router(state(vec![model("test")]));
     let resp = post_json(
         app,
         "/v1/embeddings",
-        serde_json::json!({"input": "hi", "encoding_format": "base64"}),
+        serde_json::json!({
+            "input": [0u32, 1u32, 2u32],
+            "encoding_format": "base64",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let embedding = &body["data"][0]["embedding"];
+    assert!(
+        embedding.is_string(),
+        "expected base64 string, got {embedding}"
+    );
+    let s = embedding.as_str().unwrap();
+    // Decode + sanity-check length: 4 bytes per f32, must be ≥1 f32.
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .expect("valid base64");
+    assert!(!bytes.is_empty());
+    assert_eq!(
+        bytes.len() % 4,
+        0,
+        "len must be 4·hidden, got {}",
+        bytes.len()
+    );
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_unknown_format_returns_400() {
+    let app = single_model_router(state(vec![model("test")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": [0u32, 1u32], "encoding_format": "binary"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -683,19 +720,107 @@ async fn http_openai_chat_n_gt_1_returns_400() {
 }
 
 #[tokio::test]
-async fn http_openai_chat_tools_returns_400() {
+async fn http_openai_chat_tools_are_accepted() {
+    // Tools synthesise a constrained-decoding schema. Synthetic model
+    // is infer_disabled so we 503 — confirms the schema synth +
+    // ToolMode resolution succeeded.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"]
+                    }
+                }
+            }],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tools_with_specific_choice_is_accepted() {
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "calc", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "calc"}},
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tools_unknown_choice_returns_400() {
     let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
     let resp = post_json(
         app,
         "/v1/chat/completions",
         serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}],
+            "tools": [{"type": "function", "function": {"name": "calc", "parameters": {}}}],
+            "tool_choice": {"type": "function", "function": {"name": "missing"}},
             "max_tokens": 1
         }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tools_with_stream_returns_400() {
+    // Streaming tool calls (delta chunks) is a separate slice — for
+    // now, tools + stream is rejected.
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "calc", "parameters": {}}}],
+            "stream": true,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tool_choice_none_skips_constraint() {
+    // tool_choice="none" disables constrained decoding even when tools
+    // are listed — falls through to the standard text completion path.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "calc", "parameters": {}}}],
+            "tool_choice": "none",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -832,7 +957,127 @@ async fn http_openai_chat_invalid_role_returns_400() {
         app,
         "/v1/chat/completions",
         serde_json::json!({
-            "messages": [{"role": "tool", "content": "x"}],
+            "messages": [{"role": "function", "content": "x"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tool_message_without_tool_call_id_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {"role": "tool", "content": "23C"} // missing tool_call_id
+            ],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tool_replay_is_accepted() {
+    // Full multi-turn tool flow: user → assistant tool_call → tool
+    // result → expects another assistant turn. Synthetic model is
+    // infer_disabled, so we 503 — confirming the wire shape parsed
+    // through validation.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Weather in London?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"London\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "23C, sunny"}
+            ],
+            "max_tokens": 16
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_assistant_with_only_tool_calls_is_accepted() {
+    // Some clients send assistant messages with content: null but
+    // populated tool_calls — must not 400 on the missing content.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "calc", "arguments": "{}"}}
+                ]}
+            ],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_logprobs_request_field_is_accepted() {
+    // logprobs: true should be accepted on chat completions; the
+    // synthetic model 503s but the field passes validation.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true,
+            "top_logprobs": 5,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_completions_logprobs_request_field_is_accepted() {
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "prompt": "hi",
+            "logprobs": 3,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_assistant_with_no_content_or_tools_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant"} // no content, no tool_calls
+            ],
             "max_tokens": 1
         }),
     )

@@ -20,12 +20,13 @@ This file tracks the demo narrative, the critical path, and cross-crate sequenci
 
 ---
 
-## Current state (2026-04-26)
+## Current state (2026-05-02)
 
-- **490+ tests passing** across the workspace, 0 build warnings.
+- **2,000+ tests passing** across the workspace, 0 build warnings.
 - **Primary CLI verbs** in place: `run`, `chat`, `pull`, `list`, `show`, `rm`, `link`, `serve`, `bench`.
-- **Gemma 3 4B Metal**: 75–79 tok/s (Ollama: 98–103). Gap: ~1.24×.
-- **Gemma 4 26B A4B Metal**: 3.9 tok/s after batched MoE prefill (+35% from today).
+- **Gemma 3 4B Metal**: **83–84 tok/s** (Ollama steady: 98.5–99.7). **Gap: 1.18×** (was 1.30× before the 2026-05-02 dispatch-geometry fix).
+- **Gemma 4 26B A4B Metal**: **19.4 tok/s** (was 5.1 — bug-locked under the same dispatch-geometry mismatch; correct multilingual output now).
+- **Grid (CPU MoE on remote shards)**: 18.3 tok/s 1-shard / 17.3 tok/s 2-shard local-loopback, both with parallel collect (`std::thread::scope`) and parallel fire (`rayon::par_iter`). Multi-host LAN/cross-region scaling unblocked by F-COLLECT in `crates/larql-server/ROADMAP.md`.
 - **Remote FFN (dense)**: `larql run --ffn URL` + `larql serve --ffn-only` wired end-to-end.
 - **gRPC grid**: 2-shard self-assembling grid live-validated on 26B A4B.
 - **4 KV-cache engines**: MarkovRS (287×), UnlimitedContext (254×), TurboQuant (4×), Apollo (20,000×) — all at ~95 tok/s on Gemma 3 4B Metal.
@@ -78,6 +79,31 @@ Detail in `larql-inference/ROADMAP.md` § Mechanistic hooks (lazarus parity).
 
 ---
 
+## P0 — Best-in-class mechanistic interpretability engine
+
+Driver: make LARQL's executed mechanisms queryable, attributable, patchable,
+and reproducible. This is the layer above lazarus parity: not just hooks, but
+evidence-grade traces and causal operators over the actual vindex-backed
+inference path.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| MI0 | Faithful residual DAG: TRACE uses the canonical layer runner and pins additive reconstruction | larql-inference | shipped |
+| MI1 | Python `WalkModel.trace()` / `patch_activations()` use `WalkFfn` instead of dense fallback | larql-python + larql-inference | shipped |
+| MI2 | Backend-parametric donor capture and activation patching | larql-inference | shipped |
+| MI3 | Strict trace artifacts: complete ordered chains, exact file length, `TRACE SAVE` requires `POSITIONS ALL` | larql-inference + larql-lql | shipped |
+| MI4 | Golden parity: TRACE final residual/logits match canonical forward; extend to WalkFfn, patched vindex, Q4K, MoE | larql-inference | partial — dense/custom backend pinned |
+| MI5 | Rich attribution objects: attention-head writes, FFN feature activations, router/expert decisions, provenance | larql-inference + larql-python | planned |
+| MI6 | Causal operators beyond residual replacement: head/feature/router/expert/KV patching | larql-inference + larql-python | planned |
+| MI7 | Q4K/MoE trace and patch parity with explicit precision caveats | larql-inference + larql-vindex | planned |
+| MI8 | Python experiment ergonomics: batched prompts, donor/recipient alignment, causal metrics, reproducibility metadata | larql-python | planned |
+
+Near-term order: finish MI4 parity coverage, then add attribution records where
+the forward path already exposes data, then expand patching operators one
+mechanism at a time.
+
+---
+
 ## P1 — Research stack promotion: OV/RD → engine primitives
 
 Driver: make LARQL one of the strongest practical mechanistic
@@ -112,11 +138,12 @@ features.
 | # | Item | Crate | Status |
 |---|------|-------|--------|
 | T1 | Tag KNN overrides visibly in `INFER`, `EXPLAIN INFER`, and `TRACE` as post-logits retrieval events, including the model's unoverridden top-1 | larql-lql + larql-inference | planned |
-| T2 | Fix decomposed `TRACE` to route through the shared layer sequence, including PLE/layer-scalar deltas or equivalent captured intermediates | larql-inference | planned |
-| T3 | Make Python `WalkModel.trace()` use the vindex `WalkFfn`/patch overlay rather than dense `WeightFfn` | larql-python + larql-inference | planned |
+| T2 | Fix decomposed `TRACE` to route through the shared layer sequence, including PLE/layer-scalar deltas or equivalent captured intermediates | larql-inference | shipped |
+| T3 | Make Python `WalkModel.trace()` use the vindex `WalkFfn`/patch overlay rather than dense `WeightFfn` | larql-python + larql-inference | shipped |
 | T4 | Replace gate-KNN absolute-dot feature ranking in interpretability displays with post-activation magnitude, or filter ghost negative gates after activation | larql-vindex + larql-inference | planned |
 | T5 | Fix L1 FFN cache activation capture: cache activations with outputs or bypass cache when activations are requested | larql-inference | planned |
 | T6 | Rename residual-capture embedding-neighbor fields (`top_token`) or add separate true logit-lens fields | larql-inference + larql-models | planned |
+| T7 | Pin TRACE evidence with final residual/logit parity tests across dense, custom backend, WalkFfn, patched vindex, Q4K, and MoE paths | larql-inference | partial |
 | C1 | Add explicit compile modes: default commit/materialize semantics vs `SNAPSHOT` preserving `knn_store.bin` | larql-lql + larql-vindex | design |
 | C2 | Implement KNN materialization by lowering retrieval entries into compose/MEMIT/FFN edits, then dropping or marking committed sidecar entries | larql-lql + larql-vindex + larql-inference | planned |
 | C3 | Add acceptance tests: session KNN equivalence, trace conversion, and generalization beyond stored prompts | larql-lql + larql-inference | planned |
@@ -145,7 +172,7 @@ Items in order. Each depends on the one above it.
 |---|------|-------|--------|
 | 1 | Chat template + EOS stop | larql-inference + larql-cli | not started |
 | 2 | Token streaming | larql-inference + larql-cli | not started |
-| 3 | **Per-layer FFN format** (`layers/`, GPU dispatch) Phase 2: pre-alloc buffers | larql-vindex + larql-compute | phase 1 shipped (5.2 tok/s); phase 2 open |
+| 3 | **Per-layer FFN format** (`layers/`, GPU dispatch) Phase 2: pre-alloc buffers | larql-vindex + larql-compute | shipped — `MoeScratch` pre-allocates once per decode call; combined with the 2026-05-02 dispatch-geometry fix, 26B A4B Metal now runs at **19.4 tok/s** (was bug-locked at 5.1) |
 | 4 | MoE-aware CPU forward pass (non-Metal fallback) | larql-inference | not started |
 | 5 | Wire `RouterIndex` client-side | larql-inference | not started |
 | 6 | `POST /v1/expert/{layer}/{expert_id}` | larql-server | not started |
@@ -154,7 +181,13 @@ Items in order. Each depends on the one above it.
 | 9 | `RemoteExpertBackend` client | larql-inference | not started |
 | 10 | Reliability pass (timeouts, retries) | larql-server | not started |
 
-Items 1–2 are needed for Act 1. Item 3 is the MoE performance gate: the 26B A4B currently runs at 4.1 tok/s (GPU baseline is 56.8 tok/s — 93.7% of time is CPU MoE). Items 4–10 are needed for Act 2. See `larql-vindex/ROADMAP.md P0` for the format redesign detail.
+Items 1–2 are needed for Act 1. Item 3's MoE performance gate landed
+2026-05-02: 26B A4B Metal now runs at 19.4 tok/s (was 5.1, bug-locked
+under the dispatch-geometry mismatch in `moe_dispatch.rs`). SKIP_MOE
+ceiling 56.8 tok/s — remaining headroom is real expert-dispatch work,
+not allocation. Items 4–10 are needed for Act 2. See
+`larql-vindex/ROADMAP.md P0` and `larql-server/ROADMAP.md` (F-COLLECT,
+F-LOCAL-MOE, G-SCALE) for the next levers.
 
 ---
 

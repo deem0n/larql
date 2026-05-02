@@ -145,16 +145,14 @@ impl ResidualCapture {
         };
         let q4_ffn_mmap = q4_ffn.ok_or("no Q4 FFN mmap available for decode capture")?;
         let intermediate = gate_index.num_features(0);
-        let q4_ffn_per_matrix = if ffn_is_q4k {
-            (intermediate * hidden).div_ceil(256) * 144
-        } else {
-            intermediate * hidden / 32 * 18
-        };
         let ffn_format = if ffn_is_q4k {
             larql_compute::QuantFormat::Q4_K
         } else {
             larql_compute::QuantFormat::Q4_0
         };
+        let q4_ffn_per_matrix = ffn_format
+            .packed_matrix_bytes(intermediate, hidden)
+            .ok_or("unsupported Q4 FFN format for decode capture")?;
         let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
             weights,
             index,
@@ -262,16 +260,14 @@ impl ResidualCapture {
         };
         let q4_ffn_mmap = q4_ffn.ok_or("no Q4 FFN mmap available for decode capture")?;
         let intermediate = gate_index.num_features(0);
-        let q4_ffn_per_matrix = if ffn_is_q4k {
-            (intermediate * hidden).div_ceil(256) * 144
-        } else {
-            intermediate * hidden / 32 * 18
-        };
         let ffn_format = if ffn_is_q4k {
             larql_compute::QuantFormat::Q4_K
         } else {
             larql_compute::QuantFormat::Q4_0
         };
+        let q4_ffn_per_matrix = ffn_format
+            .packed_matrix_bytes(intermediate, hidden)
+            .ok_or("unsupported Q4 FFN format for decode capture")?;
         let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
             weights,
             index,

@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 
 use std::path::Path;
 
-use larql_inference::ffn::WeightFfn;
+use larql_inference::ffn::{FfnBackend, WeightFfn};
 use larql_inference::trace as trace_mod;
 use larql_inference::trace::TracePositions;
 use larql_inference::ModelWeights;
@@ -120,7 +120,7 @@ impl PyResidualTrace {
         self.inner.node(layer, pos).map(|n| n.attn_delta.clone())
     }
 
-    /// Get FFN delta at (layer, position) as a list of floats.
+    /// Get post-attention delta at (layer, position) as a list of floats.
     #[pyo3(signature = (layer, position=None))]
     fn ffn_delta(&self, layer: i32, position: Option<usize>) -> Option<Vec<f32>> {
         let pos = position.unwrap_or_else(|| self.inner.tokens.len() - 1);
@@ -130,7 +130,8 @@ impl PyResidualTrace {
     /// Save the trace to an mmap-friendly binary file.
     ///
     /// The file is append-only and can be re-opened for reading with
-    /// zero-copy mmap access. Each token chain is written contiguously.
+    /// zero-copy mmap access. Each token chain is written contiguously;
+    /// traces must have been captured with positions="all".
     fn save(&self, path: &str) -> PyResult<usize> {
         let mut writer = trace_mod::TraceWriter::create(
             Path::new(path),
@@ -370,11 +371,23 @@ impl PyBoundaryWriter {
 }
 
 /// Capture a trace from a WalkModel (called from PyWalkModel.trace).
+#[allow(dead_code)]
 pub fn capture_trace(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     prompt: &str,
     positions: &str,
+) -> PyResult<PyResidualTrace> {
+    let ffn = WeightFfn { weights };
+    capture_trace_with_ffn(weights, tokenizer, prompt, positions, &ffn)
+}
+
+pub fn capture_trace_with_ffn(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
+    positions: &str,
+    ffn: &dyn FfnBackend,
 ) -> PyResult<PyResidualTrace> {
     let encoding = tokenizer
         .encode(prompt, true)
@@ -386,8 +399,7 @@ pub fn capture_trace(
         _ => TracePositions::Last,
     };
 
-    let ffn = WeightFfn { weights };
-    let mut trace = trace_mod::trace_residuals(weights, &token_ids, pos, false, &ffn);
+    let mut trace = trace_mod::trace_residuals(weights, &token_ids, pos, false, ffn);
 
     trace.prompt = prompt.to_string();
     trace.tokens = token_ids

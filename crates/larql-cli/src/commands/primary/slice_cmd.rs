@@ -83,8 +83,8 @@ impl Part {
             Self::DownMeta => filename == DOWN_META_BIN || filename == "down_meta.jsonl",
             Self::Ffn => {
                 filename.starts_with("interleaved")
-                    || filename == "up_weights.bin"
-                    || filename == "down_weights.bin"
+                    || filename == UP_WEIGHTS_BIN
+                    || filename == DOWN_WEIGHTS_BIN
                     || filename == UP_FEATURES_BIN
                     || filename == DOWN_FEATURES_BIN
             }
@@ -93,9 +93,9 @@ impl Part {
             Self::Tokenizer => filename == TOKENIZER_JSON,
             Self::Manifest => filename == WEIGHT_MANIFEST_JSON,
             Self::Labels => {
-                filename == "feature_labels.json"
-                    || filename == "feature_clusters.jsonl"
-                    || filename == "relation_clusters.json"
+                filename == FEATURE_LABELS_JSON
+                    || filename == FEATURE_CLUSTERS_JSONL
+                    || filename == RELATION_CLUSTERS_JSON
             }
             Self::Readme => filename == "README.md",
         }

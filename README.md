@@ -449,19 +449,21 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 
 | Operation | Latency | tok/s |
 |---|---|---|
-| **GPU Q4K decode (Metal, 34L, KV cache)** | **15.6ms** | **64** |
+| **GPU Q4K decode (Metal, 34L, KV cache)** | **11.9ms** | **84** |
 | Walk prediction (CPU, no attention) | 33ms | 30 |
 | INFER walk (CPU, with attention, mmap FFN) | 517ms | 1.9 |
 | INFER dense (CPU, all matmul) | 535ms | 1.9 |
 | DESCRIBE (knowledge browse) | 33ms | — |
 
-GPU decode per-stage breakdown:
+GPU decode per-stage breakdown (post 2026-05-02 dispatch geometry fix):
 
 | Component | Time | % of total |
 |---|---|---|
-| GPU forward (34 layers, Q4K/Q6K) | 14.1ms | 86% |
-| LM head (Q4_0 synthesized from f16 embeddings) | 2.0ms | 12% |
+| GPU forward (34 layers, Q4K/Q6K) | 11.16 ms | 86% |
+| LM head (Q4_K stride-32 + correctness fix) | 1.85 ms | 14% |
 | Embed + norm + detokenize | <0.1ms | <1% |
+
+vs ollama gemma3:4b on the same machine: 99 tok/s steady → **gap 1.18×**, was 1.30× before the fix.
 
 CPU walk breakdown:
 
@@ -471,7 +473,18 @@ CPU walk breakdown:
 | FFN × 34 layers (walk) | 194ms | 36% |
 | Attention × 34 layers | 84ms | 16% |
 
-Walk is **faster than dense** (517ms vs 535ms). GPU Q4K decode is **16× faster** than CPU walk. FFN down projection in walk reads from mmap'd vindex (zero-copy BLAS). Walk only needs ~3.5GB of model weights (attention + embeddings), not 16.6GB. No quantization. See [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md) for architecture and [docs/inference-engine.md](docs/inference-engine.md) for engine details.
+Walk is **faster than dense** (517ms vs 535ms). GPU Q4K decode is **23× faster** than CPU walk. FFN down projection in walk reads from mmap'd vindex (zero-copy BLAS). Walk only needs ~3.5GB of model weights (attention + embeddings), not 16.6GB. No quantization. See [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md) for architecture and [docs/inference-engine.md](docs/inference-engine.md) for engine details.
+
+### MoE / grid (Gemma 4 26B A4B, M3 Max)
+
+| Topology | tok/s | Notes |
+|---|---|---|
+| **Local Metal MoE** | **19.4** | Post 2026-05-02 dispatch fix; was 5.1 (bug-locked). Output coherent multilingual. |
+| 1-shard CPU/grid (loopback) | 18.3 | NEON Q4_K matvec on shard server, gRPC fan-in |
+| 2-shard CPU/grid (loopback) | 17.3 | Parallel collect + parallel fire (`std::thread::scope` + `rayon::par_iter`) |
+| SKIP_MOE ceiling | 56.8 | Attention + dense FFN only; theoretical max |
+
+The grid path is the load-bearing primitive for the **"split large models in grids"** axis — Kimi K2.6 / DeepSeek V4-class models (1T params, ~600 GB Q4_K) only fit on a multi-shard deployment. See [`crates/larql-server/ROADMAP.md` §G-SCALE](crates/larql-server/ROADMAP.md) for the path forward.
 
 ## Residual Stream Trace
 

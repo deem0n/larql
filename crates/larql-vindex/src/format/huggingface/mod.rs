@@ -30,8 +30,8 @@ pub(crate) const VINDEX_CORE_FILES: &[&str] = &[
     EMBEDDINGS_BIN,
     DOWN_META_BIN,
     "down_meta.jsonl",
-    "relation_clusters.json",
-    "feature_labels.json",
+    RELATION_CLUSTERS_JSON,
+    FEATURE_LABELS_JSON,
 ];
 
 pub(crate) const VINDEX_WEIGHT_FILES: &[&str] = &[

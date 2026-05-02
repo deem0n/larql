@@ -11,7 +11,7 @@ use ndarray::Array2;
 use std::time::Instant;
 
 use larql_compute::CpuBackend;
-use larql_compute::{default_backend, ComputeBackend, MatMulOp};
+use larql_compute::{default_backend, ComputeBackend, MatMul, MatMulOp};
 
 /// Deterministic f32 matrix.
 fn synth_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {

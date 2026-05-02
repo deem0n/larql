@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::metrics::{bool_rate, mean, percentile};
 use super::reports::{
     AddressCorruptionReport, AddressGroupImportanceReport, AddressProbePromptReport,
-    AddressProbeReport, CodeStabilityReport, OraclePqPointReport, OraclePqPromptReport,
+    AddressProbeReport, AddressProbeStratumReport, CodeStabilityReport, OraclePqPointReport,
+    OraclePqPromptReport,
 };
 use super::types::PqConfig;
 
@@ -196,6 +197,50 @@ impl OraclePqPointAccumulator {
     }
 }
 
+fn address_probe_by_stratum(
+    prompts: &[AddressProbePromptReport],
+) -> Vec<AddressProbeStratumReport> {
+    let mut by_stratum: BTreeMap<String, Vec<&AddressProbePromptReport>> = BTreeMap::new();
+    for prompt in prompts {
+        by_stratum
+            .entry(prompt.stratum.clone())
+            .or_default()
+            .push(prompt);
+    }
+
+    by_stratum
+        .into_iter()
+        .map(|(stratum, prompts)| {
+            let kls = prompts.iter().map(|prompt| prompt.kl).collect::<Vec<_>>();
+            let positions = prompts.iter().map(|prompt| prompt.positions).sum::<usize>();
+            let groups_total = prompts
+                .iter()
+                .map(|prompt| prompt.groups_total)
+                .sum::<usize>()
+                .max(1);
+            let groups_correct = prompts
+                .iter()
+                .map(|prompt| prompt.groups_correct)
+                .sum::<usize>();
+            AddressProbeStratumReport {
+                stratum,
+                prompts: prompts.len(),
+                positions,
+                group_accuracy: groups_correct as f64 / groups_total as f64,
+                mean_kl: mean(&kls),
+                p95_kl: percentile(kls.clone(), 0.95),
+                max_kl: kls.iter().copied().fold(0.0, f64::max),
+                top1_agreement: bool_rate(prompts.iter().map(|prompt| prompt.top1_agree)),
+                top5_contains_baseline_top1: bool_rate(
+                    prompts
+                        .iter()
+                        .map(|prompt| prompt.baseline_top1_in_predicted_top5),
+                ),
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct AddressProbeAccumulator {
     name: String,
@@ -256,6 +301,7 @@ impl AddressProbeAccumulator {
                     .iter()
                     .map(|p| p.baseline_top1_in_predicted_top5),
             ),
+            by_stratum: address_probe_by_stratum(&self.prompts),
             worst_examples: self.prompts.into_iter().take(8).collect(),
         }
     }

@@ -16,6 +16,12 @@
 //! looks fine on paper but the GPU phase is 2× slower than expected."
 
 use clap::Args;
+use larql_vindex::format::filenames::{
+    ATTN_WEIGHTS_Q4K_BIN, ATTN_WEIGHTS_Q4K_MANIFEST_JSON, ATTN_WEIGHTS_Q4_BIN, ATTN_WEIGHTS_Q8_BIN,
+    EMBEDDINGS_BIN, GENERATION_CONFIG_JSON, INDEX_JSON, INTERLEAVED_Q4K_BIN,
+    INTERLEAVED_Q4K_MANIFEST_JSON, INTERLEAVED_Q4_BIN, LM_HEAD_BIN, LM_HEAD_Q4_BIN, NORMS_BIN,
+    TOKENIZER_CONFIG_JSON, TOKENIZER_JSON, WEIGHT_MANIFEST_JSON,
+};
 
 use crate::commands::primary::cache;
 
@@ -58,22 +64,22 @@ pub fn run(args: DiagArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nFiles (inference-relevant):");
     let inference_files = [
-        "index.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "embeddings.bin",
-        "attn_weights_q4k.bin",
-        "attn_weights_q4k_manifest.json",
-        "attn_weights_q4.bin",
-        "attn_weights_q8.bin",
-        "interleaved_q4k.bin",
-        "interleaved_q4k_manifest.json",
-        "interleaved_q4.bin",
-        "lm_head.bin",
-        "lm_head_q4.bin",
-        "norms.bin",
-        "weight_manifest.json",
-        "generation_config.json",
+        INDEX_JSON,
+        TOKENIZER_JSON,
+        TOKENIZER_CONFIG_JSON,
+        EMBEDDINGS_BIN,
+        ATTN_WEIGHTS_Q4K_BIN,
+        ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+        ATTN_WEIGHTS_Q4_BIN,
+        ATTN_WEIGHTS_Q8_BIN,
+        INTERLEAVED_Q4K_BIN,
+        INTERLEAVED_Q4K_MANIFEST_JSON,
+        INTERLEAVED_Q4_BIN,
+        LM_HEAD_BIN,
+        LM_HEAD_Q4_BIN,
+        NORMS_BIN,
+        WEIGHT_MANIFEST_JSON,
+        GENERATION_CONFIG_JSON,
     ];
     for fname in inference_files {
         let fpath = path.join(fname);
@@ -152,8 +158,8 @@ pub fn run(args: DiagArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// summary; on mismatch, the kernel reads off-stride and produces NaN.
 fn validate_strides(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
     let manifests = [
-        "attn_weights_q4k_manifest.json",
-        "interleaved_q4k_manifest.json",
+        ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+        INTERLEAVED_Q4K_MANIFEST_JSON,
     ];
     let mut total_clean = 0usize;
     let mut total_bad = 0usize;

@@ -13,6 +13,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+pub use larql_vindex::format::filenames::GENERATION_CONFIG_JSON as GENERATION_CONFIG_FILENAME;
+
 /// Token strings that always terminate generation across model families.
 ///
 /// Built-in fallback when `generation_config.json` is missing or doesn't
@@ -29,9 +31,6 @@ pub const BUILTIN_STOP_STRINGS: &[&str] = &[
     "<|eom_id|>",
     "<|end_of_text|>",
 ];
-
-/// Filename inside a vindex containing default sampling + stop config.
-pub const GENERATION_CONFIG_FILENAME: &str = "generation_config.json";
 
 /// JSON keys read from `generation_config.json`.
 pub const KEY_EOS_TOKEN_ID: &str = "eos_token_id";

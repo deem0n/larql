@@ -18,9 +18,16 @@ curl "http://localhost:8080/v1/describe?entity=France"
 
 For Gemma 4 26B-A4B and other hybrid-MoE models, this server is also the
 **remote expert** that the inference client calls per layer. End-to-end
-~19.7 tok/s on M3 Max with one local gRPC shard (see
-`Remote MoE shard topology` below for setup, and `ROADMAP.md → F-FLY` for
-multi-host deployment.)
+~18.3 tok/s on M3 Max with one local gRPC shard, ~17.3 tok/s with two local
+shards (see `Remote MoE shard topology` below for setup, and `ROADMAP.md
+→ F-FLY` for multi-host deployment).
+
+The collect + fire halves of the gRPC dispatch are now both parallel across
+shards (`std::thread::scope` + `rayon::par_iter`, 2026-05-02) — see
+`ROADMAP.md → F-COLLECT`. On loopback the win is below noise (single
+machine, P-core saturation), but at multi-host LAN/cross-region scale this
+becomes the load-bearing primitive: parallel collect turns
+`collect ≈ N × RTT × layers` into `collect ≈ max(RTT) × layers`.
 
 ## What this is
 

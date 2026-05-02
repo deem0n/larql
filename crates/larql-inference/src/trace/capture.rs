@@ -1,9 +1,14 @@
 //! Trace capture — decomposed forward pass recording attn and FFN deltas.
 
+use std::collections::HashMap;
+
 use ndarray::Array2;
 
-use crate::attention::AttentionWeights;
+use crate::attention::SharedKV;
 use crate::ffn::{FfnBackend, WeightFfn};
+use crate::forward::hooks::LayerHook;
+use crate::forward::ple::precompute_per_layer_inputs;
+use crate::forward::{embed_tokens_pub, run_layer_with_capture_hooked};
 use crate::model::ModelWeights;
 
 use super::types::*;
@@ -13,6 +18,17 @@ pub enum TracePositions {
     Last,
     All,
     Positions(Vec<usize>),
+}
+
+#[derive(Default)]
+struct TraceLayerHook {
+    post_attention: Option<Array2<f32>>,
+}
+
+impl LayerHook for TraceLayerHook {
+    fn on_post_attention(&mut self, _layer: usize, h: &mut Array2<f32>) {
+        self.post_attention = Some(h.clone());
+    }
 }
 
 /// Capture a complete residual stream trace.
@@ -33,7 +49,9 @@ pub fn trace_residuals(
         TracePositions::Positions(ref ps) => ps.clone(),
     };
 
-    let mut h = embed_tokens_raw(weights, token_ids);
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
     let mut nodes = Vec::new();
     let mut attention_captures = Vec::new();
     let zero = vec![0.0f32; hidden];
@@ -53,13 +71,25 @@ pub fn trace_residuals(
     for layer in 0..num_layers {
         let pre = h.clone();
 
-        let (h_post_attn, _attn_projected, attn_weights) =
-            match run_attention_decomposed(weights, &h, layer, capture_attention) {
-                Some(r) => r,
-                None => continue,
-            };
-
-        let h_post_ffn = run_ffn_decomposed(weights, &h_post_attn, layer, ffn);
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| kv_cache.get(&src));
+        let mut hook = TraceLayerHook::default();
+        let Some((h_out, _, attn_weights, kv_out)) = run_layer_with_capture_hooked(
+            weights,
+            &h,
+            layer,
+            ffn,
+            false,
+            capture_attention,
+            ple_inputs.get(layer),
+            shared_kv,
+            &mut hook,
+        ) else {
+            continue;
+        };
+        let h_post_attn = hook.post_attention.unwrap_or_else(|| pre.clone());
 
         for &p in &pos_list {
             let attn_delta: Vec<f32> = h_post_attn
@@ -68,7 +98,7 @@ pub fn trace_residuals(
                 .zip(pre.row(p).iter())
                 .map(|(&a, &b)| a - b)
                 .collect();
-            let ffn_delta: Vec<f32> = h_post_ffn
+            let ffn_delta: Vec<f32> = h_out
                 .row(p)
                 .iter()
                 .zip(h_post_attn.row(p).iter())
@@ -78,7 +108,7 @@ pub fn trace_residuals(
             nodes.push(TraceNode {
                 layer: layer as i32,
                 position: p,
-                residual: h_post_ffn.row(p).to_vec(),
+                residual: h_out.row(p).to_vec(),
                 attn_delta,
                 ffn_delta,
             });
@@ -87,7 +117,10 @@ pub fn trace_residuals(
         if let Some(w) = attn_weights {
             attention_captures.push((layer, w));
         }
-        h = h_post_ffn;
+        if let Some(kv) = kv_out {
+            kv_cache.insert(layer, kv);
+        }
+        h = h_out;
     }
 
     let tokens: Vec<String> = token_ids.iter().map(|&id| format!("t{}", id)).collect();
@@ -113,43 +146,42 @@ pub fn trace(
     trace_residuals(weights, token_ids, positions, false, &ffn)
 }
 
-// ── Internal: decomposed layer execution ──
-
-fn embed_tokens_raw(weights: &ModelWeights, token_ids: &[u32]) -> Array2<f32> {
-    let seq_len = token_ids.len();
-    let hidden = weights.hidden_size;
-    let scale = weights.arch.embed_scale();
-    let mut h = Array2::<f32>::zeros((seq_len, hidden));
-    for (i, &tok_id) in token_ids.iter().enumerate() {
-        let row = weights.embed.row(tok_id as usize);
-        for j in 0..hidden {
-            h[[i, j]] = row[j] * scale;
-        }
-    }
-    h
-}
-
-/// Run attention for decomposed tracing. Delegates to shared run_attention_block.
-/// Returns (h_post_attn, attn_projected_pre_residual, optional_weights).
-fn run_attention_decomposed(
-    weights: &ModelWeights,
-    h: &Array2<f32>,
-    layer: usize,
-    capture_attention: bool,
-) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>)> {
-    crate::attention::run_attention_block(weights, h, layer, capture_attention)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engines::test_utils::make_test_weights;
+    use crate::ffn::FfnBackend;
+    use crate::forward::{forward_raw_logits, hidden_to_raw_logits, trace_forward_with_ffn};
     use larql_models::ModelWeights;
+    use ndarray::Array2;
     use std::sync::OnceLock;
 
     fn weights() -> &'static ModelWeights {
         static W: OnceLock<ModelWeights> = OnceLock::new();
         W.get_or_init(make_test_weights)
+    }
+
+    struct ZeroFfn;
+
+    impl FfnBackend for ZeroFfn {
+        fn forward(&self, _layer: usize, x: &Array2<f32>) -> Array2<f32> {
+            Array2::zeros((x.nrows(), x.ncols()))
+        }
+
+        fn forward_with_activation(
+            &self,
+            _layer: usize,
+            x: &Array2<f32>,
+        ) -> (Array2<f32>, Array2<f32>) {
+            (
+                Array2::zeros((x.nrows(), x.ncols())),
+                Array2::zeros((x.nrows(), x.ncols())),
+            )
+        }
+
+        fn name(&self) -> &str {
+            "zero"
+        }
     }
 
     // ── trace (WeightFfn path) ────────────────────────────────────────────────
@@ -218,43 +250,83 @@ mod tests {
         // Each position should have layer -1 (embedding)
         assert!(t.nodes.iter().any(|n| n.layer == -1));
     }
-}
 
-fn run_ffn_decomposed(
-    weights: &ModelWeights,
-    h_post_attn: &Array2<f32>,
-    layer: usize,
-    ffn: &dyn FfnBackend,
-) -> Array2<f32> {
-    let norm_offset = weights.arch.norm_weight_offset();
-    let arch = &*weights.arch;
+    #[test]
+    fn trace_edges_reconstruct_residuals() {
+        let w = weights();
+        let t = trace(w, &[0u32, 1, 2], TracePositions::Last);
+        let pos = 2;
 
-    let pre_ffn_key = if arch.has_post_norms() {
-        arch.pre_feedforward_layernorm_key(layer)
-    } else {
-        Some(arch.post_attention_layernorm_key(layer))
-    };
-    let h_ffn = match pre_ffn_key {
-        Some(key) => crate::forward::apply_norm(weights, h_post_attn, &key, norm_offset),
-        None => crate::residual::rms_norm(h_post_attn, None, norm_offset),
-    };
-
-    let ffn_out = ffn.forward(layer, &h_ffn);
-
-    let res_mult = arch.residual_multiplier();
-    if arch.has_post_norms() {
-        let normed = match arch.post_feedforward_layernorm_key(layer) {
-            Some(key) => crate::forward::apply_norm(weights, &ffn_out, &key, norm_offset),
-            None => crate::residual::rms_norm(&ffn_out, None, norm_offset),
-        };
-        if res_mult != 1.0 {
-            h_post_attn + &(&normed * res_mult)
-        } else {
-            h_post_attn + &normed
+        for layer in 0..w.num_layers as i32 {
+            let prev = if layer == 0 {
+                t.node(-1, pos).expect("embedding node")
+            } else {
+                t.node(layer - 1, pos).expect("previous layer node")
+            };
+            let node = t.node(layer, pos).expect("current layer node");
+            for i in 0..w.hidden_size {
+                let reconstructed = prev.residual[i] + node.attn_delta[i] + node.ffn_delta[i];
+                assert!(
+                    (reconstructed - node.residual[i]).abs() < 1e-4,
+                    "layer {layer} dim {i}: reconstructed {reconstructed} != residual {}",
+                    node.residual[i]
+                );
+            }
         }
-    } else if res_mult != 1.0 {
-        h_post_attn + &(&ffn_out * res_mult)
-    } else {
-        h_post_attn + &ffn_out
+    }
+
+    #[test]
+    fn trace_final_residual_matches_raw_forward_logits() {
+        let w = weights();
+        let tokens = &[0u32, 1, 2, 3];
+        let t = trace(w, tokens, TracePositions::Last);
+        let node = t
+            .node(w.num_layers as i32 - 1, tokens.len() - 1)
+            .expect("final trace node");
+        let raw = forward_raw_logits(w, tokens, None);
+
+        let traced_h =
+            Array2::from_shape_vec((1, w.hidden_size), node.residual.clone()).expect("trace row");
+        let raw_last = tokens.len() - 1;
+        for i in 0..w.hidden_size {
+            let expected = raw.h_pre_norm[[raw_last, i]];
+            let got = traced_h[[0, i]];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "final residual dim {i}: trace {got} != raw forward {expected}"
+            );
+        }
+
+        let traced_logits = hidden_to_raw_logits(w, &traced_h);
+        for i in 0..traced_logits.len() {
+            let expected = raw.logits[i];
+            let got = traced_logits[i];
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "logit {i}: trace projection {got} != raw forward {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_custom_ffn_matches_hooked_forward_final_residual() {
+        let w = weights();
+        let tokens = &[0u32, 1, 2, 3];
+        let ffn = ZeroFfn;
+        let t = trace_residuals(w, tokens, TracePositions::Last, false, &ffn);
+        let traced = t
+            .node(w.num_layers as i32 - 1, tokens.len() - 1)
+            .expect("final trace node");
+        let forward = trace_forward_with_ffn(w, tokens, &[w.num_layers - 1], false, 0, &ffn);
+        let (_, expected) = forward.residuals.first().expect("captured final residual");
+
+        for i in 0..w.hidden_size {
+            let got = traced.residual[i];
+            let expected = expected[i];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "custom backend final residual dim {i}: trace {got} != hooked forward {expected}"
+            );
+        }
     }
 }

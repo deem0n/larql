@@ -30,6 +30,7 @@ pub use render::render_chat_template_multi;
 
 use std::path::Path;
 
+use larql_vindex::format::filenames::TOKENIZER_CONFIG_JSON;
 use serde_json::Value;
 
 use fallback::fallback_template_for;
@@ -205,7 +206,7 @@ fn read_chat_template(vindex_dir: &Path) -> Option<String> {
     if let Ok(s) = std::fs::read_to_string(&jinja) {
         return Some(s);
     }
-    let cfg_path = vindex_dir.join("tokenizer_config.json");
+    let cfg_path = vindex_dir.join(TOKENIZER_CONFIG_JSON);
     let cfg_bytes = std::fs::read(cfg_path).ok()?;
     let cfg: Value = serde_json::from_slice(&cfg_bytes).ok()?;
     cfg.get("chat_template")?.as_str().map(|s| s.to_string())
