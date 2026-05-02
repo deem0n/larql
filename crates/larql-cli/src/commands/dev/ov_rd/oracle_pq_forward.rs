@@ -7,6 +7,7 @@ use larql_inference::{hidden_to_raw_logits, WeightFfn};
 use larql_vindex::VectorIndex;
 use ndarray::{s, Array2};
 
+use super::address::top_feature_ids_from_activation_row;
 use super::basis::{RoundtripPatchMetrics, WoRoundtripBasis, ZPcaBasis};
 use super::pq::{ModeDTable, PqCodebook};
 use super::runtime::{insert_q4k_layer_tensors, remove_layer_tensors};
@@ -208,6 +209,63 @@ pub(super) fn capture_layer_input_hidden(
     }
 
     Ok(h)
+}
+
+pub(super) fn capture_prev_ffn_feature_keys(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    target_layer: usize,
+    feature_top_k: usize,
+) -> Result<Vec<Vec<usize>>, Box<dyn std::error::Error>> {
+    let mut prev_features_by_pos = vec![Vec::<usize>::new(); token_ids.len()];
+    if target_layer == 0 || feature_top_k == 0 {
+        return Ok(prev_features_by_pos);
+    }
+
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..target_layer {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            run_layer_with_ffn(
+                weights,
+                &h,
+                layer,
+                &ffn,
+                layer + 1 == target_layer,
+                ple_inputs.get(layer),
+                shared_kv,
+            )
+            .map(|(h_new, activation, kv_out)| (h_new, activation, kv_out))
+        };
+        if let Some((h_new, activation, kv_out)) = step {
+            if let Some(activation) = activation {
+                prev_features_by_pos = activation
+                    .rows()
+                    .into_iter()
+                    .map(|row| top_feature_ids_from_activation_row(row, feature_top_k))
+                    .collect();
+            }
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!("layer {layer} returned no output").into());
+        }
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(prev_features_by_pos)
 }
 
 pub(super) fn final_logits(weights: &larql_inference::ModelWeights, h: &Array2<f32>) -> Vec<f32> {

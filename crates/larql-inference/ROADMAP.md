@@ -1213,6 +1213,55 @@ the WalkFfn-replaced layers behaved like X" a single-pass measurement.
 
 ---
 
+## P0: Mechanistic trace correctness audit
+
+From the 2026-05-02 interpretability review. These items are correctness
+requirements for using TRACE as evidence, not polish.
+
+### Route decomposed TRACE through the real layer sequence
+**Status**: Planned  
+**Files**: `trace/capture.rs`, `forward/layer.rs`, `trace/types.rs`,
+`crates/larql-lql/src/executor/trace.rs`  
+`trace_residuals` currently records attention and FFN deltas but stops at
+`h_post_ffn`, while the production layer path also applies per-layer embeddings
+and layer scalar. Rework trace capture so the recorded residual is the same
+state the next layer actually sees. Either add explicit `ple_delta` /
+`scalar_delta` components, or route through shared layer intermediates and
+derive all deltas from the canonical runner.
+
+### Python WalkModel.trace must use vindex FFN
+**Status**: Planned  
+**Files**: `crates/larql-python/src/walk.rs`, `crates/larql-python/src/trace_py.rs`  
+`WalkModel.trace()` should construct a `WalkFfn` from `self.index` and preserve
+patch/overlay semantics. The current dense `WeightFfn` trace is useful as a
+baseline, but it is not the trace of the vindex-backed model the user is
+querying.
+
+### Rank displayed gate features by contribution, not raw |dot|
+**Status**: Planned  
+**Files**: `vindex/walk_ffn/sparse.rs`, `forward/infer_patched.rs`,
+`crates/larql-vindex/src/index/compute/gate_knn/dispatch.rs`  
+Interpretability displays should not surface strongly negative gate pre-acts as
+"active" features when SiLU/GELU makes their contribution near zero. For WALK /
+EXPLAIN displays, rank or filter by post-gate activation magnitude and ideally
+include each feature's estimated FFN contribution.
+
+### L1 cache must not fabricate zero activations
+**Status**: Planned  
+**Files**: `vindex/walk_ffn/mod.rs`, `vindex/l1_cache.rs`  
+On cache hit, `forward_with_activation` currently returns the cached FFN output
+and an all-zero activation matrix. Either store activations with outputs or
+bypass the cache whenever activation capture is requested.
+
+### Separate embedding-neighbor labels from logit-lens labels
+**Status**: Planned  
+**Files**: `capture.rs`, `trace/vocab.rs`  
+Residual capture metadata that projects through `W_E` should be named as
+embedding-neighbor output, not model belief. Add separate final-norm + lm-head
+logit-lens fields where callers need prediction trajectories.
+
+---
+
 ## P1: Architecture coverage
 
 ### Wire v_shares_k into forward pass

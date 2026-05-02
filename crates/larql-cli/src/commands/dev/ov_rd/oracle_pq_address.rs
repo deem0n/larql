@@ -9,6 +9,7 @@ use ndarray::{s, ArrayView1};
 
 use super::address::{
     address_feature_key, address_probe_names, lsh_bucket, predict_code_from_hyperplanes,
+    prev_ffn_feature_key, prev_ffn_feature_probe_names, top_feature_ids_from_activation_row,
     train_binary_hyperplane, AddressLshGroupModel, AddressProbeModel, AddressSupervisedGroupModel,
 };
 use super::basis::{WoRoundtripBasis, ZPcaBasis};
@@ -49,7 +50,8 @@ pub(super) fn fit_address_probe_models(
         codebooks,
         "address-fit",
         false,
-        |head, config, pos, codes, token_ids, stratum, _| {
+        0,
+        |head, config, pos, codes, token_ids, stratum, _, _| {
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
                 let counts = majority_counts
@@ -148,6 +150,122 @@ pub(super) fn fit_address_probe_models(
     Ok(models)
 }
 
+pub(super) fn fit_address_prev_ffn_feature_group_models(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+    feature_top_k: usize,
+) -> Result<HashMap<(HeadId, PqConfig), Vec<AddressProbeModel>>, Box<dyn std::error::Error>> {
+    let names = prev_ffn_feature_probe_names();
+    let mut key_counts: HashMap<(HeadId, PqConfig, String, usize, String), Vec<usize>> =
+        HashMap::new();
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+
+    visit_code_samples(
+        weights,
+        index,
+        tokenizer,
+        prompts,
+        heads,
+        bases,
+        means,
+        pca_bases,
+        codebooks,
+        "prev-ffn-feature-fit",
+        false,
+        feature_top_k,
+        |head, config, pos, codes, token_ids, stratum, _, prev_features| {
+            for (group, &code) in codes.iter().enumerate() {
+                let levels = 1usize << config.bits_per_group;
+                let counts = majority_counts
+                    .entry((head, config, group))
+                    .or_insert_with(|| vec![0; levels]);
+                counts[code] += 1;
+            }
+            let prev_features = prev_features.unwrap_or(&[]);
+            for &group in selected_groups {
+                let code = codes[group];
+                for name in &names {
+                    let key = prev_ffn_feature_key(name, token_ids, stratum, pos, prev_features);
+                    let levels = 1usize << config.bits_per_group;
+                    let counts = key_counts
+                        .entry((head, config, (*name).to_string(), group, key))
+                        .or_insert_with(|| vec![0; levels]);
+                    counts[code] += 1;
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut models = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let mut probe_models = Vec::new();
+        for name in &names {
+            let mut group_majority = Vec::with_capacity(config.groups);
+            let mut group_maps = vec![HashMap::new(); config.groups];
+            let mut group_train_accuracy = vec![0.0; config.groups];
+            for group in 0..config.groups {
+                let majority = majority_counts
+                    .get(&(*head, *config, group))
+                    .map(|counts| argmax_usize(counts))
+                    .unwrap_or(0);
+                group_majority.push(majority);
+            }
+            for &group in selected_groups {
+                let mut map = HashMap::new();
+                let mut correct = 0usize;
+                let mut total = 0usize;
+                for ((map_head, map_config, map_name, map_group, key), counts) in key_counts.iter()
+                {
+                    if map_head == head
+                        && map_config == config
+                        && map_name == name
+                        && *map_group == group
+                    {
+                        let best = argmax_usize(counts);
+                        correct += counts[best];
+                        total += counts.iter().sum::<usize>();
+                        map.insert(key.clone(), best);
+                    }
+                }
+                group_maps[group] = map;
+                group_train_accuracy[group] = if total == 0 {
+                    0.0
+                } else {
+                    correct as f64 / total as f64
+                };
+            }
+            let selected_group_keys = (0..config.groups)
+                .map(|group| {
+                    if selected_groups.contains(&group) {
+                        format!("{}_train_acc_{:.3}", name, group_train_accuracy[group])
+                    } else {
+                        "majority".to_string()
+                    }
+                })
+                .collect();
+            probe_models.push(AddressProbeModel {
+                name: (*name).to_string(),
+                group_majority,
+                group_maps,
+                group_train_accuracy,
+                selected_group_keys,
+            });
+        }
+        models.insert((*head, *config), probe_models);
+    }
+
+    Ok(models)
+}
+
 pub(super) fn fit_address_lsh_group_models(
     weights: &mut larql_inference::ModelWeights,
     index: &VectorIndex,
@@ -178,7 +296,8 @@ pub(super) fn fit_address_lsh_group_models(
         codebooks,
         "lsh-fit",
         true,
-        |head, config, _pos, codes, _token_ids, _stratum, input_row| {
+        0,
+        |head, config, _pos, codes, _token_ids, _stratum, input_row, _| {
             let input_row = input_row.ok_or("missing layer-input row during LSH address fit")?;
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
@@ -301,7 +420,8 @@ pub(super) fn fit_address_supervised_group_models(
         codebooks,
         "supervised-fit",
         true,
-        |head, config, _pos, codes, _token_ids, _stratum, input_row| {
+        0,
+        |head, config, _pos, codes, _token_ids, _stratum, input_row, _| {
             let input_row =
                 input_row.ok_or("missing layer-input row during supervised address fit")?;
             for (group, &code) in codes.iter().enumerate() {
@@ -406,7 +526,8 @@ pub(super) fn fit_majority_codes_for_codebooks(
         codebooks,
         "majority-fit",
         false,
-        |head, config, _pos, codes, _token_ids, _stratum, _| {
+        0,
+        |head, config, _pos, codes, _token_ids, _stratum, _, _| {
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
                 let counts = majority_counts
@@ -446,15 +567,26 @@ fn visit_code_samples<F>(
     codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
     label_prefix: &str,
     with_layer_input: bool,
+    prev_ffn_feature_top_k: usize,
     mut visit: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(HeadId, PqConfig, usize, &[usize], &[u32], &str, Option<&[f32]>) -> SampleVisitResult,
+    F: FnMut(
+        HeadId,
+        PqConfig,
+        usize,
+        &[usize],
+        &[u32],
+        &str,
+        Option<&[f32]>,
+        Option<&[usize]>,
+    ) -> SampleVisitResult,
 {
     let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
     for head in heads {
         heads_by_layer.entry(head.layer).or_default().push(*head);
     }
+    let max_target_layer = heads.iter().map(|head| head.layer).max().unwrap_or(0);
 
     for (prompt_idx, record) in prompts.iter().enumerate() {
         let label = record
@@ -476,6 +608,7 @@ where
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let mut h = embed_tokens_pub(weights, &token_ids);
         let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+        let mut prev_ffn_features_by_pos = vec![Vec::<usize>::new(); token_ids.len()];
 
         for layer in 0..weights.num_layers {
             let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
@@ -517,6 +650,7 @@ where
                             .collect::<Vec<_>>();
                         let z = basis.residual_to_z(&residual);
                         let input_row = layer_input.as_ref().map(|input| input.row(pos).to_vec());
+                        let prev_features = prev_ffn_features_by_pos.get(pos).map(Vec::as_slice);
                         for ((_, config), codebook) in &head_codebooks {
                             let coords = pca_basis.coordinates_with_rank(&z, config.k);
                             let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
@@ -528,17 +662,38 @@ where
                                 &token_ids,
                                 stratum,
                                 input_row.as_deref(),
+                                prev_features,
                             )?;
                         }
                     }
                 }
             }
 
+            if layer == max_target_layer {
+                remove_layer_tensors(weights, inserted);
+                break;
+            }
+
             {
                 let ffn = WeightFfn { weights };
-                if let Some((h_new, _, _)) =
-                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
-                {
+                if let Some((h_new, activation, _)) = run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    prev_ffn_feature_top_k > 0,
+                    ple_inputs.get(layer),
+                    None,
+                ) {
+                    if let Some(activation) = activation {
+                        prev_ffn_features_by_pos = activation
+                            .rows()
+                            .into_iter()
+                            .map(|row| {
+                                top_feature_ids_from_activation_row(row, prev_ffn_feature_top_k)
+                            })
+                            .collect();
+                    }
                     h = h_new;
                 }
             }

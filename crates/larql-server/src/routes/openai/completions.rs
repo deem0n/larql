@@ -68,12 +68,6 @@ const TEXT_COMPLETION_OBJECT: &str = "text_completion";
 const DEFAULT_MAX_TOKENS: usize = 16;
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 
-/// One generated token slot — used internally by the loop, not exposed.
-struct Generated {
-    text: String,
-    eos: bool,
-}
-
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum CompletionPrompt {

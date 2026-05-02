@@ -5,7 +5,9 @@
 INSERT/SELECT/USE/COMPILE/TRACE grammar fully parsed. INSERT
 supports `MODE KNN` (residual retrieval override, validated at 25K edges)
 and `MODE COMPOSE` (FFN-overlay, ~5–10 facts/layer). `COMPILE INTO VINDEX`
-bakes patches into canonical `down_weights.bin`. `COMPILE INTO MODEL` applies
+bakes compose patches into canonical weight files and persists KNN entries as
+`knn_store.bin`; default KNN inserts are therefore packaged as retrieval
+overlays, not yet materialized into FFN features. `COMPILE INTO MODEL` applies
 MEMIT (opt-in via `LARQL_MEMIT_ENABLE=1`). `ALPHA` and `MODE` clauses are
 accepted on `INSERT`; `ALPHA` only affects `MODE COMPOSE`.
 
@@ -47,6 +49,56 @@ parse. Batch splitting remains in the REPL path.
 `examples/*.rs`, `benches/*.rs`
 Docs and benchmarks reflect KNN default, compose-only `ALPHA`, single-layer
 COMPOSE behavior, and the compile benchmark now includes a down-override bake.
+
+---
+
+## P0: KNN journal vs committed weights
+
+### Make retrieval overlays visible in query output
+**Status**: Planned  
+**Files**: `src/executor/query/infer.rs`, `src/executor/query/infer_trace.rs`,
+`src/executor/trace.rs`, `src/executor/tests.rs`  
+Default `INSERT MODE KNN` is a retrieval overlay over the model result. `INFER`
+and `EXPLAIN INFER` should tag when `apply_knn_override` fires, include the
+override layer/cosine, and show the model's unoverridden top-1. `TRACE` should
+keep the residual DAG pure and add a separate `pending_retrieval_override` /
+`uncommitted_overrides` section after the layer table. This makes current
+semantics honest: the trace did not miss an internal edit; the edit is outside
+the weights.
+
+### Add explicit compile mode semantics
+**Status**: Design  
+**Files**: `src/parser/lifecycle.rs`, `src/ast.rs`,
+`src/executor/lifecycle/compile/into_vindex.rs`, `src/executor/tests.rs`  
+Target SQL surface:
+```sql
+COMPILE CURRENT INTO VINDEX "out.vindex";
+COMPILE CURRENT INTO VINDEX "out.vindex" SNAPSHOT;
+```
+Default `COMPILE` should eventually mean commit/materialize all pending edits.
+`SNAPSHOT` preserves the current behavior: bake compose overlays, then carry
+`knn_store.bin` forward. Until materialization ships, keep current behavior but
+surface it explicitly in output/docs as a snapshot/package operation.
+
+### Materialize KNN entries into mechanistic edits
+**Status**: Planned  
+**Files**: `src/executor/lifecycle/compile/into_vindex.rs`,
+`src/executor/mutation/insert/compose.rs`, `src/executor/compact.rs`,
+`src/executor/tests.rs`  
+Lower each `KnnEntry` into a durable FFN edit before writing the compiled
+vindex, then drop or mark the sidecar entries as committed. First strategy:
+compose lowering from `(entity, relation, target, layer, residual_key)` into a
+free slot at the retrieval layer, reusing the canonical/decoy prompt machinery
+from `INSERT MODE COMPOSE` where possible. Later strategies can route through
+MEMIT or a hybrid chooser.
+
+Acceptance criteria:
+- Weak equivalence: `INFER(session_with_knn, q)` equals
+  `INFER(materialized_vindex, q)` for canonical affected prompts.
+- Trace conversion: pre-materialization trace reports a pending retrieval
+  override; post-materialization trace shows residual/FFN contribution.
+- Generalization: materialized vindex affects nearby unstored prompts without
+  depending on a `knn_store.bin` lookup.
 
 ---
 

@@ -8,18 +8,20 @@ use larql_vindex::{
 };
 use std::collections::HashMap;
 
+use super::address::prev_ffn_feature_key;
 use super::basis::*;
 use super::input::*;
 use super::metrics::*;
 use super::oracle_pq_address::{
-    fit_address_lsh_group_models, fit_address_probe_models, fit_address_supervised_group_models,
+    fit_address_lsh_group_models, fit_address_prev_ffn_feature_group_models,
+    fit_address_probe_models, fit_address_supervised_group_models,
     fit_majority_codes_for_codebooks,
 };
 use super::oracle_pq_eval::evaluate_predicted_address;
 use super::oracle_pq_fit::fit_pq_codebooks;
 use super::oracle_pq_forward::{
-    capture_layer_input_hidden, final_logits, forward_q4k_oracle_pq_head,
-    forward_q4k_oracle_pq_mode_d_head,
+    capture_layer_input_hidden, capture_prev_ffn_feature_keys, final_logits,
+    forward_q4k_oracle_pq_head, forward_q4k_oracle_pq_mode_d_head,
 };
 use super::oracle_pq_mode_d::{corruption_keep_values, materialize_mode_d_tables};
 use super::oracle_pq_reports::OraclePqPointAccumulator;
@@ -150,6 +152,21 @@ pub(super) struct OraclePqArgs {
     /// Comma-separated PQ groups for --address-code-stability.
     #[arg(long, default_value = "0")]
     address_code_stability_groups: String,
+
+    /// Fit and evaluate selected PQ groups from previous-layer FFN top-feature
+    /// keys. This is the first model-native discrete-state address probe for
+    /// non-layer-0 dynamic heads.
+    #[arg(long)]
+    address_prev_ffn_feature_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-prev-ffn-feature-group-probe.
+    #[arg(long, default_value = "0")]
+    address_prev_ffn_feature_groups: String,
+
+    /// Number of previous-layer FFN activation features retained for feature
+    /// hash keys.
+    #[arg(long, default_value_t = 4)]
+    address_prev_ffn_feature_top_k: usize,
 
     /// Comma-separated PQ groups whose centroids are fit separately per
     /// prompt stratum. This is a codebook-layout diagnostic for cases where a
@@ -303,6 +320,36 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                 if group >= config.groups {
                     return Err(format!(
                         "--address-code-stability-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut prev_ffn_feature_groups = parse_usize_list(&args.address_prev_ffn_feature_groups)?;
+    prev_ffn_feature_groups.sort_unstable();
+    prev_ffn_feature_groups.dedup();
+    if args.address_prev_ffn_feature_group_probe {
+        if prev_ffn_feature_groups.is_empty() {
+            return Err("--address-prev-ffn-feature-group-probe requires at least one --address-prev-ffn-feature-groups value".into());
+        }
+        if args.address_prev_ffn_feature_top_k == 0 {
+            return Err("--address-prev-ffn-feature-top-k must be greater than zero".into());
+        }
+        for head in &selected_heads {
+            if head.layer == 0 {
+                eprintln!(
+                    "warning: L{}H{} has no previous layer; previous-FFN feature keys will be 'none'",
+                    head.layer, head.head
+                );
+            }
+        }
+        for config in &configs {
+            for &group in &prev_ffn_feature_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-prev-ffn-feature-groups includes group {group}, but config {:?} has only {} groups",
                         config, config.groups
                     )
                     .into());
@@ -474,6 +521,30 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     } else {
         HashMap::new()
     };
+    let address_prev_ffn_feature_models = if args.address_prev_ffn_feature_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-prev-ffn-feature-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting previous-FFN feature group address probes for groups {:?} (top_k={})",
+            prev_ffn_feature_groups, args.address_prev_ffn_feature_top_k
+        );
+        fit_address_prev_ffn_feature_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &prev_ffn_feature_groups,
+            args.address_prev_ffn_feature_top_k,
+        )?
+    } else {
+        HashMap::new()
+    };
     if args.address_corruption_sweep && !args.mode_d_check {
         return Err("--address-corruption-sweep requires --mode-d-check".into());
     }
@@ -485,6 +556,7 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         || args.address_lsh_group_probe
         || args.address_supervised_group_probe
         || args.address_key_group_probe
+        || args.address_prev_ffn_feature_group_probe
     {
         eprintln!("Fitting per-group majority codes for address diagnostics");
         fit_majority_codes_for_codebooks(
@@ -938,6 +1010,104 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                     }
                 }
 
+                if args.address_prev_ffn_feature_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for previous-FFN feature group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let prev_feature_models = address_prev_ffn_feature_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                            format!(
+                                "missing previous-FFN feature group probe model for L{} H{} {:?}",
+                                head.layer, head.head, config
+                            )
+                        })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for previous-FFN feature group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let prev_features_by_position = capture_prev_ffn_feature_keys(
+                        &mut weights,
+                        &token_ids,
+                        &index,
+                        head.layer,
+                        args.address_prev_ffn_feature_top_k,
+                    )?;
+                    for probe_model in prev_feature_models {
+                        let selected_group_keys = probe_model.selected_group_keys.clone();
+                        for (probe_name, use_oracle_rest) in [
+                            (
+                                format!(
+                                    "{}_groups_{:?}_oracle_rest",
+                                    probe_model.name, prev_ffn_feature_groups
+                                ),
+                                true,
+                            ),
+                            (
+                                format!(
+                                    "{}_groups_{:?}_majority_rest",
+                                    probe_model.name, prev_ffn_feature_groups
+                                ),
+                                false,
+                            ),
+                        ] {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let mut codes = if use_oracle_rest {
+                                        oracle_codes.clone()
+                                    } else {
+                                        group_majority.clone()
+                                    };
+                                    let prev_features = prev_features_by_position
+                                        .get(pos)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]);
+                                    let key = prev_ffn_feature_key(
+                                        &probe_model.name,
+                                        &token_ids,
+                                        stratum,
+                                        pos,
+                                        prev_features,
+                                    );
+                                    let probe_codes = probe_model.predict_codes_from_key(&key);
+                                    for &group in &prev_ffn_feature_groups {
+                                        codes[group] = probe_codes[group];
+                                    }
+                                    codes
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_name,
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
+                        }
+                    }
+                }
+
                 if args.address_corruption_sweep {
                     let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
                         format!(
@@ -1100,6 +1270,13 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_prev_ffn_feature_group_probe: args.address_prev_ffn_feature_group_probe,
+        address_prev_ffn_feature_groups: if args.address_prev_ffn_feature_group_probe {
+            prev_ffn_feature_groups
+        } else {
+            Vec::new()
+        },
+        address_prev_ffn_feature_top_k: args.address_prev_ffn_feature_top_k,
         stratum_conditioned_pq_groups,
         selected_heads,
         heads: head_reports,

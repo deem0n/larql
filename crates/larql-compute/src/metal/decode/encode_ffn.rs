@@ -183,8 +183,15 @@ impl MetalBackend {
         inter_padded_val: u32,
     ) {
         use crate::metal::shaders::q4k_ffn_gate_up as q4k_gu;
-        use crate::metal::shaders::q4k_matvec as q4k;
-        let n_tgs_down = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
+        // Pull `q4k_matvec` dispatch geometry from the bound pipeline so
+        // dispatches work for both 4sg and 8sg variants. Hardcoding the
+        // 4sg constants while dispatching the 8sg pipeline (production
+        // default since 2026-04-28) leaves rows 4..7 of each TG unwritten.
+        // Same fix as `trait_impl/quant_matvec.rs::q4k_matvec` and
+        // `moe_dispatch.rs`.
+        let q4k_matvec_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
+        let q4k_matvec_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let n_tgs_down = (hidden as u64).div_ceil(q4k_matvec_rows_per_tg);
 
         if layer.is_gated() {
             // Variant selection. Production **default is 8sg** as of
@@ -380,7 +387,7 @@ impl MetalBackend {
             } // close `else { unfused geglu+matvec chain }`
             let _ = n_tgs_down;
         } else {
-            let n_tgs_up = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
+            let n_tgs_up = (inter as u64).div_ceil(q4k_matvec_rows_per_tg);
             enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(bufs.up_w), 0);
             enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
@@ -389,7 +396,7 @@ impl MetalBackend {
             enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(n_tgs_up, 1, 1),
-                MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+                MTLSize::new(q4k_matvec_threads_per_tg, 1, 1),
             );
 
             self.encode_activation(
@@ -413,7 +420,7 @@ impl MetalBackend {
             );
             enc.dispatch_thread_groups(
                 MTLSize::new(n_tgs_down, 1, 1),
-                MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+                MTLSize::new(q4k_matvec_threads_per_tg, 1, 1),
             );
         }
     }

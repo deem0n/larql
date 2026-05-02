@@ -148,13 +148,24 @@ impl QuantMatVec for MetalBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
-        use crate::metal::shaders::q4k_matvec as q4k;
+        // Pull dispatch geometry from the actually-bound pipeline rather
+        // than from `shaders::q4k_matvec`'s hard-coded constants. The
+        // `q4k_matvec_pipeline` field is bound at startup to either
+        // `q4k_matvec` (4 rows × 128 threads) or `q4k_matvec_8sg`
+        // (8 rows × 256 threads) per `LARQL_Q4K_MATVEC_8SG`. Using the
+        // 4sg constants here under-dispatches by 50% when 8sg is bound,
+        // leaving simdgroups 4..7 unscheduled and half the rows in each
+        // TG unwritten — same family of bug as the historical 077884b
+        // "81–84 tok/s on broken Q4_K dispatch" (Q4_K bytes routed
+        // through a kernel with mismatched threadgroup geometry).
         let buf_w = self.bufs.get_bytes(q4k_data);
         let buf_x = self.bufs.transient_from_f32(x);
         let buf_out = self.bufs.output((num_rows * 4) as u64);
         let n = num_rows as u32;
         let k = hidden as u32;
-        let num_tgs = (num_rows as u64).div_ceil(q4k::ROWS_PER_TG);
+        let rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
+        let threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let num_tgs = (num_rows as u64).div_ceil(rows_per_tg);
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -166,7 +177,7 @@ impl QuantMatVec for MetalBackend {
         enc.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(num_tgs, 1, 1),
-            metal::MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+            metal::MTLSize::new(threads_per_tg, 1, 1),
         );
         enc.end_encoding();
         cmd.commit();

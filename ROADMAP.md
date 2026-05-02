@@ -100,6 +100,43 @@ experiments.
 
 ---
 
+## P0 — Interpretability truthfulness + commit semantics
+
+Driver: make the current edit model honest before the demo, then earn the
+stronger "INSERT commits into weights" story. Today default `INSERT MODE KNN`
+is a retrieval overlay persisted in `knn_store.bin`; `COMPILE INTO VINDEX`
+bakes compose/MEMIT overlays but carries that KNN sidecar forward. That is a
+snapshot/package operation, not a mechanical commit of the journal into FFN
+features.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| T1 | Tag KNN overrides visibly in `INFER`, `EXPLAIN INFER`, and `TRACE` as post-logits retrieval events, including the model's unoverridden top-1 | larql-lql + larql-inference | planned |
+| T2 | Fix decomposed `TRACE` to route through the shared layer sequence, including PLE/layer-scalar deltas or equivalent captured intermediates | larql-inference | planned |
+| T3 | Make Python `WalkModel.trace()` use the vindex `WalkFfn`/patch overlay rather than dense `WeightFfn` | larql-python + larql-inference | planned |
+| T4 | Replace gate-KNN absolute-dot feature ranking in interpretability displays with post-activation magnitude, or filter ghost negative gates after activation | larql-vindex + larql-inference | planned |
+| T5 | Fix L1 FFN cache activation capture: cache activations with outputs or bypass cache when activations are requested | larql-inference | planned |
+| T6 | Rename residual-capture embedding-neighbor fields (`top_token`) or add separate true logit-lens fields | larql-inference + larql-models | planned |
+| C1 | Add explicit compile modes: default commit/materialize semantics vs `SNAPSHOT` preserving `knn_store.bin` | larql-lql + larql-vindex | design |
+| C2 | Implement KNN materialization by lowering retrieval entries into compose/MEMIT/FFN edits, then dropping or marking committed sidecar entries | larql-lql + larql-vindex + larql-inference | planned |
+| C3 | Add acceptance tests: session KNN equivalence, trace conversion, and generalization beyond stored prompts | larql-lql + larql-inference | planned |
+
+Acceptance target for materialization:
+
+```text
+INFER(session_with_knn, q) == INFER(materialized_vindex, q)
+```
+
+for affected canonical prompts, plus a stronger trace/generalization check:
+session trace reports pending retrieval; materialized trace shows residual/FFN
+evidence; nearby unstored prompts behave through the materialized edit rather
+than through a lookup sidecar.
+
+Until C1-C3 ship, video language should distinguish three mechanisms:
+KNN journal/retrieval overlay, compose FFN overlay, and compiled/baked weights.
+
+---
+
 ## Critical path (P0 — what blocks the demo)
 
 Items in order. Each depends on the one above it.

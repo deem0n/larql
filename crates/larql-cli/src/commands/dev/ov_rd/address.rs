@@ -29,6 +29,18 @@ impl AddressProbeModel {
             })
             .collect()
     }
+
+    pub(super) fn predict_codes_from_key(&self, key: &str) -> Vec<usize> {
+        self.group_maps
+            .iter()
+            .enumerate()
+            .map(|(group, map)| {
+                map.get(key)
+                    .copied()
+                    .unwrap_or_else(|| self.group_majority[group])
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +172,16 @@ pub(super) fn address_probe_names() -> Vec<&'static str> {
     ]
 }
 
+pub(super) fn prev_ffn_feature_probe_names() -> Vec<&'static str> {
+    vec![
+        "prev_ffn_top1",
+        "prev_ffn_top2_hash",
+        "stratum_prev_ffn_top1",
+        "token_prev_ffn_top1",
+        "position_prev_ffn_top1",
+    ]
+}
+
 pub(super) fn address_feature_key(
     name: &str,
     token_ids: &[u32],
@@ -182,6 +204,56 @@ pub(super) fn address_feature_key(
         "position_stratum_token" => format!("p:{position}|s:{stratum}|t:{token}"),
         _ => format!("p:{position}"),
     }
+}
+
+pub(super) fn prev_ffn_feature_key(
+    name: &str,
+    token_ids: &[u32],
+    stratum: &str,
+    position: usize,
+    prev_features: &[usize],
+) -> String {
+    let token = token_ids.get(position).copied().unwrap_or(0);
+    let top1 = prev_features
+        .first()
+        .map(|feature| feature.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let top2 = prev_features
+        .iter()
+        .take(2)
+        .map(|feature| feature.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let top2 = if top2.is_empty() {
+        "none".to_string()
+    } else {
+        top2
+    };
+    match name {
+        "prev_ffn_top1" => format!("pf1:{top1}"),
+        "prev_ffn_top2_hash" => format!("pf2:{top2}"),
+        "stratum_prev_ffn_top1" => format!("s:{stratum}|pf1:{top1}"),
+        "token_prev_ffn_top1" => format!("t:{token}|pf1:{top1}"),
+        "position_prev_ffn_top1" => format!("p:{position}|pf1:{top1}"),
+        _ => format!("pf1:{top1}"),
+    }
+}
+
+pub(super) fn top_feature_ids_from_activation_row(
+    row: ArrayView1<'_, f32>,
+    top_k: usize,
+) -> Vec<usize> {
+    let mut indexed = row.iter().copied().enumerate().collect::<Vec<_>>();
+    indexed.sort_unstable_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    indexed
+        .into_iter()
+        .take(top_k)
+        .map(|(feature, _)| feature)
+        .collect()
 }
 
 pub(super) fn lsh_bucket(row: ArrayView1<'_, f32>, seed: u64, bits: usize) -> usize {

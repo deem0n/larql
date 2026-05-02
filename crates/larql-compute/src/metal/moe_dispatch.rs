@@ -352,7 +352,15 @@ impl MetalBackend {
         // Per-expert down projection — use each expert's pre-staged down buffer.
         let n_out = hidden as u32;
         let k_in = inter_padded as u32;
-        let down_tgs = (hidden as u64).div_ceil(crate::metal::shaders::q4k_matvec::ROWS_PER_TG);
+        // Pull dispatch geometry from the bound pipeline so this works for
+        // both the 4sg and 8sg variants of `q4k_matvec` — hardcoding the
+        // 4sg constants while dispatching the 8sg pipeline (the production
+        // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
+        // only writes rows 0..3 of each TG's 8-row range. See the matching
+        // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
+        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
         for (e, (_, down_buf)) in expert_bufs.iter().enumerate().take(valid_count) {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
@@ -364,7 +372,7 @@ impl MetalBackend {
             enc.set_bytes(4, 4, &k_in as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(down_tgs, 1, 1),
-                MTLSize::new(crate::metal::shaders::q4k_matvec::THREADS_PER_TG, 1, 1),
+                MTLSize::new(down_threads_per_tg, 1, 1),
             );
         }
         enc.end_encoding();
@@ -545,7 +553,15 @@ impl MetalBackend {
         // Down projection per expert.
         let n_out = hidden as u32;
         let k_in = inter_padded as u32;
-        let down_tgs = (hidden as u64).div_ceil(crate::metal::shaders::q4k_matvec::ROWS_PER_TG);
+        // Pull dispatch geometry from the bound pipeline so this works for
+        // both the 4sg and 8sg variants of `q4k_matvec` — hardcoding the
+        // 4sg constants while dispatching the 8sg pipeline (the production
+        // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
+        // only writes rows 0..3 of each TG's 8-row range. See the matching
+        // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
+        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
 
         for e in 0..valid_count {
             let act_offset = (e * inter_padded * 4) as u64;
@@ -558,7 +574,7 @@ impl MetalBackend {
             enc.set_bytes(4, 4, &k_in as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(down_tgs, 1, 1),
-                MTLSize::new(crate::metal::shaders::q4k_matvec::THREADS_PER_TG, 1, 1),
+                MTLSize::new(down_threads_per_tg, 1, 1),
             );
         }
         enc.end_encoding();
@@ -739,7 +755,15 @@ impl MetalBackend {
         // ── 6. Down projection per expert ────────────────────────────────
         let n_out = hidden as u32;
         let k_in = inter_padded as u32;
-        let down_tgs = (hidden as u64).div_ceil(crate::metal::shaders::q4k_matvec::ROWS_PER_TG);
+        // Pull dispatch geometry from the bound pipeline so this works for
+        // both the 4sg and 8sg variants of `q4k_matvec` — hardcoding the
+        // 4sg constants while dispatching the 8sg pipeline (the production
+        // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
+        // only writes rows 0..3 of each TG's 8-row range. See the matching
+        // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
+        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
 
         for e in 0..valid_count {
             let act_offset = (e * inter_padded * 4) as u64;
@@ -752,7 +776,7 @@ impl MetalBackend {
             enc.set_bytes(4, 4, &k_in as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(down_tgs, 1, 1),
-                MTLSize::new(crate::metal::shaders::q4k_matvec::THREADS_PER_TG, 1, 1),
+                MTLSize::new(down_threads_per_tg, 1, 1),
             );
         }
         enc.end_encoding();
