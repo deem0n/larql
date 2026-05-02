@@ -58,6 +58,7 @@ model as a queryable knowledge graph I can edit at runtime".
 
 ## Features
 
+- **OpenAI-compatible API** — `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/completions`, `POST /v1/chat/completions` (slices 1–2; SSE streaming + tools + JSON mode queued for slices 3-4). Existing `openai` Python/JS SDKs work unmodified — chat templates auto-detected from the model family (Gemma / Llama / ChatML / Mistral / plain)
 - **Browse endpoints** — DESCRIBE, WALK, SELECT, RELATIONS, STATS (no weights needed)
 - **Inference** — full forward pass with WalkFfn (weights lazy-loaded on first request)
 - **Remote MoE expert** — `/v1/experts/layer-batch` (residual once + K experts), gRPC streaming with overlap, f16 wire opt-in, UDS transport for same-host shards
@@ -91,6 +92,119 @@ larql serve --dir ./vindexes/ --port 8080
 
 # With auth + TLS
 larql serve output/gemma3-4b-v2.vindex --api-key "sk-abc123" --tls-cert cert.pem --tls-key key.pem
+```
+
+### Quickstart with the OpenAI SDK
+
+larql-server speaks the OpenAI API. Point any existing `openai`
+Python or JS client at the larql `base_url` and it works unmodified
+(N0 slices 1–2: `/v1/models`, `/v1/embeddings`, `/v1/completions`,
+`/v1/chat/completions`). Chat completions auto-detect the chat
+template from the model family (Gemma / Llama / ChatML / Mistral /
+plain). SSE streaming + tools + JSON mode queued in slices 3-4.
+
+**Python:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="sk-anything",  # SDK requires non-empty; matched against --api-key if set
+)
+
+# /v1/models
+for m in client.models.list().data:
+    print(m.id, m.owned_by)
+
+# /v1/embeddings (single + batched)
+emb = client.embeddings.create(model="gemma-3-4b", input="France")
+batch = client.embeddings.create(
+    model="gemma-3-4b",
+    input=["France", "Germany", "Japan"],
+)
+
+# /v1/completions
+resp = client.completions.create(
+    model="gemma-3-4b",
+    prompt="The capital of France is",
+    max_tokens=10,
+    temperature=0.0,
+)
+print(resp.choices[0].text)
+
+# /v1/chat/completions
+chat = client.chat.completions.create(
+    model="gemma-3-4b",
+    messages=[
+        {"role": "system", "content": "You are concise."},
+        {"role": "user",   "content": "What is the capital of France?"},
+    ],
+    max_tokens=10,
+)
+print(chat.choices[0].message.content)
+```
+
+**JS:**
+
+```js
+import OpenAI from "openai";
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/v1",
+  apiKey: "sk-anything",
+});
+const models = await client.models.list();
+const emb    = await client.embeddings.create({ model: "gemma-3-4b", input: "France" });
+const resp   = await client.completions.create({
+  model: "gemma-3-4b",
+  prompt: "The capital of France is",
+  max_tokens: 10,
+});
+const chat = await client.chat.completions.create({
+  model: "gemma-3-4b",
+  messages: [
+    { role: "system", content: "You are concise." },
+    { role: "user",   content: "Capital of France?" },
+  ],
+  max_tokens: 10,
+});
+```
+
+**curl:**
+
+```bash
+curl http://localhost:8080/v1/models
+
+curl -X POST http://localhost:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "gemma-3-4b", "input": "France"}'
+
+curl -X POST http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemma-3-4b",
+    "prompt": "The capital of France is",
+    "max_tokens": 5
+  }'
+
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemma-3-4b",
+    "messages": [
+      {"role": "system", "content": "You are concise."},
+      {"role": "user",   "content": "Capital of France?"}
+    ],
+    "max_tokens": 5
+  }'
+```
+
+For an end-to-end live walkthrough that boots an in-process server
+and exercises every endpoint with a real vindex:
+
+```bash
+cargo run --release -p larql-server --example openai_demo -- \
+  output/gemma3-4b-q4k-streaming.vindex
 ```
 
 ## CLI Options
@@ -179,6 +293,15 @@ cargo run -p larql-server --example server_demo
 cargo run -p larql-server --example embed_demo
 ```
 
+The OpenAI-compat live demo boots an in-process server and exercises
+`/v1/models`, `/v1/embeddings`, `/v1/completions` against a real
+vindex (no port binding, no external HTTP client):
+
+```bash
+cargo run --release -p larql-server --example openai_demo -- \
+  output/gemma3-4b-q4k-streaming.vindex
+```
+
 Synthetic release benchmark, captured 2026-04-26 (re-validated
 2026-05-01 post Q1 cleanup — within noise):
 
@@ -195,7 +318,16 @@ cargo run -p larql-server --example server_bench --release
 | `describe` simulation | 0.298 ms/op |
 | `relations` simulation | 0.399 ms/op |
 | `embed` 512-token prefill | 0.115 ms/op |
-| `logits` dot, 1024 vocab × 256 hidden | 0.191 ms/op |
+| `logits` dot, 1024 vocab × 256 hidden | 0.221 ms/op |
+| **OpenAI envelopes (encode-only):** | |
+| `/v1/models` JSON serialize | 0.001 ms/op (1.02 M ops/s) |
+| `/v1/embeddings` single (hidden=256) | 0.008 ms/op |
+| `/v1/embeddings` batch=8 (hidden=256) | 0.074 ms/op |
+| `/v1/completions` serialize | 0.001 ms/op (723 K ops/s) |
+| `/v1/completions` stream=true → 400 | 0.000 ms/op |
+| `/v1/chat/completions` serialize | 0.002 ms/op (635 K ops/s) |
+| `/v1/chat/completions` Gemma render (3 turns) | 0.000 ms/op (5.7 M ops/s) |
+| `/v1/chat/completions` tools → 400 | 0.001 ms/op |
 
 These numbers measure in-process synthetic index operations, not network
 latency or real model weight paging. For a live vindex, use:
@@ -855,6 +987,145 @@ extras — OpenAI clients ignore them.
 }
 ```
 
+### OpenAI-compatible Endpoints (N0 slice 1)
+
+These endpoints conform to the OpenAI API shape so existing
+`openai` Python/JS SDKs work unmodified:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://larql:8080/v1", api_key="sk-...")
+
+# /v1/models
+models = client.models.list()
+
+# /v1/embeddings
+emb = client.embeddings.create(model="gemma-3-4b", input="hello world")
+
+# /v1/completions
+resp = client.completions.create(
+    model="gemma-3-4b",
+    prompt="The capital of France is",
+    max_tokens=10,
+)
+```
+
+#### POST /v1/embeddings
+
+Mean-pooled static-embedding lookup. All four `input` variants
+supported: `string`, `string[]`, `int[]` (pre-tokenised), `int[][]`
+(pre-tokenised batched).
+
+```json
+POST /v1/embeddings
+{"model": "gemma-3-4b-it", "input": "France"}
+
+→ {
+  "object": "list",
+  "data": [{"object": "embedding", "embedding": [0.12, ...], "index": 0}],
+  "model": "gemma-3-4b-it",
+  "usage": {"prompt_tokens": 1, "total_tokens": 1}
+}
+```
+
+Note: results are *lookup-pooled* — they're a mean over the
+input-token static embeddings, not a contrastively-trained sentence
+encoder. Useful as a baseline; not competitive with dedicated
+embedding models for retrieval ranking.
+
+`encoding_format: "base64"` returns 400 in slice 1 (follow-up).
+
+#### POST /v1/completions
+
+Non-streaming text completions.
+
+```json
+POST /v1/completions
+{
+  "model": "gemma-3-4b-it",
+  "prompt": "The capital of France is",
+  "max_tokens": 10,
+  "temperature": 0.7
+}
+
+→ {
+  "id": "cmpl-abc123...",
+  "object": "text_completion",
+  "created": 1746094800,
+  "model": "gemma-3-4b-it",
+  "choices": [{
+    "text": " Paris.",
+    "index": 0,
+    "finish_reason": "stop",
+    "logprobs": null
+  }],
+  "usage": {"prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8}
+}
+```
+
+Slice 1 limitations:
+- `stream=true` returns 400 (SSE arrives in slice 3)
+- `n>1` returns 400 (single completion per prompt)
+- `logprobs: int` accepted but response field always `null` (F18 follow-up)
+- `top_p` accepted but greedy/temperature only
+- Generation is un-KV-cached, O(N²) per token. For Gemma 3 4B that's
+  ~1-3 tok/s on CPU. The KV-cached fast path is N0.2-fast in the
+  ROADMAP.
+
+#### POST /v1/chat/completions
+
+Multi-turn chat with chat-template rendering. Messages are rendered to
+the model's native template (Gemma `<start_of_turn>` / Llama 3 header
+tags / ChatML `<|im_start|>` / Mistral `[INST]` / plain) auto-detected
+from the model family or id, then run through the same generation
+loop as `/v1/completions`.
+
+```json
+POST /v1/chat/completions
+{
+  "model": "gemma-3-4b-it",
+  "messages": [
+    {"role": "system", "content": "You are concise."},
+    {"role": "user",   "content": "What is the capital of France?"}
+  ],
+  "max_tokens": 10,
+  "temperature": 0.0
+}
+
+→ {
+  "id": "chatcmpl-abc123...",
+  "object": "chat.completion",
+  "created": 1746094800,
+  "model": "gemma-3-4b-it",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": " Paris."},
+    "finish_reason": "stop",
+    "logprobs": null
+  }],
+  "usage": {"prompt_tokens": 16, "completion_tokens": 2, "total_tokens": 18}
+}
+```
+
+Slice 2 limitations:
+- `stream=true` → 400 (SSE arrives in slice 3)
+- `n>1` → 400
+- `tools`, `tool_choice` → 400 (slice 4 = N0.6 constrained decoding)
+- `response_format: {type: "json_object" | "json_schema"}` → 400 (slice 4)
+- `logprobs` / `top_logprobs` accepted, response field always `null` (F18)
+- `frequency_penalty`, `presence_penalty`, `seed`, `top_p` accepted but
+  ignored (greedy/temperature only)
+- Same un-KV-cached generation as `/v1/completions` — output content
+  quality depends on the path; wire shape is correct.
+
+Coming next:
+- **N0.1 SSE** streaming via `text/event-stream` for both `/v1/completions`
+  and `/v1/chat/completions` (slice 3)
+- **N0.6** constrained decoding — `tools`, `tool_choice`,
+  `response_format: json_schema` via JSON schema → GBNF mask (slice 4)
+- **N0.3** Responses API (`/v1/responses`) — pairs with N1 stateful
+  sessions (slice 5)
+
 ## Authentication
 
 When `--api-key` is set, all endpoints (except `/v1/health`) require a Bearer token:
@@ -997,6 +1268,9 @@ larql-server/
 ├── examples/
 │   ├── server_demo.rs          Synthetic vindex API demo (no real model)
 │   ├── embed_demo.rs           Synthetic embed/logits/token demo
+│   ├── openai_demo.rs          Live OpenAI-compat walkthrough — boots an
+│   │                           in-process server with the given vindex and
+│   │                           exercises /v1/models, /v1/embeddings, /v1/completions
 │   ├── server_bench.rs         Synthetic endpoint latency benchmarks
 │   ├── bench_embed_server.rs   Live vindex embed-service benchmark
 │   └── bench_expert_server.rs  Live MoE expert benchmark (cpu_moe_forward
@@ -1090,7 +1364,7 @@ larql-server/
 ## Testing
 
 ```bash
-# Unit + integration tests (~580 tests across lib + 14 test files; all green)
+# Unit + integration tests (~595 tests across lib + 14 test files; all green)
 cargo test -p larql-server
 
 # Synthetic demos (no real vindex)
@@ -1099,6 +1373,11 @@ cargo run -p larql-server --example embed_demo
 
 # Synthetic endpoint latency benchmark
 cargo run -p larql-server --example server_bench --release
+
+# Live OpenAI-compat walkthrough — boots in-process server and
+# exercises /v1/models, /v1/embeddings, /v1/completions
+cargo run --release -p larql-server --example openai_demo -- \
+  output/gemma3-4b-q4k-streaming.vindex
 
 # Live embed benchmark (requires a real vindex)
 cargo run --release -p larql-server --example bench_embed_server -- \

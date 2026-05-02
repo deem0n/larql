@@ -268,14 +268,42 @@ Reproduction: `cargo run --release --features metal -p larql-cli --bin larql -- 
 
 **Lesson for future kernel work**: the kernel-isolated profiler can be misleading. A 1.79× isolated speedup ≠ 1.79× end-to-end if the kernel was bandwidth-bound or part of a longer pipeline where other resources serialise the GPU. Always validate end-to-end on a quiet system before adopting.
 
-#### Remaining decode gap (after f16 acc explored)
+#### Track C — `q4k_ffn_gate_up_nr2` candidate ROUND-TRIPPED 2026-05-02 (opt-in, regressed end-to-end)
 
-Decode at ~78 tok/s vs ollama ~95 tok/s, ~1.30×. With f16 acc not paying off end-to-end, the remaining options are:
-- **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis likely applies; expected to also wash out end-to-end. Lower priority unless the gate+up finding turns out to be situational.
-- **Dispatch overhead reduction** (~100-dispatch gap to ollama) — closing this means more aggressive kernel fusion. The fused FFN gate+up + GEGLU + down for Q6_K models was tried (#1 below) and regressed — re-enable might require a cheaper activation variant.
-- **Accept ~1.30× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 25% likely requires fundamental architecture changes.
+NR2 (2 rows / simdgroup variant of `q4k_ffn_gate_up`) was a strong isolated profiler candidate after the 8sg landing — `diag_profile_kernels` showed:
 
-**Effort**: f16 accumulator try is ~1 day (write variant, run parity tests, bench). Other tracks are larger.
+| | iso ms | iso GB/s | **batched ms** | **batched GB/s** |
+|---|---|---|---|---|
+| 8sg (default) | 0.591 | 51.4 | 0.106 | **278.9** |
+| NR2 (candidate) | 0.401 | 76.8 | 0.110 | **267.0** |
+
+End-to-end A/B (warmup 8, decode 30, quiet GPU, three runs):
+
+| config | tok/s | GPU fwd | lm_head | output |
+|---|---|---|---|---|
+| baseline (8sg) | **75.9** | **11.19 ms** | 2.99 ms | "Paris" ✓ |
+| NR2 (`LARQL_GATE_UP_NR2=1`) | 72.9 | 11.80 ms (**+0.62 ms**) | 2.96 ms | "Paris" ✓ |
+
+NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the batched number, not the isolated one — the 1.47× iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. **Not promoted; kept as opt-in only.**
+
+**Same A/B run also confirmed** that the v5 stride-32 lm_head is the *fast* path, not just the correct one: `LARQL_LM_HEAD_STRIDE32=0` regressed lm_head 2.99 → 4.08 ms (+1.09 ms, 75.9 → 69.5 tok/s). The "+0.7 ms cost" framing in PERFORMANCE.md is relative to the pre-fix broken-output kernel, not the current fallback. No tradeoff to chase.
+
+#### Iso-vs-batched pattern, third confirmed instance
+
+`f16_acc` (2026-04-28) + `attn_fused` (2026-05-01) + `nr2` (2026-05-02) all showed isolated wins that failed end-to-end. Pattern pinned in `docs/adr/015-isolated-vs-batched-kernel-perf.md`. **Promotion criterion going forward**: a candidate must win the *batched* `diag_profile_kernels` column AND end-to-end bench. Isolated-only wins do not justify a session of end-to-end measurement on their own — three sessions burned on this so far.
+
+#### Remaining decode gap (after f16 acc, attn_fused, NR2 ruled out)
+
+Decode at ~76 tok/s vs ollama ~99 tok/s steady-state, ~1.30×. The "isolated-only" candidates are exhausted on the FFN gate+up path. Remaining options, ordered:
+
+1. **Multi-TG `attn_fused` retry** — the standalone `qk_norm_rope_fused` runs 12 TGs; the fused variant collapses to 8 because of register pressure. A multi-TG-per-head fused variant (split the QKV+attend work across 2 TGs, keep total ≥12) would preserve parallelism while saving the dispatch. **This is the one remaining iso-win-prone candidate that is *also* batched-friendly** — the dispatch saving lives in the cmd-buffer count, not the per-kernel ALU. Estimated +0.2–0.4 ms recovery if successful.
+2. **f16 lm_head wiring** — `MetalBackend::f16_gemv` shipped with a passing test 2026-04-18; `backend_lm_head_topk` still goes f32. ~50 LOC: expose embeddings.bin f16 bytes from `VectorIndex` and prefer the f16 path. Could claw back some of the +0.7 ms paid for v5 stride-32 correctness. Bonus: removes the 5.6 GB f32 clone on 31B.
+3. **Wire `ProfileTimings.gate_up_ms` / `down_ms` producer** (#12 in P0 structural cleanup) — without it, the remaining ~2 ms in GPU fwd is unattributed. Diagnostic, not perf — but it points the next swing.
+4. **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis likely applies; expected to also wash out end-to-end. Lower priority unless gate+up finding turns out to be situational.
+5. **Dispatch overhead reduction** (~100-dispatch gap to ollama) — closing this means more aggressive kernel fusion. The fused FFN gate+up + GEGLU + down for Q6_K models was tried (#1 below) and regressed — re-enable might require a cheaper activation variant.
+6. **Accept ~1.30× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 25% likely requires fundamental architecture changes.
+
+**Effort**: multi-TG attn_fused retry is ~2 days (split the kernel, keep parity tests, batched bench). f16 lm_head wiring is ~half a day. Other tracks are larger.
 
 #### Acceptance criterion
 

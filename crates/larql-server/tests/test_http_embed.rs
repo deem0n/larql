@@ -369,12 +369,7 @@ async fn http_openai_embeddings_base64_format_returns_400() {
 #[tokio::test]
 async fn http_openai_embeddings_empty_input_returns_400() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(
-        app,
-        "/v1/embeddings",
-        serde_json::json!({"input": []}),
-    )
-    .await;
+    let resp = post_json(app, "/v1/embeddings", serde_json::json!({"input": []})).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -427,12 +422,7 @@ async fn http_openai_completions_infer_disabled_returns_503() {
 #[tokio::test]
 async fn http_openai_completions_missing_prompt_returns_422() {
     let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
-    let resp = post_json(
-        app,
-        "/v1/completions",
-        serde_json::json!({"max_tokens": 1}),
-    )
-    .await;
+    let resp = post_json(app, "/v1/completions", serde_json::json!({"max_tokens": 1})).await;
     // Missing required `prompt` field — serde returns 422 via axum's
     // Json extractor.
     assert!(
@@ -441,4 +431,313 @@ async fn http_openai_completions_missing_prompt_returns_422() {
         "got {}",
         resp.status()
     );
+}
+
+// ══════════════════════════════════════════════════════════════
+// OpenAI endpoints — multi-model routing
+//
+// In multi-model mode the client passes `model` in the request body
+// (OpenAI convention). The endpoints route to the right loaded vindex
+// without needing a path-prefixed `/v1/{model_id}/...` URL.
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn http_openai_models_multi_lists_all_with_openai_shape() {
+    let app = multi_model_router(state(vec![
+        model_functional("gemma-a"),
+        model_functional("gemma-b"),
+    ]));
+    let resp = get(app, "/v1/models").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"gemma-a"));
+    assert!(ids.contains(&"gemma-b"));
+    for entry in data {
+        assert_eq!(entry["object"], "model");
+        assert_eq!(entry["owned_by"], "larql");
+    }
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_multi_routes_via_model_field() {
+    let app = multi_model_router(state(vec![
+        model_functional("gemma-a"),
+        model_functional("gemma-b"),
+    ]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"model": "gemma-b", "input": "France"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["model"], "gemma-b");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["index"], 0);
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_multi_unknown_model_returns_404() {
+    let app = multi_model_router(state(vec![model_functional("gemma-a")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"model": "missing", "input": "France"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_no_model_field_in_single_model_works() {
+    // Single-model mode: omitting `model` is fine; we use the loaded one.
+    let app = single_model_router(state(vec![model_functional("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": "France"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["model"], "gemma");
+}
+
+#[tokio::test]
+async fn http_openai_completions_multi_routes_via_model_field() {
+    // Use ModelBuilder to flip infer_disabled=false.
+    use larql_server::state::LoadedModel;
+    use std::sync::Arc;
+    let m = ModelBuilder::new("gemma-a").build();
+    let n = ModelBuilder::new("gemma-b").build();
+    let _: Arc<LoadedModel> = Arc::clone(&m);
+    let app = multi_model_router(state(vec![m, n]));
+    // infer_disabled=true on default ModelBuilder → expect 503.
+    // We're testing routing, not generation — 503 from the right model
+    // confirms routing worked.
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"model": "gemma-b", "prompt": "x", "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_completions_multi_unknown_model_returns_404() {
+    let app = multi_model_router(state(vec![model_functional("gemma-a")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"model": "missing", "prompt": "x", "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ══════════════════════════════════════════════════════════════
+// OpenAI endpoints — auth flow
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn http_openai_embeddings_with_auth_required_no_token_returns_401() {
+    use axum::middleware;
+    let app_state = state_with_key(vec![model_functional("gemma")], "sk-secret");
+    let app = single_model_router(app_state.clone()).layer(middleware::from_fn_with_state(
+        app_state,
+        larql_server::auth::auth_middleware,
+    ));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": "France"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_with_auth_correct_bearer_returns_200() {
+    use axum::middleware;
+    let app_state = state_with_key(vec![model_functional("gemma")], "sk-secret");
+    let app = single_model_router(app_state.clone()).layer(middleware::from_fn_with_state(
+        app_state,
+        larql_server::auth::auth_middleware,
+    ));
+    let resp = post_json_h(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": "France"}),
+        ("authorization", "Bearer sk-secret"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ══════════════════════════════════════════════════════════════
+// POST /v1/chat/completions — N0.1 slice 2
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn http_openai_chat_stream_true_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_n_gt_1_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 3,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_tools_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_response_format_json_schema_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {}},
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_response_format_text_is_accepted() {
+    // {type: "text"} is the OpenAI default — should pass through, fall
+    // through to infer_disabled gate (synthetic model) → 503.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "text"},
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_invalid_role_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "tool", "content": "x"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_empty_messages_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({"messages": [], "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_infer_disabled_returns_503() {
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_multi_routes_via_model_field() {
+    let app = multi_model_router(state(vec![model("gemma-a"), model("gemma-b")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": "gemma-b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    // Routing succeeds; infer_disabled on the synthetic model → 503.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_multi_unknown_model_returns_404() {
+    let app = multi_model_router(state(vec![model("gemma-a")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": "missing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

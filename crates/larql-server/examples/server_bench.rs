@@ -468,6 +468,179 @@ fn main() {
 
     println!("  Note: production Gemma 3 4B logits = 262208 × 2560 ~ 2ms CPU, ~0.1ms Metal");
 
+    // ── OpenAI-compat envelopes (encode-only synthetic timings) ──────────
+    //
+    // The OpenAI N0 endpoints add an envelope around the existing /v1/embed
+    // and /v1/logits compute. These benches measure the JSON encode cost
+    // for the envelope alone — total endpoint latency = compute time
+    // (above) + envelope cost (below). Useful for validating the wire
+    // shape doesn't dominate.
+    println!("\n── OpenAI-compat envelopes (encode-only) ──");
+
+    bench(
+        "/v1/models OpenAI-shape JSON serialize",
+        1000,
+        100_000,
+        || {
+            let resp = serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "gemma-3-4b-it",
+                    "object": "model",
+                    "created": 1746094800u64,
+                    "owned_by": "larql",
+                    "path": "/v1",
+                    "features": 348160usize,
+                    "loaded": true,
+                }]
+            });
+            serde_json::to_string(&resp).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/embeddings serialize (single, hidden=256)",
+        1000,
+        50_000,
+        || {
+            let emb: Vec<f32> = (0..256).map(|i| i as f32 * 0.01).collect();
+            let resp = serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "embedding": emb, "index": 0}],
+                "model": "gemma-3-4b-it",
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+            });
+            serde_json::to_string(&resp).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/embeddings serialize (batch=8, hidden=256)",
+        500,
+        20_000,
+        || {
+            let emb: Vec<f32> = (0..256).map(|i| i as f32 * 0.01).collect();
+            let data: Vec<serde_json::Value> = (0..8)
+                .map(|i| serde_json::json!({"object": "embedding", "embedding": &emb, "index": i}))
+                .collect();
+            let resp = serde_json::json!({
+                "object": "list",
+                "data": data,
+                "model": "gemma-3-4b-it",
+                "usage": {"prompt_tokens": 8, "total_tokens": 8}
+            });
+            serde_json::to_string(&resp).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/completions serialize (max_tokens=10)",
+        1000,
+        100_000,
+        || {
+            let resp = serde_json::json!({
+                "id": "cmpl-abc123def456",
+                "object": "text_completion",
+                "created": 1746094800u64,
+                "model": "gemma-3-4b-it",
+                "choices": [{
+                    "text": " Paris is the capital of France.",
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "logprobs": null,
+                }],
+                "usage": {
+                    "prompt_tokens": 6,
+                    "completion_tokens": 7,
+                    "total_tokens": 13,
+                }
+            });
+            serde_json::to_string(&resp).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/completions request validation (stream=true → 400)",
+        1000,
+        100_000,
+        || {
+            // Simulate the cheap path: parse body, check stream flag, return.
+            let body = br#"{"prompt":"hi","max_tokens":1,"stream":true}"#;
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
+        },
+    );
+
+    bench(
+        "/v1/chat/completions serialize (assistant content)",
+        1000,
+        100_000,
+        || {
+            let resp = serde_json::json!({
+                "id": "chatcmpl-abc123def456",
+                "object": "chat.completion",
+                "created": 1746094800u64,
+                "model": "gemma-3-4b-it",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": " Paris is the capital of France.",
+                    },
+                    "finish_reason": "stop",
+                    "logprobs": null,
+                }],
+                "usage": {
+                    "prompt_tokens": 16,
+                    "completion_tokens": 7,
+                    "total_tokens": 23,
+                }
+            });
+            serde_json::to_string(&resp).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/chat/completions render gemma multi-turn (3 messages)",
+        1000,
+        100_000,
+        || {
+            // Mirror the rendering path for slice 2 chat templates —
+            // measures string concat cost, not tokenisation.
+            let messages = [
+                ("system", "You are concise."),
+                ("user", "Capital of France?"),
+                ("assistant", "Paris."),
+            ];
+            let mut out = String::with_capacity(256);
+            for (role, content) in messages {
+                let role = if role == "assistant" { "model" } else { role };
+                out.push_str(&format!("<start_of_turn>{role}\n{content}<end_of_turn>\n"));
+            }
+            out.push_str("<start_of_turn>model\n");
+            out
+        },
+    );
+
+    bench(
+        "/v1/chat/completions request validation (tools → 400)",
+        1000,
+        100_000,
+        || {
+            let body = br#"{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function"}],"max_tokens":1}"#;
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            req.get("tools")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        },
+    );
+
+    println!(
+        "  Note: OpenAI envelope adds ~10-20 µs over the underlying compute.\n\
+         Total /v1/embeddings latency = embed lookup (above) + ~5 µs encode."
+    );
+
     println!("\n── Summary ──");
     let total_features: usize = all_layers.iter().map(|l| patched.num_features(*l)).sum();
     println!(

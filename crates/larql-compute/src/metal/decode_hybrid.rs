@@ -272,16 +272,17 @@ impl MetalBackend {
 
         // O projection
         if uses_q4k {
-            use crate::metal::shaders::q4kf_qkv_proj as proj_sh;
             let o_rows = hidden as u32;
             let o_k = layer_q_dim as u32;
-            let num_tgs = (hidden as u64).div_ceil(proj_sh::ROWS_PER_TG);
             let o_out = self.bufs.output((hidden * 4) as u64);
             let o_pipeline = if layer.wo.format == crate::QuantFormat::Q4_KF {
                 &self.q4kf_proj_pipeline
+            } else if layer.wo.format == crate::QuantFormat::Q6_K {
+                &self.q6k_matvec_pipeline
             } else {
-                &self.q4k_proj_pipeline
+                &self.q4k_matvec_pipeline
             };
+            let num_tgs = (hidden as u64).div_ceil(o_pipeline.rows_per_tg);
             enc_c.set_compute_pipeline_state(&o_pipeline.state);
             enc_c.set_buffer(0, Some(&wo_buf), 0);
             enc_c.set_buffer(1, Some(&attn_out), 0);
@@ -290,7 +291,7 @@ impl MetalBackend {
             enc_c.set_bytes(4, 4, &o_k as *const u32 as *const std::ffi::c_void);
             enc_c.dispatch_thread_groups(
                 MTLSize::new(num_tgs, 1, 1),
-                MTLSize::new(proj_sh::THREADS_PER_TG, 1, 1),
+                MTLSize::new(o_pipeline.threads_per_tg, 1, 1),
             );
 
             // Residual add: h_post_attn = h + O_out

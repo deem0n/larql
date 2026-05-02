@@ -159,21 +159,46 @@ the addressable surface, not by implementation effort.
 
 ### N0. OpenAI API compatibility (Chat Completions, Completions, Responses, Embeddings)
 
-**Status**: Not started. Supersedes the older F10 ("OpenAI-compat
-`/v1/chat/completions`") which scoped only the chat endpoint
-shallowly. **Highest-leverage item in this section** — every
-existing OpenAI client (Python `openai` SDK, JS `openai`, LangChain,
-LlamaIndex, Cursor, Continue, Aider, hundreds of agent frameworks,
-every dashboard/eval harness in the ecosystem) becomes a larql client
-the day this lands. Without it we're a niche-internal tool;
-with it we're a drop-in target.
+**Status**: **Slices 1 + 2 shipped 2026-05-02** — `/v1/models`,
+`/v1/embeddings`, `/v1/completions`, `/v1/chat/completions` (all
+non-streaming) live and OpenAI-shape-conformant on `larql-server`.
+Live-validated against `output/gemma3-4b-q4k-streaming.vindex`. Chat
+templates auto-detected from `arch.family()` (Gemma / Llama / ChatML
+/ Mistral / Plain).
+
+Slice 3 (SSE streaming on completions + chat completions) + slice 4
+(tools / JSON mode / `response_format: json_schema`) + slice 5
+(Responses API) remain; per-item **Status** lines below.
+
+Supersedes the older F10 ("OpenAI-compat `/v1/chat/completions`")
+which scoped only the chat endpoint shallowly. **Highest-leverage
+item in this section** — every existing OpenAI client (Python `openai`
+SDK, JS `openai`, LangChain, LlamaIndex, Cursor, Continue, Aider, eval
+harnesses, dashboards) becomes a larql client the day all slices ship.
+With slices 1+2 every chat client today already works; slices 3+4 add
+the polish (streaming, tools, structured output).
+
+**Router-side parity (N0-router)**: `larql-router` should also serve
+the OpenAI surface so clients can hit the grid as a single endpoint
+and the router fans out to shards. `/v1/models` aggregates from
+registered shards; `/v1/embeddings`, `/v1/completions`, and
+`/v1/chat/completions` proxy to shards owning the relevant compute.
+Tracked under "Router-side OpenAI surface" in P1.
 
 **Scope** — five endpoints, mapped onto our existing inference path:
 
 #### N0.1 `POST /v1/chat/completions` (Chat Completions API)
 
-The current standard. Most clients still talk this even after the
-Responses API launched. Non-streaming + streaming via SSE.
+**Status**: Slice 2 shipped 2026-05-02 (non-streaming). Live-validated
+against `output/gemma3-4b-q4k-streaming.vindex`. Wire conforms to the
+OpenAI shape; chat templates auto-detected from `arch.family()` (Gemma
+/ Llama / ChatML / Mistral) with id-string fallback and a Plain
+template for unknown / non-instruct models. SSE streaming → slice 3.
+`tools` / `tool_choice` / `response_format: json_*` → slice 4 (returns
+400 with a clear "see ROADMAP" message). `n>1` → 400.
+
+Original spec preserved below for context on the streaming + tools work
+that remains.
 
 ```
 Request:  {model, messages: [{role, content, tool_calls?, tool_call_id?}],
@@ -1096,6 +1121,70 @@ the SDK is a thin wrapper over the OpenAI client.
 ---
 
 ## Completed
+
+### 2026-05-02 — F0 closed + N0 slices 1 + 2 (OpenAI compat: models + embeddings + completions + chat completions)
+
+**F0 closed.** `larql run output/gemma4-26b-a4b-q4k.vindex "The capital
+of France is" --max-tokens 5` (no `--moe-shards`, no `--metal`) returns
+**"Paris."** Local in-process CPU MoE on the per-layer Q4_K hybrid-MoE
+vindex now produces the correct answer; the M-CPU kernel work shared
+the code path with the 2026-04-30 server-side fix, so the local route
+inherited correctness for free. Marked closed under P0 Active.
+
+**N0 slice 1 + slice 2** — four OpenAI-compatible endpoints landed
+end-to-end on `larql-server`, live-validated against
+`output/gemma3-4b-q4k-streaming.vindex`:
+
+| Endpoint | Slice | Notes |
+|---|---|---|
+| `GET /v1/models` | 1 | OpenAI `{object: "list", data: [{id, object: "model", created, owned_by: "larql", ...}]}`. Larql-specific extras (`path`, `features`, `loaded`) preserved. |
+| `POST /v1/embeddings` | 1 | All four `input` variants (`string`, `string[]`, `int[]`, `int[][]`). Mean-pooled static-embedding lookup. `encoding_format: "base64"` returns 400 (follow-up). |
+| `POST /v1/completions` | 1 | Non-streaming; un-KV-cached generation loop. `stream=true` and `n>1` return 400. |
+| `POST /v1/chat/completions` | 2 | Multi-turn chat with chat-template auto-detection (Gemma / Llama / ChatML / Mistral / Plain) from `arch.family()`. Same generation path as `/v1/completions`. `tools` / `tool_choice` / `response_format: json_*` / `stream=true` / `n>1` return 400 with clear messages. |
+
+Implementation surface: ~1600 LOC across three new files
+(`src/routes/openai_embeddings.rs`, `src/routes/openai_completions.rs`,
+`src/routes/openai_chat.rs`) + reshape of `src/routes/models.rs` + 4
+routes wired into both single-model and multi-model routers + 23 unit
+tests + 19 integration tests + new live `examples/openai_demo.rs`
+walkthrough that boots the server in-process via
+`tower::ServiceExt::oneshot` and exercises every endpoint.
+
+Live smoke (`gemma3-4b-q4k-streaming.vindex`, port 18081):
+- `/v1/models` → OpenAI shape with `gemma-3-4b-it`, `created`, `owned_by`, larql extras.
+- `/v1/embeddings input="France"` → 2560-dim pooled vector + correct usage block.
+- `/v1/completions max_tokens=5` → wire-correct response (`cmpl-...`,
+  `text_completion`, `usage`).
+- `/v1/chat/completions max_tokens=8` with system + user → wire-correct
+  response (`chatcmpl-...`, `chat.completion`, `choices[0].message.{role:
+  "assistant", content}`, `usage`). Output content quality on the
+  un-KV-cached path is poor (degenerate greedy on un-trained
+  base-decode-without-template); wire is what's verified here.
+
+**Tests** — full sweep:
+- `cargo test -p larql-server --lib`: 154 lib tests
+- 14 integration files: 392 integration tests
+- Total: ~546 tests, 0 failures
+- `cargo clippy -p larql-server --tests --no-deps -- -D warnings`: clean
+- `cargo fmt -p larql-server -- --check`: clean
+
+**Open follow-ups** (per-item in N0 sub-headers above):
+- **Slice 3 (N0.1 SSE)** — `text/event-stream` for both
+  `/v1/completions` and `/v1/chat/completions`. Bundles with Q1.10
+  (stream.rs reduction) since both touch the same streaming
+  state-machine shape.
+- **Slice 4 (N0.6)** — constrained decoding for `tools` / `tool_choice`
+  / `response_format: json_schema` via JSON schema → GBNF mask.
+- **Slice 5 (N0.3)** — `/v1/responses` Responses API, pairs with N1
+  stateful sessions.
+- **N0.2-fast** — KV-cached generation path. Both `/v1/completions`
+  and `/v1/chat/completions` benefit. Requires `LoadedModel.weights`
+  to live behind a `RwLock` (or `ModelWeights.tensors` interior-
+  mutable); ~20 readers across the crate. Currently ~1-3 tok/s on
+  Gemma 3 4B; expect 30-50× speedup once KV-cached.
+- **base64 encoding** for `/v1/embeddings` — small follow-up.
+- **N0-router** — OpenAI surface on `larql-router` (grid front);
+  tracked under "Router-side OpenAI surface" in P1.
 
 ### 2026-05-01 (continued) — Q1 code-quality cleanup (9 of 10 items)
 

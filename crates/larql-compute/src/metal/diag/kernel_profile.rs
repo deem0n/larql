@@ -13,7 +13,7 @@
 //! | Kernel | Batched GB/s | ms/tok | Bottleneck |
 //! |---|---|---|---|
 //! | q6k_matvec (FFN down, K=10240) | 312 GB/s | 2.34ms | bandwidth-bound (LPDDR5X) |
-//! | q4k_ffn_gate_up (gate+up, K=2560) | 272 GB/s | 3.68ms | compute-bound (Q4_K dequant) |
+//! | q4k_ffn_gate_up_8sg (gate+up, K=2560) | 272 GB/s | 3.68ms | compute-bound (Q4_K dequant) |
 //! | lm_head f32_gemv (262K×2560) | 370 GB/s | — | bandwidth-bound (near peak) |
 //!
 //! Gate+up is compute-bound because Q4_K at K=2560 has low bytes-per-element
@@ -300,7 +300,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         results.push(r);
     }
 
-    // ── q4k_ffn_gate_up: fused gate+up (N=inter, K=hidden) ───────────────
+    // ── q4k_ffn_gate_up_8sg: production fused gate+up (N=inter, K=hidden) ──
     {
         let n = inter;
         let k = hidden;
@@ -316,7 +316,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let xb = metal.bufs().transient_from_f32(&x);
         let go = metal.bufs().output((n * 4) as u64);
         let uo = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q4k_ffn_gate_up_pipeline;
+        let kh = &metal.q4k_ffn_gate_up_8sg_pipeline;
         let tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;
@@ -414,7 +414,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
 
         let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
         let r = KernelResult {
-            name: "q4k_ffn_gate_up (gate+up, 10240×2560)".into(),
+            name: "q4k_ffn_gate_up_8sg (gate+up, 10240×2560)".into(),
             mb_per_call: mb,
             isolated_ms: iso_ms,
             isolated_sd_ms: iso_sd,
@@ -435,6 +435,73 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
             "  ↳ cold-cache (rotate {cold_n} weight buffers): {cold_ms:>7.3}ms/call  {cold_gbs:>7.1} GB/s  ({:.1}ms/tok)",
             cold_ms * n_layers as f64
         );
+        results.push(r);
+    }
+
+    // ── q4k_ffn_gate_up_nr2: candidate fused gate+up variant ───────────────
+    {
+        let n = inter;
+        let k = hidden;
+        let mb = 2.0 * (n * (k / sb * q4k_sb)) as f64 / 1e6;
+        let gate_q4k = quantize_q4_k(&synth_f32(n * k, 0.2));
+        let up_q4k = quantize_q4_k(&synth_f32(n * k, 0.3));
+        let x = synth_f32(k, 0.5);
+
+        let wg = metal.bufs().get_bytes(&gate_q4k);
+        let wu = metal.bufs().get_bytes(&up_q4k);
+        let xb = metal.bufs().transient_from_f32(&x);
+        let go = metal.bufs().output((n * 4) as u64);
+        let uo = metal.bufs().output((n * 4) as u64);
+        let kh = &metal.q4k_ffn_gate_up_nr2_pipeline;
+        let tgs = (n as u64).div_ceil(kh.rows_per_tg);
+        let n_val = n as u32;
+        let k_val = k as u32;
+
+        let dispatch = |enc: &metal::ComputeCommandEncoderRef| {
+            enc.set_compute_pipeline_state(&kh.state);
+            enc.set_buffer(0, Some(&wg), 0);
+            enc.set_buffer(1, Some(&wu), 0);
+            enc.set_buffer(2, Some(&xb), 0);
+            enc.set_buffer(3, Some(&go), 0);
+            enc.set_buffer(4, Some(&uo), 0);
+            enc.set_bytes(5, 4, &n_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &k_val as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tgs * 2, 1, 1),
+                MTLSize::new(kh.threads_per_tg, 1, 1),
+            );
+        };
+
+        let (iso_ms, iso_sd) = measure_isolated(warmup, iters, &mut || {
+            let cmd = metal.queue().new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            dispatch(enc);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        });
+        let bat_ms = measure_single_cmdbuf_batched(&metal, warmup, iters, n_layers, &dispatch);
+
+        let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
+        let r = KernelResult {
+            name: "q4k_ffn_gate_up_nr2 (candidate, 10240×2560)".into(),
+            mb_per_call: mb,
+            isolated_ms: iso_ms,
+            isolated_sd_ms: iso_sd,
+            isolated_gbs: mb / iso_kernel,
+            batched_ms_per_layer: bat_ms,
+            batched_gbs: mb / bat_ms,
+        };
+        println!(
+            "{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
+            r.name,
+            r.isolated_ms,
+            r.isolated_gbs,
+            r.batched_ms_per_layer,
+            r.batched_gbs,
+            r.ms_per_token(n_layers)
+        );
+        println!("  ↳ decode A/B: LARQL_GATE_UP_NR2=1 ./target/release/larql bench ...");
         results.push(r);
     }
 
@@ -581,6 +648,105 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
             r.batched_ms_per_layer,
             r.batched_gbs,
             r.ms_per_token(n_layers)
+        );
+        results.push(r);
+    }
+
+    // ── q4k_q6k_qkv_proj_normed: production Gemma 3 QKV ─────────────────
+    //
+    // This is the actual Gemma 3 4B hot path: input RMS norm fused into a
+    // mixed Q4_K Q/K + Q6_K V projection. Measure it separately from the
+    // uniform-Q4_K synthetic q4k_qkv_proj above so QKV shows up correctly in
+    // the decode gap diagnosis.
+    {
+        let q_rows = q_dim;
+        let k_rows = kv_dim;
+        let v_rows = kv_dim;
+        let total_rows = q_rows + k_rows + v_rows;
+        let k = hidden;
+        let mb_q4 = ((q_rows + k_rows) * (k / sb * q4k_sb)) as f64 / 1e6;
+        let mb_q6 = (v_rows * (k / sb * q6k_sb)) as f64 / 1e6;
+        let mb = mb_q4 + mb_q6;
+
+        let wq = quantize_q4_k(&synth_f32(q_rows * k, 0.5));
+        let wk = quantize_q4_k(&synth_f32(k_rows * k, 0.6));
+        let wv = quantize_q6_k(&synth_f32(v_rows * k, 0.7));
+        let h = synth_f32(k, 0.4);
+        let norm_w = vec![1.0f32; k];
+
+        let wqb = metal.bufs().get_bytes(&wq);
+        let wkb = metal.bufs().get_bytes(&wk);
+        let wvb = metal.bufs().get_bytes(&wv);
+        let hb = metal.bufs().transient_from_f32(&h);
+        let nb = metal.bufs().get_f32(&norm_w);
+        let qo = metal.bufs().output((q_rows * 4) as u64);
+        let ko = metal.bufs().output((k_rows * 4) as u64);
+        let vo = metal.bufs().output((v_rows * 4) as u64);
+        let kh = &metal.q4k_q6k_qkv_proj_normed_pipeline;
+        let n_tgs = (total_rows as u64).div_ceil(kh.rows_per_tg);
+        let q_val = q_rows as u32;
+        let k_rows_val = k_rows as u32;
+        let v_val = v_rows as u32;
+        let k_val = k as u32;
+        let eps = 1e-6f32;
+        let offset = 1.0f32;
+
+        let dispatch = |enc: &metal::ComputeCommandEncoderRef| {
+            enc.set_compute_pipeline_state(&kh.state);
+            enc.set_buffer(0, Some(&wqb), 0);
+            enc.set_buffer(1, Some(&wkb), 0);
+            enc.set_buffer(2, Some(&wvb), 0);
+            enc.set_buffer(3, Some(&hb), 0);
+            enc.set_buffer(4, Some(&nb), 0);
+            enc.set_buffer(5, Some(&qo), 0);
+            enc.set_buffer(6, Some(&ko), 0);
+            enc.set_buffer(7, Some(&vo), 0);
+            enc.set_bytes(8, 4, &q_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(9, 4, &k_rows_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &v_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(11, 4, &k_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(12, 4, &eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(13, 4, &offset as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs, 1, 1),
+                MTLSize::new(kh.threads_per_tg, 1, 1),
+            );
+        };
+
+        let (iso_ms, iso_sd) = measure_isolated(warmup, iters, &mut || {
+            let cmd = metal.queue().new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            dispatch(enc);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        });
+        let bat_ms = measure_single_cmdbuf_batched(&metal, warmup, iters, n_layers, &dispatch);
+
+        let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
+        let r = KernelResult {
+            name: format!(
+                "q4k_q6k_qkv_normed (Q+K+V, {}+{}+{}×{})",
+                q_rows, k_rows, v_rows, k
+            ),
+            mb_per_call: mb,
+            isolated_ms: iso_ms,
+            isolated_sd_ms: iso_sd,
+            isolated_gbs: mb / iso_kernel,
+            batched_ms_per_layer: bat_ms,
+            batched_gbs: mb / bat_ms,
+        };
+        println!(
+            "{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
+            r.name,
+            r.isolated_ms,
+            r.isolated_gbs,
+            r.batched_ms_per_layer,
+            r.batched_gbs,
+            r.ms_per_token(n_layers)
+        );
+        println!(
+            "  ↳ GB/s counts Q/K/V weight bytes only; normed kernel also rereads H+norm per TG"
         );
         results.push(r);
     }

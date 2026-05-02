@@ -114,11 +114,12 @@ pub async fn handle_embeddings(
 
     // Resolve input to one or more token-id sequences. Strings get
     // tokenised; pre-tokenised inputs pass through.
+    let model_ref: &LoadedModel = model.as_ref();
     let token_seqs: Vec<Vec<u32>> = match req.input {
-        EmbeddingInput::Single(s) => vec![tokenize_one(&model, &s)?],
+        EmbeddingInput::Single(s) => vec![tokenize_one(model_ref, &s)?],
         EmbeddingInput::Batch(strs) => strs
             .iter()
-            .map(|s| tokenize_one(&model, s))
+            .map(|s| tokenize_one(model_ref, s))
             .collect::<Result<_, _>>()?,
         EmbeddingInput::SingleTokens(ids) => vec![ids],
         EmbeddingInput::BatchTokens(idses) => idses,
@@ -136,7 +137,7 @@ pub async fn handle_embeddings(
                 "input[{idx}] is empty — every input must have ≥1 token"
             )));
         }
-        let h = embed_tokens(&model, ids)?;
+        let h = embed_tokens(model_ref, ids)?;
         let pooled = mean_pool(&h);
         total_tokens += ids.len();
         data.push(EmbeddingObject {
@@ -207,8 +208,7 @@ mod tests {
 
     #[test]
     fn mean_pool_empty_sequence_returns_zero_vector() {
-        let h: larql_vindex::ndarray::Array2<f32> =
-            larql_vindex::ndarray::Array2::zeros((0, 4));
+        let h: larql_vindex::ndarray::Array2<f32> = larql_vindex::ndarray::Array2::zeros((0, 4));
         let pooled = mean_pool(&h);
         assert_eq!(pooled, vec![0.0, 0.0, 0.0, 0.0]);
     }
@@ -239,7 +239,10 @@ mod tests {
         let req: EmbeddingsRequest = serde_json::from_value(json).unwrap();
         match req.input {
             EmbeddingInput::SingleTokens(v) => assert_eq!(v, vec![1, 2, 3]),
-            other => panic!("expected SingleTokens, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected SingleTokens, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 

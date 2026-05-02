@@ -480,7 +480,127 @@ OpenAI clients ignore them.
 }
 ```
 
-### 4.5 Remote MoE Expert Endpoints
+### 4.5 OpenAI-Compatible Endpoints (N0 slice 1, shipped 2026-05-02)
+
+Three endpoints conforming to the [OpenAI API](https://platform.openai.com/docs/api-reference)
+shape. Existing `openai` Python/JS SDKs work unmodified — point
+`base_url` at the larql server and the SDK calls just work.
+
+#### GET /v1/models — covered in §4.4 above (now OpenAI-shape).
+
+#### POST /v1/embeddings
+
+```
+Request:  {model?, input: string | string[] | int[] | int[][],
+           encoding_format?: "float" | "base64",
+           dimensions?, user?}
+Response: {object: "list",
+           data: [{object: "embedding", embedding: [f32...], index}],
+           model, usage: {prompt_tokens, total_tokens}}
+```
+
+- `input` accepts strings (server tokenises) or pre-tokenised arrays.
+- Pooling: **mean-pool** over per-token static embeddings. Equivalent
+  to `np.mean(embeddings_table[token_ids], axis=0)`. Treat as
+  "lookup-pooled" not "semantic" embeddings.
+- `encoding_format: "base64"` returns 400 in slice 1 (follow-up).
+- `dimensions`, `user` accepted but no effect (logged via tracing).
+
+#### POST /v1/completions
+
+```
+Request:  {model?, prompt: string | string[],
+           max_tokens?, temperature?, top_p?,
+           stream?, logprobs?, echo?, stop?,
+           n?, best_of?, seed?, user?}
+Response: {id: "cmpl-...", object: "text_completion", created,
+           model,
+           choices: [{text, index, finish_reason, logprobs: null}],
+           usage: {prompt_tokens, completion_tokens, total_tokens}}
+```
+
+Slice 1 constraints:
+- `stream=true` → 400 (SSE arrives in slice 3 alongside chat completions).
+- `n>1` → 400.
+- `logprobs` → request field accepted, response field always `null`.
+- `top_p` → accepted but ignored (greedy/temperature only).
+- `stop` → string or string-array; first match halts generation; the
+  matched substring is trimmed from the returned `text`.
+- `echo: true` → prepends the prompt to the returned `text`.
+- `best_of` → accepted, treated as 1.
+- Generation is un-KV-cached (`forward::predict_with_temperature` per
+  step); O(N²) in context length. KV-cached fast path is N0.2-fast
+  in the roadmap.
+
+`finish_reason` values: `"stop"` (EOS token, end-of-turn marker, or
+matched stop string) or `"length"` (hit `max_tokens`).
+
+#### POST /v1/chat/completions
+
+Slice 2 (shipped 2026-05-02). Multi-turn chat with chat-template
+rendering.
+
+```
+Request:  {model?, messages: [{role: "system"|"user"|"assistant", content}, ...],
+           max_tokens?, temperature?, top_p?,
+           stream?, n?, stop?,
+           tools?, tool_choice?, response_format?,
+           logprobs?, top_logprobs?,
+           frequency_penalty?, presence_penalty?, seed?, user?}
+Response: {id: "chatcmpl-...", object: "chat.completion", created,
+           model,
+           choices: [{
+             index,
+             message: {role: "assistant", content},
+             finish_reason: "stop"|"length",
+             logprobs: null
+           }],
+           usage: {prompt_tokens, completion_tokens, total_tokens}}
+```
+
+Chat-template selection (auto-detected):
+- `arch.family()` returns `gemma2` / `gemma3` / `gemma4` → Gemma
+  (`<start_of_turn>` / `<end_of_turn>`)
+- `llama` → Llama 3 header tags
+  (`<|start_header_id|>...<|end_header_id|>...<|eot_id|>`)
+- `qwen` / `qwen2` / `qwen3` / `deepseek` / `gpt_oss` → ChatML
+  (`<|im_start|>{role}\n...<|im_end|>`)
+- `mistral` / `mixtral` → Mistral `[INST] ... [/INST]` with system
+  prepended to first user
+- anything else → Plain `User: ...\nAssistant: ...` markers
+
+Slice 2 constraints:
+- `stream=true` → 400 (SSE arrives in slice 3).
+- `n>1` → 400.
+- `tools`, `tool_choice` non-empty → 400 (slice 4 = N0.6 constrained
+  decoding).
+- `response_format != {"type": "text"}` → 400 (json_object,
+  json_schema land in slice 4).
+- `logprobs` / `top_logprobs` request fields accepted; response
+  field always `null` (F18 follow-up).
+- `frequency_penalty`, `presence_penalty`, `seed`, `top_p` accepted
+  but ignored (greedy/temperature only).
+- Messages with `tool_calls` or `tool_call_id` non-null → 400.
+- Generation reuses the un-KV-cached `/v1/completions` path —
+  N0.2-fast in the roadmap addresses both endpoints together.
+
+#### Coming next (N0 slices 3-5)
+
+- **N0.1 SSE** — `text/event-stream` for streaming token output on
+  both `/v1/completions` and `/v1/chat/completions` (slice 3).
+- **N0.6** — constrained decoding via JSON schema → GBNF for
+  `tools` / `tool_choice` / `response_format: json_schema` (slice 4).
+- **N0.3** `/v1/responses` — Responses API + stateful sessions
+  (slice 5).
+
+#### N0-router
+
+Mirror of these endpoints on `larql-router` so the grid is a single
+OpenAI endpoint. `/v1/models` aggregates from registered shards;
+`/v1/embeddings` and `/v1/completions` proxy to a shard owning the
+relevant compute.
+
+### 4.6 Remote MoE Expert Endpoints
 
 For hybrid-MoE models (e.g. Gemma 4 26B-A4B), the inference client runs
 attention + dense FFN + the per-layer router locally and dispatches

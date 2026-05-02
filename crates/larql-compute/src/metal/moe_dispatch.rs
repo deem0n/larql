@@ -170,16 +170,32 @@ impl MetalBackend {
             ));
         }
 
-        // Allocate scratch once for the whole decode call. Sized from the first
-        // MoE layer; we assume top_k / intermediate_size are constant across
-        // MoE layers (true for Gemma 4 26B A4B and similar). When future
-        // architectures violate that we'll need either per-layer scratch or
-        // the worst-case max — but no current model exercises that path.
-        let scratch = layers
+        // Cache scratch by `(top_k, hidden, intermediate_size)` on the
+        // backend so the ~15 Metal buffer allocations (~120ms on Gemma 4
+        // 26B-A4B, M3 Max) only happen at first use, not per token. The
+        // shape stays constant across MoE layers in the architectures we
+        // currently target (Gemma 4 26B A4B and similar) and across
+        // decode calls for the same loaded model — when the cached
+        // scratch's shape doesn't match the requested shape we evict and
+        // reallocate, mirroring `larql-server`'s `moe_scratches`
+        // HashMap-by-shape cache. Holding the lock for the whole decode
+        // matches the `kv_cache` pattern above; concurrent decodes on
+        // the same backend serialise here just as they do on KV.
+        let mut scratch_guard = self.moe_scratch.lock().unwrap();
+        if let Some(shape) = layers
             .iter()
             .find_map(|l| l.moe.as_ref())
-            .map(|m| MoeScratch::new(&self.bufs, m.top_k, hidden, m.intermediate_size));
-        let scratch_ref = scratch.as_ref();
+            .map(|m| (m.top_k, hidden, m.intermediate_size))
+        {
+            let needs_alloc = match scratch_guard.as_ref() {
+                Some(s) => (s.top_k, s.hidden, s.inter) != shape,
+                None => true,
+            };
+            if needs_alloc {
+                *scratch_guard = Some(MoeScratch::new(&self.bufs, shape.0, shape.1, shape.2));
+            }
+        }
+        let scratch_ref = scratch_guard.as_ref();
 
         let mut moe_fn = {
             let get_expert_ref = &get_expert;

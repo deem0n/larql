@@ -246,6 +246,14 @@ pub struct MetalBackend {
     pub scale_vector_pipeline: ComputePipelineState,
     /// KV cache for decode mode — initialized on first decode_token call.
     kv_cache: std::sync::Mutex<Option<ops::kv_cache::KVCache>>,
+    /// Pre-allocated MoE scratch for `decode_token_q4k_moe` — keyed
+    /// by `(top_k, hidden, intermediate_size)`. Reused across decode
+    /// calls so the ~15 buffer allocations (~120ms on Gemma 4 26B-A4B,
+    /// M3 Max) only happen at first use, not per token. Mirrors the
+    /// shape cache `larql-server` keeps in `state.rs::moe_scratches`,
+    /// pulled inside the backend so the local decode path benefits
+    /// without each caller threading a cache through.
+    moe_scratch: std::sync::Mutex<Option<moe_dispatch::MoeScratch>>,
     pub rms_norm_q8_pipeline: ComputePipelineState,
     pub residual_norm_pipeline: ComputePipelineState,
     pub residual_norm_q8_pipeline: ComputePipelineState,
@@ -558,6 +566,7 @@ impl MetalBackend {
             rope_at_pos_batched_qk_pipeline,
             scale_vector_pipeline,
             kv_cache: std::sync::Mutex::new(None),
+            moe_scratch: std::sync::Mutex::new(None),
             rms_norm_q8_pipeline,
             residual_norm_pipeline,
             residual_norm_q8_pipeline,

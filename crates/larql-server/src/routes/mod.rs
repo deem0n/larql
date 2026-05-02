@@ -8,6 +8,7 @@ pub mod health;
 pub mod infer;
 pub mod insert;
 pub mod models;
+pub mod openai_chat;
 pub mod openai_completions;
 pub mod openai_embeddings;
 pub mod patches;
@@ -61,6 +62,7 @@ const TOKEN_ENCODE: &str = "/v1/token/encode";
 const TOKEN_DECODE: &str = "/v1/token/decode";
 const OPENAI_EMBEDDINGS: &str = "/v1/embeddings";
 const OPENAI_COMPLETIONS: &str = "/v1/completions";
+const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 
 const M_DESCRIBE: &str = "/v1/{model_id}/describe";
 const M_WALK: &str = "/v1/{model_id}/walk";
@@ -128,6 +130,10 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
             OPENAI_COMPLETIONS,
             post(openai_completions::handle_completions),
         )
+        .route(
+            OPENAI_CHAT_COMPLETIONS,
+            post(openai_chat::handle_chat_completions),
+        )
         .with_state(state)
 }
 
@@ -161,6 +167,10 @@ pub fn multi_model_router(state: Arc<AppState>) -> Router {
         .route(
             OPENAI_COMPLETIONS,
             post(openai_completions::handle_completions),
+        )
+        .route(
+            OPENAI_CHAT_COMPLETIONS,
+            post(openai_chat::handle_chat_completions),
         )
         .with_state(state)
 }

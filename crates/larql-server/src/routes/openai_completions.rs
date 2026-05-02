@@ -191,11 +191,8 @@ pub async fn handle_completions(
 
     // Model id for the response (matches the request when given,
     // otherwise the loaded model's id).
-    let model_id = req
-        .model
-        .clone()
-        .unwrap_or_else(|| model.id.clone());
-    let model_arc = Arc::clone(&model);
+    let model_id = req.model.clone().unwrap_or_else(|| model.id.clone());
+    let model_arc = model.clone();
 
     // Run the generation loop on the blocking pool so the tokio runtime
     // stays responsive to other requests.
@@ -326,7 +323,9 @@ fn run_completions_loop(
 }
 
 fn contains_any(haystack: &str, needles: &[String]) -> bool {
-    needles.iter().any(|n| !n.is_empty() && haystack.contains(n.as_str()))
+    needles
+        .iter()
+        .any(|n| !n.is_empty() && haystack.contains(n.as_str()))
 }
 
 fn trim_at_stop(haystack: &str, needles: &[String]) -> String {

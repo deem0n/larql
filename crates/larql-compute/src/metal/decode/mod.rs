@@ -630,7 +630,7 @@ impl MetalBackend {
                 use crate::metal::stages::quant_matvec::Pipelines;
                 let pipes = Pipelines {
                     q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                    q4k_matvec_fallback: &self.q4k_proj_pipeline,
+                    q4k_matvec_fallback: &self.q4k_matvec_pipeline,
                     q6k_matvec: &self.q6k_matvec_pipeline,
                     q4_matvec: &self.q4.matvec,
                     q4k_matmul: None,
