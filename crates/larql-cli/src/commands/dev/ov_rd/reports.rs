@@ -603,6 +603,8 @@ pub(super) struct OraclePqExceptionReport {
     pub(super) exception_edits: Vec<usize>,
     pub(super) tail_fracs: Vec<f64>,
     pub(super) tail_selector: String,
+    pub(super) exception_fit: String,
+    pub(super) position_candidates_per_prompt: usize,
     pub(super) sigma_rel_cutoff: f64,
     pub(super) pq_iters: usize,
     pub(super) exception_iters: usize,

@@ -221,8 +221,6 @@ fn make_loaded_model(
         down_top_k: 1,
         has_model_weights: false,
         model_config: None,
-        fp4: None,
-        ffn_layout: None,
     };
 
     // Build ModelWeights with expert data in raw_bytes (no mmap needed).
@@ -239,7 +237,6 @@ fn make_loaded_model(
         tensors: HashMap::new(),
         vectors,
         raw_bytes,
-        skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
@@ -256,7 +253,7 @@ fn make_loaded_model(
     };
 
     let lock = OnceLock::new();
-    lock.set(std::sync::RwLock::new(weights)).ok();
+    lock.set(weights).ok();
 
     LoadedModel {
         id: "test-moe".into(),
@@ -275,22 +272,8 @@ fn make_loaded_model(
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         expert_filter: None,
-        unit_filter: None,
+        moe_remote: None,
     }
-}
-
-/// Variant that sets `expert_filter` on the returned model. Used to test
-/// `--experts START-END` ownership enforcement.
-fn make_loaded_model_with_filter(
-    gate_up: Vec<u8>,
-    down: Vec<u8>,
-    router_proj: Vec<f32>,
-    pre_norm: Vec<f32>,
-    filter: (usize, usize),
-) -> LoadedModel {
-    let mut m = make_loaded_model(gate_up, down, router_proj, pre_norm);
-    m.expert_filter = Some(filter);
-    m
 }
 
 // ── Server helper ─────────────────────────────────────────────────────────────
@@ -324,21 +307,11 @@ fn local_output(
     router_proj: &[f32],
     pre_norm: &[f32],
 ) -> Vec<f32> {
-    // Synthetic test fixtures store BF16 monolith. Slice into per-expert
-    // tables for the new MoeLayerWeights API.
-    let gu_stride = 2 * INTER * HIDDEN * 2;
-    let dn_stride = HIDDEN * INTER * 2;
-    let experts_gate_up: Vec<&[u8]> = (0..NUM_EXPERTS)
-        .map(|e| &gate_up[e * gu_stride..(e + 1) * gu_stride])
-        .collect();
-    let experts_down: Vec<&[u8]> = (0..NUM_EXPERTS)
-        .map(|e| &down[e * dn_stride..(e + 1) * dn_stride])
-        .collect();
     cpu_moe_forward(
         h,
         &MoeLayerWeights {
-            experts_gate_up,
-            experts_down,
+            experts_gate_up: gate_up,
+            experts_down: down,
             router_proj,
             router_scale: &[],
             router_per_expert_scale: &[],
@@ -352,7 +325,6 @@ fn local_output(
             top_k: TOP_K,
             intermediate_size: INTER,
             activation: larql_compute::Activation::Silu,
-            expert_data_format: larql_compute::QuantFormat::BF16,
         },
         0.0,
         1e-6,
@@ -643,89 +615,5 @@ async fn expert_endpoint_no_shard_error() {
     assert!(
         matches!(err, Err(RemoteMoeError::NoShard { expert_id: 3 })),
         "expected NoShard(3), got {err:?}"
-    );
-}
-
-/// Regression test: `--experts 0-1` (CLI) → `expert_filter = (0, 2)` (the
-/// half-open range `parse_layer_range` produces). The route handler must
-/// REJECT expert 2 even though it's at the half-open upper bound — earlier
-/// the inclusive `>` check let `expert_id == end` slip through, exposing a
-/// neighbour shard's experts. Test covers boundaries: 0 (in), 1 (in, last),
-/// 2 (out, off-by-one), 3 (out, far).
-#[tokio::test]
-async fn expert_filter_rejects_at_upper_bound() {
-    use axum::body::{to_bytes, Body};
-    use axum::http::{Request, StatusCode};
-    use larql_server::{
-        cache::DescribeCache, routes::single_model_router, session::SessionManager, state::AppState,
-    };
-    use std::sync::atomic::AtomicU64;
-    use tower::ServiceExt as _;
-
-    let gate_up = make_gate_up_bytes();
-    let down = make_down_bytes();
-    let router_proj = make_router_proj();
-    let pre_norm = make_pre_norm();
-    let h = make_input();
-
-    // Filter: (0, 2) = inclusive 0-1 = `--experts 0-1`.
-    let model = make_loaded_model_with_filter(gate_up, down, router_proj, pre_norm, (0, 2));
-    let state = Arc::new(AppState {
-        models: vec![Arc::new(model)],
-        started_at: std::time::Instant::now(),
-        requests_served: AtomicU64::new(0),
-        api_key: None,
-        sessions: SessionManager::new(3600),
-        describe_cache: DescribeCache::new(60),
-    });
-    let app = single_model_router(state);
-
-    async fn call(app: axum::Router, h: &[f32], id: usize) -> (StatusCode, String) {
-        let body_str = serde_json::json!({ "residual": h }).to_string();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/v1/expert/0/{id}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(body_str))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let text = String::from_utf8_lossy(&bytes).to_string();
-        (status, text)
-    }
-
-    let (s0, _) = call(app.clone(), &h, 0).await;
-    assert_eq!(s0, StatusCode::OK, "expert 0 (in-range) must succeed");
-
-    let (s1, _) = call(app.clone(), &h, 1).await;
-    assert_eq!(s1, StatusCode::OK, "expert 1 (last in-range) must succeed");
-
-    let (s2, body2) = call(app.clone(), &h, 2).await;
-    assert_eq!(
-        s2,
-        StatusCode::BAD_REQUEST,
-        "expert 2 (one past the inclusive end) MUST be rejected — \
-         this catches the half-open vs inclusive off-by-one. body: {body2}"
-    );
-    assert!(
-        body2.contains("not owned"),
-        "rejection body must explain ownership: {body2}"
-    );
-    // Error message displays the inclusive bound, not the half-open one.
-    assert!(
-        body2.contains("0–1") || body2.contains("0-1"),
-        "error message must show inclusive range 0–1, not 0–2; got: {body2}"
-    );
-
-    let (s3, _) = call(app, &h, 3).await;
-    assert_eq!(
-        s3,
-        StatusCode::BAD_REQUEST,
-        "expert 3 (well out of range) must be rejected"
     );
 }

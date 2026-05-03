@@ -156,6 +156,22 @@ impl GridState {
         }
     }
 
+    /// All distinct `listen_url` values across all registered servers.
+    /// Used by the `/v1/stats` proxy to find a shard to forward to.
+    pub fn all_shard_urls(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.servers
+            .values()
+            .filter_map(|s| {
+                if seen.insert(s.listen_url.clone()) {
+                    Some(s.listen_url.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn status_response(&self) -> StatusResponse {
         // Build per-model coverage
         let mut by_model: HashMap<String, Vec<&ServerEntry>> = HashMap::new();

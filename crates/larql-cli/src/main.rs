@@ -1,19 +1,5 @@
-#![allow(
-    unused_imports,
-    clippy::doc_overindented_list_items,
-    clippy::excessive_precision,
-    clippy::for_kv_map,
-    clippy::io_other_error,
-    clippy::large_enum_variant,
-    clippy::manual_contains,
-    clippy::manual_is_multiple_of,
-    clippy::manual_repeat_n,
-    clippy::map_identity,
-    clippy::needless_lifetimes,
-    clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::type_complexity)]
 
 use clap::{Parser, Subcommand};
 
@@ -21,8 +7,7 @@ mod commands;
 mod formatting;
 mod utils;
 
-use commands::dev::ov_rd::cmd as ov_rd_cmd;
-use commands::diagnostics::parity as parity_cmd;
+use commands::dev::*;
 use commands::extraction::*;
 use commands::primary::*;
 use commands::query::*;
@@ -83,21 +68,6 @@ enum Commands {
 
     /// Benchmark decode throughput on a real vindex (Metal / CPU / Ollama).
     Bench(bench_cmd::BenchArgs),
-
-    /// Engine diagnostic — show which inference paths the loader will pick
-    /// for a vindex (lm_head fast/slow, attn fused/per-proj, FFN, stride
-    /// validation). `--probe` runs a real forward and prints per-stage
-    /// timings. Catches silent slowdowns at a glance.
-    Diag(diag_cmd::DiagArgs),
-
-    /// Cross-backend numerical diff for inference components (MoE expert,
-    /// MoE block, ...). Catches silent regressions in quantisation,
-    /// activation, norm, or expert-routing math when refactoring.
-    Parity(parity_cmd::ParityArgs),
-
-    /// Shannon-style next-token bit measurements and demo compression.
-    #[command(subcommand)]
-    Shannon(shannon_cmd::ShannonCommand),
 
     // ── Server ──────────────────────────────────────────────────────
     #[command(next_help_heading = "Server")]
@@ -220,8 +190,8 @@ enum DevCommand {
     /// Map attention OV circuits to FFN gate features.
     OvGate(ov_gate_cmd::OvGateArgs),
 
-    /// Measure OV pre-W_O rate-distortion statistics.
-    OvRd(ov_rd_cmd::OvRdArgs),
+    /// OV rate-distortion and residual-table attention compilation experiments.
+    OvRd(ov_rd::cmd::OvRdArgs),
 
     /// Discover attention → FFN circuits from weight decomposition.
     CircuitDiscover(circuit_discover_cmd::CircuitDiscoverArgs),
@@ -305,7 +275,7 @@ impl From<ChatArgs> for run_cmd::RunArgs {
             constrained: false,
             moe_shards: None,
             moe_units_manifest: None,
-            moe_dispatch: "streaming".into(),
+            moe_dispatch: "streaming".to_string(),
         }
     }
 }
@@ -349,24 +319,6 @@ struct ServeArgs {
     /// Set to N to cap at N layers; evicted layers are re-decoded on access.
     #[arg(long, default_value = "0")]
     max_gate_cache_layers: usize,
-
-    /// Cap Q4_K/Q6_K FFN dequant cache layers via LRU. 0 = unlimited.
-    /// Only fires on the CPU per-position fallback (Metal full-K decode
-    /// streams Q4_K bytes directly, never populating this cache).
-    /// Recommended: 8 for a CPU-only Gemma 3 4B server (≈ 840 MB ceiling
-    /// on the down leg).
-    #[arg(long, default_value = "0")]
-    max_q4k_cache_layers: usize,
-
-    /// Use HNSW for gate KNN instead of brute-force matmul. Approximate
-    /// (recall 80–95%); wins for high-feature MoE, neutral on dense 4B.
-    /// Pairs with `--hnsw-ef-search` to control the recall/speed knob.
-    #[arg(long)]
-    hnsw: bool,
-
-    /// HNSW beam width — higher = better recall, slower search.
-    #[arg(long, default_value = "200")]
-    hnsw_ef_search: usize,
 
     /// madvise(MADV_DONTNEED) on all mmaps after each walk-ffn request.
     /// Enforces a hard RSS bound alongside --max-gate-cache-layers at the
@@ -460,6 +412,17 @@ struct ServeArgs {
     /// Trust X-Forwarded-For when rate limiting (enable only behind a trusted proxy).
     #[arg(long)]
     trust_forwarded_for: bool,
+
+    /// Server-side MoE expert shard map: `"START-END=URL,START-END=URL,..."`
+    /// The walk-ffn handler will dispatch MoE expert calls to these remote servers.
+    /// Combine with --layers for full 2D (layer × expert) sharding.
+    #[arg(long)]
+    moe_shards: Option<String>,
+
+    /// Path to a JSON manifest for fine-grained per-(layer, expert) shard ownership.
+    /// Mutually exclusive with --moe-shards.
+    #[arg(long, value_name = "PATH")]
+    moe_units_manifest: Option<std::path::PathBuf>,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -483,7 +446,6 @@ const LEGACY_DEV_NAMES: &[&str] = &[
     "qk-rank",
     "qk-modes",
     "ov-gate",
-    "ov-rd",
     "circuit-discover",
     "attn-bottleneck",
     "ffn-bench",
@@ -521,9 +483,6 @@ fn main() {
         Commands::Run(args) => run_cmd::run(args),
         Commands::Chat(args) => run_cmd::run(args.into()),
         Commands::Bench(args) => bench_cmd::run(args),
-        Commands::Diag(args) => diag_cmd::run(args),
-        Commands::Parity(args) => parity_cmd::run(args),
-        Commands::Shannon(cmd) => shannon_cmd::run(cmd),
         Commands::Pull(args) => pull_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
         Commands::List(args) => list_cmd::run(args),
@@ -591,7 +550,7 @@ fn run_dev(cmd: DevCommand) -> Result<(), Box<dyn std::error::Error>> {
         DevCommand::QkRank(a) => qk_rank_cmd::run(a),
         DevCommand::QkModes(a) => qk_modes_cmd::run(a),
         DevCommand::OvGate(a) => ov_gate_cmd::run(a),
-        DevCommand::OvRd(a) => ov_rd_cmd::run(a),
+        DevCommand::OvRd(a) => ov_rd::cmd::run(a),
         DevCommand::CircuitDiscover(a) => circuit_discover_cmd::run(a),
         DevCommand::AttnBottleneck(a) => attn_bottleneck_cmd::run(a),
         DevCommand::FfnBottleneck(a) => ffn_bottleneck_cmd::run(a),
@@ -639,15 +598,6 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.max_gate_cache_layers > 0 {
         cmd_args.push("--max-gate-cache-layers".into());
         cmd_args.push(args.max_gate_cache_layers.to_string());
-    }
-    if args.max_q4k_cache_layers > 0 {
-        cmd_args.push("--max-q4k-cache-layers".into());
-        cmd_args.push(args.max_q4k_cache_layers.to_string());
-    }
-    if args.hnsw {
-        cmd_args.push("--hnsw".into());
-        cmd_args.push("--hnsw-ef-search".into());
-        cmd_args.push(args.hnsw_ef_search.to_string());
     }
     if args.release_mmap_after_request {
         cmd_args.push("--release-mmap-after-request".into());
@@ -718,6 +668,14 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.trust_forwarded_for {
         cmd_args.push("--trust-forwarded-for".into());
+    }
+    if let Some(ref s) = args.moe_shards {
+        cmd_args.push("--moe-shards".into());
+        cmd_args.push(s.clone());
+    }
+    if let Some(ref path) = args.moe_units_manifest {
+        cmd_args.push("--moe-units-manifest".into());
+        cmd_args.push(path.display().to_string());
     }
 
     let exe = std::env::current_exe().ok();

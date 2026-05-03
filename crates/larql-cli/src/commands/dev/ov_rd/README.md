@@ -165,7 +165,8 @@ oracle_pq_stability.rs
                   PQ code distribution stability diagnostics
 pq.rs              PQ codebooks, Mode D tables, and k-means mechanics
 pq_exception.rs    base-PQ-plus-exception residual catalogue diagnostics, with
-                  residual-error and prompt-KL tail selectors
+                  residual-error/prompt-KL/position-restore tail selectors
+                  and k-means/exemplar fits
 reports.rs         JSON artifact schemas
 runtime.rs         thin shim over inference Q4K tensor insertion/removal
 sanity.rs          no-op/subtract/residual-delta equivalence checks

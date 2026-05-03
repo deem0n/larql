@@ -430,6 +430,45 @@ async fn handle_health() -> Json<Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// Proxy /v1/stats to the first reachable shard so that clients connecting
+/// via RemoteWalkBackend (which reads hidden_size from /v1/stats) work
+/// transparently through the router.
+async fn handle_stats(State(state): State<Arc<AppState>>) -> Response {
+    // Collect candidate shard URLs: grid shards first, then static.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(grid) = &state.grid {
+        let guard = grid.read().await;
+        for url in guard.all_shard_urls() {
+            candidates.push(url);
+        }
+    }
+    for shard in &state.static_shards {
+        if !candidates.contains(&shard.url) {
+            candidates.push(shard.url.clone());
+        }
+    }
+    for url in candidates {
+        let stats_url = format!("{url}/v1/stats");
+        if let Ok(resp) = state.client.get(&stats_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes().await {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap();
+                }
+            }
+        }
+    }
+    // No shard reachable — return minimal synthetic stats so callers don't fail hard.
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(r#"{"error":"no shard reachable"}"#))
+        .unwrap()
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -526,6 +565,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let app = Router::new()
         .route("/v1/walk-ffn", post(handle_walk_ffn))
+        .route("/v1/stats", axum::routing::get(handle_stats))
         .route("/v1/health", axum::routing::get(handle_health))
         .with_state(state);
 

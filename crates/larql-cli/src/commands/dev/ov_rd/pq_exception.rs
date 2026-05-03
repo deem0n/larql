@@ -63,9 +63,17 @@ pub(super) struct OraclePqExceptionArgs {
     #[arg(long, default_value = "1.0,0.25,0.1")]
     tail_fracs: String,
 
-    /// Training-position selector for exception fitting: residual-error or prompt-kl.
+    /// Training-position selector for exception fitting: residual-error, prompt-kl, or position-restore-kl.
     #[arg(long, default_value = "residual-error")]
     tail_selector: String,
+
+    /// Exception catalogue fitting method: kmeans or exemplar.
+    #[arg(long, default_value = "kmeans")]
+    exception_fit: String,
+
+    /// Candidate positions per prompt/head for position-local restore selectors.
+    #[arg(long, default_value_t = 4)]
+    position_candidates_per_prompt: usize,
 
     /// Relative singular value cutoff for retained W_O-visible directions.
     #[arg(long, default_value_t = 1e-6)]
@@ -124,6 +132,7 @@ struct ErrorSample {
 enum TailSelector {
     ResidualError,
     PromptKl,
+    PositionRestoreKl,
 }
 
 impl TailSelector {
@@ -131,8 +140,9 @@ impl TailSelector {
         match value {
             "residual-error" => Ok(Self::ResidualError),
             "prompt-kl" => Ok(Self::PromptKl),
+            "position-restore-kl" => Ok(Self::PositionRestoreKl),
             other => Err(format!(
-                "invalid --tail-selector '{other}', expected residual-error or prompt-kl"
+                "invalid --tail-selector '{other}', expected residual-error, prompt-kl, or position-restore-kl"
             )
             .into()),
         }
@@ -142,6 +152,32 @@ impl TailSelector {
         match self {
             Self::ResidualError => "residual-error",
             Self::PromptKl => "prompt-kl",
+            Self::PositionRestoreKl => "position-restore-kl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExceptionFit {
+    Kmeans,
+    Exemplar,
+}
+
+impl ExceptionFit {
+    fn parse(value: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        match value {
+            "kmeans" => Ok(Self::Kmeans),
+            "exemplar" => Ok(Self::Exemplar),
+            other => Err(
+                format!("invalid --exception-fit '{other}', expected kmeans or exemplar").into(),
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Kmeans => "kmeans",
+            Self::Exemplar => "exemplar",
         }
     }
 }
@@ -197,6 +233,7 @@ pub(super) fn run_oracle_pq_exception(
         return Err("--tail-fracs values must be finite and in (0, 1]".into());
     }
     let tail_selector = TailSelector::parse(&args.tail_selector)?;
+    let exception_fit = ExceptionFit::parse(&args.exception_fit)?;
 
     let mut prompts = load_prompts(&args.prompts, args.max_prompts)?;
     if let Some(max_per_stratum) = args.max_per_stratum {
@@ -213,6 +250,11 @@ pub(super) fn run_oracle_pq_exception(
     eprintln!("Exception edits: {:?}", exception_edits);
     eprintln!("Tail fractions: {:?}", tail_fracs);
     eprintln!("Tail selector: {}", tail_selector.as_str());
+    eprintln!("Exception fit: {}", exception_fit.as_str());
+    eprintln!(
+        "Position candidates per prompt: {}",
+        args.position_candidates_per_prompt
+    );
     eprintln!("Prompts: {}", prompts_seen);
 
     eprintln!("Fitting position-mean static bases");
@@ -284,6 +326,26 @@ pub(super) fn run_oracle_pq_exception(
     } else {
         HashMap::new()
     };
+    let position_scores = if tail_selector == TailSelector::PositionRestoreKl {
+        eprintln!("Measuring position-local restore gains for exception selection");
+        measure_fit_position_restore_gains(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &base_codebooks,
+            &base_tables,
+            &w_o_heads,
+            base_config,
+            args.position_candidates_per_prompt,
+        )?
+    } else {
+        HashMap::new()
+    };
 
     eprintln!("Fitting exception residual catalogues");
     let exception_catalogs = fit_exception_catalogs(
@@ -302,7 +364,9 @@ pub(super) fn run_oracle_pq_exception(
         &exception_edits,
         &tail_fracs,
         tail_selector,
+        exception_fit,
         &prompt_scores,
+        &position_scores,
         args.exception_iters,
     )?;
 
@@ -479,6 +543,8 @@ pub(super) fn run_oracle_pq_exception(
         exception_edits,
         tail_fracs,
         tail_selector: tail_selector.as_str().to_string(),
+        exception_fit: exception_fit.as_str().to_string(),
+        position_candidates_per_prompt: args.position_candidates_per_prompt,
         sigma_rel_cutoff: args.sigma_rel_cutoff,
         pq_iters: args.pq_iters,
         exception_iters: args.exception_iters,
@@ -510,7 +576,9 @@ fn fit_exception_catalogs(
     exception_edits: &[usize],
     tail_fracs: &[f64],
     tail_selector: TailSelector,
+    exception_fit: ExceptionFit,
     prompt_scores: &HashMap<(HeadId, usize), f64>,
+    position_scores: &HashMap<(HeadId, usize, usize), f64>,
     iterations: usize,
 ) -> Result<HashMap<ExceptionKey, ExceptionCatalog>, Box<dyn std::error::Error>> {
     let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
@@ -577,6 +645,9 @@ fn fit_exception_catalogs(
                             TailSelector::PromptKl => {
                                 *prompt_scores.get(&(*head, prompt_idx)).unwrap_or(&0.0)
                             }
+                            TailSelector::PositionRestoreKl => *position_scores
+                                .get(&(*head, prompt_idx, pos))
+                                .unwrap_or(&0.0),
                         };
                         samples
                             .get_mut(head)
@@ -629,7 +700,10 @@ fn fit_exception_catalogs(
                 .map(|sample| sample.values.clone())
                 .collect::<Vec<_>>();
             for &edits in exception_edits {
-                let centroids = kmeans_centroids(&selected, edits, iterations);
+                let centroids = match exception_fit {
+                    ExceptionFit::Kmeans => kmeans_centroids(&selected, edits, iterations),
+                    ExceptionFit::Exemplar => exemplar_centroids(&selected, edits),
+                };
                 catalogs.insert(
                     ExceptionKey {
                         head: *head,
@@ -649,6 +723,18 @@ fn fit_exception_catalogs(
     }
 
     Ok(catalogs)
+}
+
+fn exemplar_centroids(selected: &[Vec<f64>], edits: usize) -> Vec<Vec<f64>> {
+    if edits == 0 {
+        return Vec::new();
+    }
+    if selected.is_empty() {
+        return vec![Vec::new(); edits];
+    }
+    (0..edits)
+        .map(|idx| selected[idx.min(selected.len() - 1)].clone())
+        .collect()
 }
 
 fn measure_fit_prompt_base_pq_kl(
@@ -710,6 +796,160 @@ fn measure_fit_prompt_base_pq_kl(
     Ok(scores)
 }
 
+fn measure_fit_position_restore_gains(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    tables: &HashMap<(HeadId, PqConfig), ModeDTable>,
+    w_o_heads: &HashMap<HeadId, Vec<Vec<f32>>>,
+    base_config: PqConfig,
+    candidates_per_prompt: usize,
+) -> Result<HashMap<(HeadId, usize, usize), f64>, Box<dyn std::error::Error>> {
+    let mut scores = HashMap::new();
+    if candidates_per_prompt == 0 {
+        return Ok(scores);
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = prompt_label(record);
+        eprintln!(
+            "  position-restore-fit [{}/{}] {}",
+            prompt_idx + 1,
+            prompts.len(),
+            label
+        );
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+        let baseline_hidden =
+            larql_inference::vindex::predict_q4k_hidden(weights, &token_ids, index, None);
+        let baseline_logits = final_logits(weights, &baseline_hidden);
+        let baseline_logp = log_softmax(&baseline_logits);
+
+        for head in heads {
+            let basis = bases
+                .get(head)
+                .ok_or_else(|| format!("missing basis for L{}H{}", head.layer, head.head))?;
+            let pca_basis = pca_bases
+                .get(head)
+                .ok_or_else(|| format!("missing PCA basis for L{}H{}", head.layer, head.head))?;
+            let head_means = means
+                .get(head)
+                .ok_or_else(|| format!("missing means for L{}H{}", head.layer, head.head))?;
+            let codebook = codebooks.get(&(*head, base_config)).ok_or_else(|| {
+                format!("missing base codebook for L{}H{}", head.layer, head.head)
+            })?;
+            let table = tables
+                .get(&(*head, base_config))
+                .ok_or_else(|| format!("missing base table for L{}H{}", head.layer, head.head))?;
+            let w_o_head = w_o_heads
+                .get(head)
+                .ok_or_else(|| format!("missing W_O head for L{}H{}", head.layer, head.head))?;
+
+            let base_hidden = forward_q4k_oracle_pq_mode_d_head(
+                weights, &token_ids, index, *head, basis, pca_basis, head_means, codebook, table,
+                stratum,
+            )?;
+            let base_logits = final_logits(weights, &base_hidden);
+            let base_logp = log_softmax(&base_logits);
+            let base_kl = kl_logp(&baseline_logp, &base_logp);
+
+            let mut candidates = capture_head_position_sq_errors(
+                weights, index, &token_ids, *head, basis, pca_basis, head_means, codebook, table,
+                w_o_head, stratum,
+            )?;
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.truncate(candidates_per_prompt.min(candidates.len()));
+
+            for (position, _sq_norm) in candidates {
+                let restored_hidden = forward_q4k_oracle_pq_position_restore_head(
+                    weights, &token_ids, index, *head, basis, pca_basis, head_means, codebook,
+                    table, w_o_head, position, stratum,
+                )?;
+                let restored_logits = final_logits(weights, &restored_hidden);
+                let restored_logp = log_softmax(&restored_logits);
+                let restored_kl = kl_logp(&baseline_logp, &restored_logp);
+                let gain = (base_kl - restored_kl).max(0.0);
+                scores.insert((*head, prompt_idx, position), gain);
+            }
+        }
+    }
+
+    Ok(scores)
+}
+
+fn capture_head_position_sq_errors(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    token_ids: &[u32],
+    head: HeadId,
+    basis: &WoRoundtripBasis,
+    pca_basis: &ZPcaBasis,
+    means: &StaticHeadMeans,
+    codebook: &PqCodebook,
+    table: &ModeDTable,
+    w_o_head: &[Vec<f32>],
+    stratum: &str,
+) -> Result<Vec<(usize, f64)>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        if layer == head.layer {
+            let result = (|| -> Result<Vec<(usize, f64)>, Box<dyn std::error::Error>> {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                let start = head.head * head_dim;
+                let end = start + head_dim;
+                let mut errors = Vec::with_capacity(pre_o.nrows());
+                for pos in 0..pre_o.nrows() {
+                    let row = pre_o.slice(s![pos, start..end]);
+                    let values = row
+                        .as_slice()
+                        .ok_or("pre-W_O head row was not contiguous during restore fit")?;
+                    let base_delta = base_pq_delta(
+                        values, basis, pca_basis, means, codebook, table, pos, stratum,
+                    );
+                    let true_delta = project_head_vector_to_hidden(w_o_head, values);
+                    let sq_norm = true_delta
+                        .iter()
+                        .zip(base_delta.iter())
+                        .map(|(&true_value, &base_value)| {
+                            let delta = true_value as f64 - base_value as f64;
+                            delta * delta
+                        })
+                        .sum::<f64>();
+                    errors.push((pos, sq_norm));
+                }
+                Ok(errors)
+            })();
+            remove_layer_tensors(weights, inserted);
+            return result;
+        }
+        {
+            let ffn = WeightFfn { weights };
+            if let Some((h_new, _, _)) =
+                run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+            {
+                h = h_new;
+            }
+        }
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Err(format!("target layer {} was not reached", head.layer).into())
+}
+
 fn forward_q4k_oracle_pq_exception_head(
     weights: &mut larql_inference::ModelWeights,
     token_ids: &[u32],
@@ -751,6 +991,51 @@ fn forward_q4k_oracle_pq_exception_head(
                 let exception = &catalog.centroids[code];
                 for (&base, &extra) in base_delta.iter().zip(exception.iter()) {
                     replacement_delta.push(base + extra as f32);
+                }
+            }
+            Array2::from_shape_vec((original_head.nrows(), hidden_size), replacement_delta)
+                .map_err(|err| err.to_string())
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn forward_q4k_oracle_pq_position_restore_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    basis: &WoRoundtripBasis,
+    pca_basis: &ZPcaBasis,
+    means: &StaticHeadMeans,
+    codebook: &PqCodebook,
+    table: &ModeDTable,
+    w_o_head: &[Vec<f32>],
+    restore_position: usize,
+    stratum: &str,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let hidden_size = weights.hidden_size;
+    larql_inference::vindex::predict_q4k_hidden_with_mapped_head_residual_delta(
+        weights,
+        token_ids,
+        index,
+        head.layer,
+        head.head,
+        |original_head| {
+            let mut replacement_delta = Vec::with_capacity(original_head.nrows() * hidden_size);
+            for pos in 0..original_head.nrows() {
+                let row = original_head.row(pos);
+                let values = row
+                    .as_slice()
+                    .ok_or("pre-W_O head row was not contiguous during position restore")?;
+                if pos == restore_position {
+                    let true_delta = project_head_vector_to_hidden(w_o_head, values);
+                    replacement_delta.extend_from_slice(&true_delta);
+                } else {
+                    let base_delta = base_pq_delta(
+                        values, basis, pca_basis, means, codebook, table, pos, stratum,
+                    );
+                    replacement_delta.extend_from_slice(&base_delta);
                 }
             }
             Array2::from_shape_vec((original_head.nrows(), hidden_size), replacement_delta)

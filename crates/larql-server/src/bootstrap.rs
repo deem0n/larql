@@ -70,6 +70,9 @@ pub struct LoadVindexOptions {
     /// precedence over `expert_filter` for `run_expert`'s ownership check
     /// and for the HNSW / Metal warmup loops.  Loaded from `--units` JSON.
     pub unit_filter: Option<Arc<std::collections::HashSet<(usize, usize)>>>,
+    /// Server-side remote MoE backend. When `Some`, the walk-ffn handler
+    /// delegates MoE expert dispatch to remote shard servers.
+    pub moe_remote: Option<Arc<larql_inference::ffn::RemoteMoeBackend>>,
 }
 
 /// JSON layout for the `--units` manifest.  Each value is a list of inclusive
@@ -324,6 +327,7 @@ pub fn load_single_vindex(
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
+        moe_remote: opts.moe_remote.clone(),
         #[cfg(feature = "metal-experts")]
         metal_backend: std::sync::OnceLock::new(),
         #[cfg(feature = "metal-experts")]
@@ -571,6 +575,18 @@ pub struct Cli {
     /// Required when the router enforces grid authentication.
     #[arg(long, env = "LARQL_GRID_KEY")]
     pub grid_key: Option<String>,
+
+    /// Server-side MoE expert shard map: `"START-END=URL,START-END=URL,..."`
+    /// The walk-ffn handler dispatches MoE expert calls to these remote servers.
+    /// Combine with --layers for full 2D (layer × expert) sharding.
+    /// Mutually exclusive with --moe-units-manifest.
+    #[arg(long)]
+    pub moe_shards: Option<String>,
+
+    /// Path to a JSON manifest for fine-grained per-(layer, expert) shard ownership.
+    /// Same format as `larql run --moe-units-manifest`. Mutually exclusive with --moe-shards.
+    #[arg(long, value_name = "PATH")]
+    pub moe_units_manifest: Option<PathBuf>,
 }
 
 // ── Server lifecycle ──────────────────────────────────────────────────────────
@@ -613,6 +629,53 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                 .len(),
         );
     }
+    // Build server-side MoE remote backend (--moe-shards or --moe-units-manifest).
+    if cli.moe_shards.is_some() && cli.moe_units_manifest.is_some() {
+        return Err("--moe-shards and --moe-units-manifest are mutually exclusive".into());
+    }
+    let moe_remote: Option<Arc<larql_inference::ffn::RemoteMoeBackend>> =
+        if let Some(ref s) = cli.moe_shards {
+            use larql_inference::ffn::moe_remote::ShardConfig;
+            let mut cfgs: Vec<ShardConfig> = Vec::new();
+            for segment in s.split(',') {
+                let segment = segment.trim();
+                if segment.is_empty() {
+                    continue;
+                }
+                let mut parts = segment.splitn(2, '=');
+                let range_str = parts.next().ok_or_else(|| -> BoxError {
+                    format!("malformed --moe-shards segment: {segment:?}").into()
+                })?;
+                let url = parts.next().ok_or_else(|| -> BoxError {
+                    format!("missing URL in --moe-shards segment: {segment:?}").into()
+                })?;
+                let (start, end_incl) =
+                    ShardConfig::parse_range(range_str).ok_or_else(|| -> BoxError {
+                        format!("bad expert range {range_str:?} in --moe-shards").into()
+                    })?;
+                cfgs.push(ShardConfig::new(start, end_incl, url));
+            }
+            if cfgs.is_empty() {
+                return Err("--moe-shards: no valid segments found".into());
+            }
+            let n = cfgs.len();
+            let backend = larql_inference::ffn::RemoteMoeBackend::connect(cfgs)
+                .map_err(|e| -> BoxError { format!("--moe-shards connect: {e}").into() })?;
+            info!("  MoE experts: remote ({n} shard(s) via --moe-shards)");
+            Some(Arc::new(backend))
+        } else if let Some(ref path) = cli.moe_units_manifest {
+            use larql_inference::ffn::moe_remote::parse_unit_manifest;
+            let cfgs = parse_unit_manifest(path)
+                .map_err(|e| -> BoxError { format!("--moe-units-manifest: {e}").into() })?;
+            let n = cfgs.len();
+            let backend = larql_inference::ffn::RemoteMoeBackend::connect(cfgs)
+                .map_err(|e| -> BoxError { format!("--moe-units-manifest connect: {e}").into() })?;
+            info!("  MoE experts: remote ({n} shard(s) via --moe-units-manifest)");
+            Some(Arc::new(backend))
+        } else {
+            None
+        };
+
     let load_opts = LoadVindexOptions {
         no_infer: cli.no_infer,
         ffn_only: cli.ffn_only,
@@ -629,6 +692,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         release_mmap_after_request: cli.release_mmap_after_request,
         expert_filter,
         unit_filter,
+        moe_remote,
     };
 
     if let Some(ref dir) = cli.dir {
@@ -1098,6 +1162,7 @@ mod tests {
             release_mmap_after_request: true,
             expert_filter: Some((3, 4)),
             unit_filter: None,
+            moe_remote: None,
         };
         let copied = opts.clone();
         assert!(copied.no_infer);

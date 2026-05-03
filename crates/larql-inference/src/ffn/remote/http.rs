@@ -369,6 +369,38 @@ impl FfnBackend for RemoteWalkBackend {
         (out, zeros)
     }
 
+    fn forward_moe_full_layer(
+        &self,
+        layer: usize,
+        h_post_attn: &Array2<f32>,
+    ) -> Option<Array2<f32>> {
+        let seq_len = h_post_attn.nrows();
+        let hidden = h_post_attn.ncols();
+        let residual: Vec<f32> = h_post_attn.iter().copied().collect();
+        let body = serde_json::json!({
+            "layer": layer,
+            "residual": residual,
+            "seq_len": seq_len,
+            "full_output": true,
+            "moe_layer": true,
+        });
+        let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
+        let resp = self.client.post(&url).json(&body).send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().ok()?;
+        let floats = v["output"]
+            .as_array()?
+            .iter()
+            .filter_map(|x| x.as_f64().map(|f| f as f32))
+            .collect::<Vec<f32>>();
+        if floats.len() != seq_len * hidden {
+            return None;
+        }
+        Array2::from_shape_vec((seq_len, hidden), floats).ok()
+    }
+
     fn name(&self) -> &str {
         "remote-walk"
     }

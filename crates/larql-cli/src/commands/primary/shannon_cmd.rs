@@ -30,6 +30,7 @@ const TOP_VALUE: u64 = (1u64 << CODE_BITS) - 1;
 const FIRST_QTR: u64 = TOP_VALUE / 4 + 1;
 const HALF: u64 = FIRST_QTR * 2;
 const THIRD_QTR: u64 = FIRST_QTR * 3;
+const VINDEX_BLOCK_TARGET_TOKENS: usize = 512;
 
 #[derive(Subcommand)]
 pub enum ShannonCommand {
@@ -133,7 +134,7 @@ pub struct EncodeArgs {
     bytes: Option<usize>,
 
     /// Previous tokens visible to the model for each arithmetic-code step.
-    /// Ignored when --vindex is used; the KV-cache path uses full context.
+    /// Ignored when --vindex is used; the KV-cache path uses 512-token blocks.
     #[arg(long, default_value_t = 256)]
     context: usize,
 
@@ -459,31 +460,48 @@ fn run_encode_vindex(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     eprintln!(
-        "encoding {} bytes as {} target tokens with KV-cached vindex...",
+        "encoding {} bytes as {} target tokens with KV-cached vindex blocks...",
         text.len(),
         ids.len() - 1
     );
     let pb = progress_bar((ids.len() - 1) as u64, "encoding");
-    let mut encoder = ArithmeticEncoder::new();
-    let forced = larql_inference::layer_graph::generate::stream_forced_full_logits(
-        &mut rt.weights,
-        ids[0],
-        ids.len() - 1,
-        &rt.index,
-        rt.backend.as_ref(),
-        |step, logits| {
-            let target = ids[step + 1];
-            let counts = quantized_counts(logits).map_err(|e| format!("quantize logits: {e}"))?;
-            let (low, high) =
-                interval_for_symbol(&counts, target).map_err(|e| format!("interval: {e}"))?;
-            encoder.encode(low, high, FREQ_TOTAL);
-            pb.inc(1);
-            Ok(target)
-        },
-    )?;
+    let mut blocks = Vec::new();
+    let mut prefill_ms = 0.0;
+    let mut decode_ms = Vec::new();
+    let mut start = 0usize;
+    while start + 1 < ids.len() {
+        let end = (start + VINDEX_BLOCK_TARGET_TOKENS + 1).min(ids.len());
+        let block_ids = &ids[start..end];
+        let mut encoder = ArithmeticEncoder::new();
+        let forced = larql_inference::layer_graph::generate::stream_forced_full_logits(
+            &mut rt.weights,
+            block_ids[0],
+            block_ids.len() - 1,
+            &rt.index,
+            rt.backend.as_ref(),
+            |step, logits| {
+                let target = block_ids[step + 1];
+                let counts =
+                    quantized_counts(logits).map_err(|e| format!("quantize logits: {e}"))?;
+                let (low, high) =
+                    interval_for_symbol(&counts, target).map_err(|e| format!("interval: {e}"))?;
+                encoder.encode(low, high, FREQ_TOTAL);
+                pb.inc(1);
+                Ok(target)
+            },
+        )?;
+        prefill_ms += forced.prefill_ms;
+        decode_ms.extend(forced.decode_ms);
+        blocks.push(VindexShannonBlock {
+            first_token: block_ids[0],
+            target_tokens: (block_ids.len() - 1) as u64,
+            payload: encoder.finish(),
+        });
+        start = end - 1;
+    }
     pb.finish_and_clear();
 
-    let payload = encoder.finish();
+    let payload = encode_vindex_blocks(&blocks);
     let blob = ShannonFile {
         // The vindex fast path is full-context within the GPU KV cache. Use
         // u32::MAX so old CPU decode treats this as "effectively unlimited"
@@ -510,9 +528,10 @@ fn run_encode_vindex(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>>
         "bits/char:       {:>10.3}",
         blob.payload.len() as f64 * 8.0 / chars
     );
-    println!("prefill:         {:>10.1} ms", forced.prefill_ms);
-    if !forced.decode_ms.is_empty() {
-        let avg = forced.decode_ms.iter().sum::<f64>() / forced.decode_ms.len() as f64;
+    println!("blocks:          {:>10}", blocks.len());
+    println!("prefill total:   {:>10.1} ms", prefill_ms);
+    if !decode_ms.is_empty() {
+        let avg = decode_ms.iter().sum::<f64>() / decode_ms.len() as f64;
         println!("decode avg:      {:>10.1} ms/token", avg);
     }
     println!("wrote: {}", args.out.display());
@@ -525,34 +544,50 @@ fn run_decode_vindex(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>>
     fs::File::open(&args.input)?.read_to_end(&mut raw)?;
     let blob = ShannonFile::from_bytes(&raw)?;
     let mut rt = load_vindex_runtime(vindex, args.metal)?;
-    let mut decoder = ArithmeticDecoder::new(&blob.payload);
+    let blocks = parse_vindex_blocks(&blob.payload)?.unwrap_or_else(|| {
+        vec![VindexShannonBlock {
+            first_token: blob.first_token,
+            target_tokens: blob.target_tokens,
+            payload: blob.payload.clone(),
+        }]
+    });
 
     eprintln!(
-        "decoding {} target tokens with KV-cached vindex...",
+        "decoding {} target tokens with KV-cached vindex blocks...",
         blob.target_tokens
     );
     let pb = progress_bar(blob.target_tokens, "decoding");
-    let forced = larql_inference::layer_graph::generate::stream_forced_full_logits(
-        &mut rt.weights,
-        blob.first_token,
-        blob.target_tokens as usize,
-        &rt.index,
-        rt.backend.as_ref(),
-        |_step, logits| {
-            let counts = quantized_counts(logits).map_err(|e| format!("quantize logits: {e}"))?;
-            let value = decoder.scaled_value(FREQ_TOTAL);
-            let (symbol, low, high) =
-                symbol_for_value(&counts, value).map_err(|e| format!("decode symbol: {e}"))?;
-            decoder.decode(low, high, FREQ_TOTAL);
-            pb.inc(1);
-            Ok(symbol)
-        },
-    )?;
+    let mut ids = Vec::with_capacity(blob.target_tokens as usize + 1);
+    let mut prefill_ms = 0.0;
+    let mut decode_ms = Vec::new();
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let mut decoder = ArithmeticDecoder::new(&block.payload);
+        let forced = larql_inference::layer_graph::generate::stream_forced_full_logits(
+            &mut rt.weights,
+            block.first_token,
+            block.target_tokens as usize,
+            &rt.index,
+            rt.backend.as_ref(),
+            |_step, logits| {
+                let counts =
+                    quantized_counts(logits).map_err(|e| format!("quantize logits: {e}"))?;
+                let value = decoder.scaled_value(FREQ_TOTAL);
+                let (symbol, low, high) =
+                    symbol_for_value(&counts, value).map_err(|e| format!("decode symbol: {e}"))?;
+                decoder.decode(low, high, FREQ_TOTAL);
+                pb.inc(1);
+                Ok(symbol)
+            },
+        )?;
+        if block_idx == 0 {
+            ids.push(block.first_token);
+        }
+        ids.extend_from_slice(&forced.forced_tokens);
+        prefill_ms += forced.prefill_ms;
+        decode_ms.extend(forced.decode_ms);
+    }
     pb.finish_and_clear();
 
-    let mut ids = Vec::with_capacity(forced.forced_tokens.len() + 1);
-    ids.push(blob.first_token);
-    ids.extend_from_slice(&forced.forced_tokens);
     let text = rt
         .tokenizer
         .decode(&ids, true)
@@ -560,9 +595,10 @@ fn run_decode_vindex(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>>
     fs::write(&args.out, text.as_bytes())?;
     println!("decoded:         {:>10} bytes", text.len());
     println!("expected:        {:>10} bytes", blob.original_bytes);
-    println!("prefill:         {:>10.1} ms", forced.prefill_ms);
-    if !forced.decode_ms.is_empty() {
-        let avg = forced.decode_ms.iter().sum::<f64>() / forced.decode_ms.len() as f64;
+    println!("blocks:          {:>10}", blocks.len());
+    println!("prefill total:   {:>10.1} ms", prefill_ms);
+    if !decode_ms.is_empty() {
+        let avg = decode_ms.iter().sum::<f64>() / decode_ms.len() as f64;
         println!("decode avg:      {:>10.1} ms/token", avg);
     }
     println!("wrote: {}", args.out.display());
@@ -1124,6 +1160,13 @@ struct ShannonFile {
     payload: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct VindexShannonBlock {
+    first_token: u32,
+    target_tokens: u64,
+    payload: Vec<u8>,
+}
+
 impl ShannonFile {
     fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(36 + self.payload.len());
@@ -1157,6 +1200,57 @@ impl ShannonFile {
             payload: bytes[36..].to_vec(),
         })
     }
+}
+
+fn encode_vindex_blocks(blocks: &[VindexShannonBlock]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"LSB1");
+    out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for block in blocks {
+        out.extend_from_slice(&block.first_token.to_le_bytes());
+        out.extend_from_slice(&block.target_tokens.to_le_bytes());
+        out.extend_from_slice(&(block.payload.len() as u64).to_le_bytes());
+        out.extend_from_slice(&block.payload);
+    }
+    out
+}
+
+fn parse_vindex_blocks(
+    bytes: &[u8],
+) -> Result<Option<Vec<VindexShannonBlock>>, Box<dyn std::error::Error>> {
+    if !bytes.starts_with(b"LSB1") {
+        return Ok(None);
+    }
+    if bytes.len() < 8 {
+        return Err("truncated vindex block payload".into());
+    }
+    let block_count = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    let mut offset = 8usize;
+    let mut blocks = Vec::with_capacity(block_count);
+    for _ in 0..block_count {
+        if bytes.len().saturating_sub(offset) < 20 {
+            return Err("truncated vindex block header".into());
+        }
+        let first_token = u32::from_le_bytes(bytes[offset..offset + 4].try_into()?);
+        offset += 4;
+        let target_tokens = u64::from_le_bytes(bytes[offset..offset + 8].try_into()?);
+        offset += 8;
+        let payload_len = u64::from_le_bytes(bytes[offset..offset + 8].try_into()?) as usize;
+        offset += 8;
+        if bytes.len().saturating_sub(offset) < payload_len {
+            return Err("truncated vindex block payload".into());
+        }
+        blocks.push(VindexShannonBlock {
+            first_token,
+            target_tokens,
+            payload: bytes[offset..offset + payload_len].to_vec(),
+        });
+        offset += payload_len;
+    }
+    if offset != bytes.len() {
+        return Err("trailing bytes after vindex block payload".into());
+    }
+    Ok(Some(blocks))
 }
 
 fn progress_bar(len: u64, label: &str) -> ProgressBar {
@@ -1213,5 +1307,32 @@ mod tests {
         assert_eq!(parsed.target_tokens, 42);
         assert_eq!(parsed.original_bytes, 100);
         assert_eq!(parsed.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn vindex_blocks_round_trip() {
+        let blocks = vec![
+            VindexShannonBlock {
+                first_token: 2,
+                target_tokens: 3,
+                payload: vec![1, 2, 3],
+            },
+            VindexShannonBlock {
+                first_token: 5,
+                target_tokens: 1,
+                payload: vec![8, 13],
+            },
+        ];
+
+        let encoded = encode_vindex_blocks(&blocks);
+        let parsed = parse_vindex_blocks(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].first_token, 2);
+        assert_eq!(parsed[0].target_tokens, 3);
+        assert_eq!(parsed[0].payload, vec![1, 2, 3]);
+        assert_eq!(parsed[1].first_token, 5);
+        assert_eq!(parsed[1].target_tokens, 1);
+        assert_eq!(parsed[1].payload, vec![8, 13]);
+        assert!(parse_vindex_blocks(&[1, 2, 3]).unwrap().is_none());
     }
 }

@@ -30,12 +30,25 @@ pub trait FfnBackend {
 
     /// Human-readable name for logging.
     fn name(&self) -> &str;
+
+    /// For hybrid MoE layers: receive `h_post_attn` (post-attention, pre-FFN,
+    /// unnormalized) and return the full layer output `h_out`. Returns `None`
+    /// to fall back to local dispatch.
+    fn forward_moe_full_layer(
+        &self,
+        _layer: usize,
+        _h_post_attn: &larql_vindex::ndarray::Array2<f32>,
+    ) -> Option<larql_vindex::ndarray::Array2<f32>> {
+        None
+    }
 }
 
 // ── Re-exports ──
 
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
-pub use remote::{RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend};
+pub use remote::{
+    LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
+};
 pub use sparse::SparseFfn;
 pub use sparse_compute::{
     sparse_ffn_forward, sparse_ffn_forward_with_full_overrides, sparse_ffn_forward_with_overrides,

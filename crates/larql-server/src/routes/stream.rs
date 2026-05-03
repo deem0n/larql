@@ -509,6 +509,7 @@ mod tests {
             ffn_l2_cache: FfnL2Cache::new(1),
             expert_filter: None,
             unit_filter: None,
+            moe_remote: None,
             #[cfg(feature = "metal-experts")]
             metal_backend: std::sync::OnceLock::new(),
             #[cfg(feature = "metal-experts")]

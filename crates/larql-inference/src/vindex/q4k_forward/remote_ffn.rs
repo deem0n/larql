@@ -67,6 +67,22 @@ pub fn predict_q4k_hidden_with_ffn(
         weights.tensors.insert(v_key.clone(), w_v.into_shared());
         weights.tensors.insert(o_key.clone(), w_o.into_shared());
 
+        // For hybrid MoE layers, try delegating the full layer to the remote
+        // backend (attention already done locally; server handles dense-FFN +
+        // expert dispatch + combine). Fall through to dense-only on None.
+        if weights.arch.is_hybrid_moe() {
+            if let Some(h_post_attn) = crate::forward::run_attention_public(weights, &h, layer) {
+                if let Some(h_out) = ffn_backend.forward_moe_full_layer(layer, &h_post_attn) {
+                    h = h_out;
+                    weights.tensors.remove(&q_key);
+                    weights.tensors.remove(&k_key);
+                    weights.tensors.remove(&v_key);
+                    weights.tensors.remove(&o_key);
+                    continue;
+                }
+            }
+        }
+
         let shared_kv = weights
             .arch
             .kv_shared_source_layer(layer)

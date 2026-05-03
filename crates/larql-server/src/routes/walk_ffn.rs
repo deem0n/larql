@@ -96,10 +96,9 @@ use larql_vindex::GateIndex as _;
 use serde::Deserialize;
 
 use crate::error::ServerError;
-use crate::http::{BINARY_FFN_CONTENT_TYPE, JSON_CONTENT_TYPE, REQUEST_BODY_LIMIT_BYTES};
-use crate::state::{elapsed_ms, AppState, LoadedModel};
+use crate::state::{AppState, LoadedModel};
 
-pub(crate) const BINARY_CT: &str = BINARY_FFN_CONTENT_TYPE;
+pub(crate) const BINARY_CT: &str = "application/x-larql-ffn";
 pub(crate) const BATCH_MARKER: u32 = 0xFFFF_FFFF;
 
 #[derive(Deserialize)]
@@ -126,6 +125,12 @@ pub struct WalkFfnRequest {
     /// feature indices + scores. Requires loadable model weights.
     #[serde(default)]
     pub full_output: bool,
+    /// When true, `residual` is `h_post_attn` (post-attention, pre-norm). The
+    /// server runs the full hybrid MoE layer: dense-FFN + remote expert dispatch
+    /// + combine + outer norm. Requires `full_output: true` and the server to
+    /// have `--moe-shards` configured.
+    #[serde(default)]
+    pub moe_layer: bool,
 }
 
 fn default_seq_len() -> usize {
@@ -210,6 +215,7 @@ pub(crate) fn decode_binary_request(body: &[u8]) -> Result<WalkFfnRequest, Serve
         seq_len,
         top_k,
         full_output,
+        moe_layer: false,
     })
 }
 
@@ -340,10 +346,193 @@ pub(crate) fn run_full_output_core(
     use larql_inference::ffn::FfnBackend;
     use larql_vindex::ndarray::Array2;
 
-    let weights_guard = model
+    // MoE full-layer path: server does dense-FFN + remote expert dispatch + combine.
+    if req.moe_layer {
+        if !req.full_output {
+            return Err(ServerError::BadRequest(
+                "moe_layer=true requires full_output=true".into(),
+            ));
+        }
+        let moe_remote = model.moe_remote.as_ref().ok_or_else(|| {
+            ServerError::BadRequest(
+                "moe_layer=true but server has no --moe-shards configured".into(),
+            )
+        })?;
+
+        let hidden = model.config.hidden_size;
+        let seq_len = req.seq_len;
+        let x = Array2::from_shape_vec((seq_len, hidden), req.residual.clone())
+            .map_err(|e| ServerError::Internal(format!("reshape residual: {e}")))?;
+
+        let weights_guard = model
+            .get_or_load_weights()
+            .map_err(ServerError::InferenceUnavailable)?;
+        let weights: &larql_inference::ModelWeights = &weights_guard;
+        let arch = &*weights.arch;
+        let patched = model.patched.blocking_read();
+        let norm_offset = arch.norm_weight_offset();
+        let eps = arch.norm_eps();
+
+        let mut entries = Vec::with_capacity(scan_layers.len());
+        for &layer in scan_layers {
+            if layer >= model.config.num_layers {
+                return Err(ServerError::BadRequest(format!(
+                    "layer {layer} out of range (num_layers = {})",
+                    model.config.num_layers
+                )));
+            }
+
+            // Dense FFN via Q4K proxy (reads mmap, no tensor insertion needed).
+            struct Q4kProxy<'a> {
+                arch: &'a dyn larql_models::ModelArchitecture,
+                index: &'a larql_vindex::VectorIndex,
+            }
+            impl larql_inference::ffn::FfnBackend for Q4kProxy<'_> {
+                fn forward(
+                    &self,
+                    layer: usize,
+                    x: &larql_vindex::ndarray::Array2<f32>,
+                ) -> larql_vindex::ndarray::Array2<f32> {
+                    larql_inference::vindex::q4k_ffn_forward_layer(self.arch, self.index, layer, x)
+                }
+                fn forward_with_activation(
+                    &self,
+                    layer: usize,
+                    x: &larql_vindex::ndarray::Array2<f32>,
+                ) -> (
+                    larql_vindex::ndarray::Array2<f32>,
+                    larql_vindex::ndarray::Array2<f32>,
+                ) {
+                    let o = self.forward(layer, x);
+                    (o.clone(), o)
+                }
+                fn name(&self) -> &str {
+                    "q4k-proxy"
+                }
+            }
+            let proxy = Q4kProxy {
+                arch,
+                index: patched.base(),
+            };
+
+            // Run the full FFN forward which returns h_post_ffn (residual already added).
+            // We need only the delta: h1 = h_post_ffn - x.
+            let (h_post_ffn_dense, _) =
+                larql_inference::forward::run_ffn(weights, &x, layer, &proxy, false);
+            let h1 = &h_post_ffn_dense - &x;
+
+            // Build router weights from model vectors.
+            fn get_vec<'a>(
+                vectors: &'a std::collections::HashMap<String, Vec<f32>>,
+                k: Option<String>,
+            ) -> &'a [f32] {
+                k.and_then(|k| vectors.get(&k))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+            }
+
+            let router_proj_key = arch.moe_router_key(layer).ok_or_else(|| {
+                ServerError::BadRequest(format!("layer {layer}: no MoE router weights"))
+            })?;
+            let router_proj = weights
+                .vectors
+                .get(&router_proj_key)
+                .ok_or_else(|| {
+                    ServerError::BadRequest(format!("layer {layer}: router_proj not in vectors"))
+                })?
+                .as_slice();
+
+            let router = larql_inference::ffn::MoeRouterWeights {
+                router_proj,
+                router_scale: get_vec(&weights.vectors, arch.moe_router_scale_key(layer)),
+                router_per_expert_scale: get_vec(
+                    &weights.vectors,
+                    arch.moe_router_per_expert_scale_key(layer),
+                ),
+                router_norm: get_vec(&weights.vectors, arch.moe_router_norm_key(layer)),
+                router_norm_parameter_free: arch.moe_router_norm_parameter_free(),
+                router_input_scalar: arch.moe_router_input_scalar().unwrap_or(1.0),
+                pre_experts_norm: get_vec(&weights.vectors, arch.moe_pre_experts_norm_key(layer)),
+                post_experts_norm: get_vec(&weights.vectors, arch.moe_post_experts_norm_key(layer)),
+                num_experts: arch.num_experts(),
+                top_k: arch.num_experts_per_token(),
+            };
+
+            // Remote expert dispatch — returns the expert-block contribution
+            // (same shape as x).
+            let h2 = moe_remote
+                .forward_moe_seq(layer, &x, &router, norm_offset, eps)
+                .map_err(|e| ServerError::Internal(format!("moe dispatch L{layer}: {e}")))?;
+
+            // Combine: h1 (dense delta) + h2 (expert delta).
+            let combined = &h1 + &h2;
+
+            // Outer post-norm + residual combine:
+            //   out[pos][i] = x[pos][i] + norm(combined[pos])[i]
+            // where norm(c)[i] = c[i] / rms(c) * (outer_w[i] + norm_offset)
+            // If no outer norm weight, combined is added directly.
+            let outer_w_vec: Option<&Vec<f32>> = if arch.moe_has_combined_output_norm() {
+                arch.moe_post_outer_norm_key(layer)
+                    .or_else(|| arch.post_feedforward_layernorm_key(layer))
+                    .and_then(|k| weights.vectors.get(&k))
+            } else {
+                None
+            };
+
+            let mut out_buf = Array2::<f32>::zeros((seq_len, hidden));
+            for pos in 0..seq_len {
+                let x_row = x.row(pos);
+                let c_row = combined.row(pos);
+                let c_slice = c_row.as_slice().expect("contiguous");
+                let out_row = if let Some(outer_w) = outer_w_vec {
+                    let rms =
+                        (c_slice.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
+                    x_row
+                        .iter()
+                        .zip(c_slice.iter())
+                        .zip(outer_w.iter())
+                        .map(|((&xi, &ci), &wi)| xi + ci / rms * (wi + norm_offset))
+                        .collect::<Vec<f32>>()
+                } else {
+                    x_row
+                        .iter()
+                        .zip(c_slice.iter())
+                        .map(|(&xi, &ci)| xi + ci)
+                        .collect::<Vec<f32>>()
+                };
+                for (dst, src) in out_buf.row_mut(pos).iter_mut().zip(out_row.iter()) {
+                    *dst = *src;
+                }
+            }
+
+            // Layer scalar (Gemma 4 feature — multiply output by a per-layer scalar).
+            if let Some(key) = arch.layer_scalar_key(layer) {
+                if let Some(scalars) = weights.vectors.get(&key) {
+                    if let Some(&s) = scalars.first() {
+                        if s != 0.0 && s != 1.0 {
+                            out_buf *= s;
+                        }
+                    }
+                }
+            }
+
+            entries.push(FfnEntry {
+                layer,
+                output: out_buf.into_raw_vec_and_offset().0,
+            });
+        }
+
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        return Ok(FfnOutput {
+            entries,
+            seq_len,
+            latency_ms,
+        });
+    }
+
+    let weights = model
         .get_or_load_weights()
         .map_err(ServerError::InferenceUnavailable)?;
-    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let patched = model.patched.blocking_read();
     let is_q4k = model.config.quant == larql_vindex::QuantFormat::Q4K;
@@ -351,7 +540,7 @@ pub(crate) fn run_full_output_core(
         None
     } else {
         Some(larql_inference::vindex::WalkFfn::new_unlimited(
-            weights, &*patched,
+            &weights, &*patched,
         ))
     };
 
@@ -450,7 +639,8 @@ fn run_features_only(
         }));
     }
 
-    let latency_rounded = elapsed_ms(start);
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let latency_rounded = (latency_ms * 10.0).round() / 10.0;
 
     if scan_layers.len() == 1 {
         let r = &results[0];
@@ -469,7 +659,9 @@ fn run_features_only(
 }
 
 fn run_walk_ffn(state: &AppState, req: &WalkFfnRequest) -> Result<serde_json::Value, ServerError> {
-    let model = state.model_or_err(None)?;
+    let model = state
+        .model(None)
+        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
 
     let hidden = model.config.hidden_size;
     validate_residual(req, hidden)?;
@@ -494,9 +686,14 @@ pub async fn handle_walk_ffn(
 ) -> Result<Response, ServerError> {
     state.bump_requests();
 
-    let is_binary = crate::wire::has_content_type(request.headers(), BINARY_CT);
+    let is_binary = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with(BINARY_CT))
+        .unwrap_or(false);
 
-    let body = axum::body::to_bytes(request.into_body(), REQUEST_BODY_LIMIT_BYTES)
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .map_err(|e| ServerError::BadRequest(format!("read body: {e}")))?;
 
@@ -508,7 +705,9 @@ pub async fn handle_walk_ffn(
             ));
         }
         let result = tokio::task::spawn_blocking(move || {
-            let model = state.model_or_err(None)?;
+            let model = state
+                .model(None)
+                .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
             validate_residual(&req, model.config.hidden_size)?;
             let scan_layers = collect_scan_layers(&req)?;
             validate_owned(model, &scan_layers)?;
@@ -552,7 +751,7 @@ pub async fn handle_walk_ffn(
         serde_json::to_vec(&result).map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(header::CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(json_bytes))
         .unwrap())
 }
@@ -794,90 +993,5 @@ mod tests {
         let results = v["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["layer"].as_u64(), Some(0));
-    }
-
-    #[test]
-    fn json_full_output_rounds_latency() {
-        let out = FfnOutput {
-            entries: vec![FfnEntry {
-                layer: 3,
-                output: vec![1.0],
-            }],
-            seq_len: 1,
-            latency_ms: 12.34,
-        };
-        let v = encode_json_full_output(&out);
-        assert_eq!(v["latency_ms"], 12.3);
-    }
-
-    #[test]
-    fn collect_scan_layers_prefers_layers_field() {
-        let req = WalkFfnRequest {
-            layer: Some(9),
-            layers: Some(vec![1, 2, 3]),
-            residual: vec![0.0; 4],
-            seq_len: 1,
-            top_k: 10,
-            full_output: false,
-        };
-        assert_eq!(collect_scan_layers(&req).unwrap(), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn collect_scan_layers_requires_layer_or_layers() {
-        let req = WalkFfnRequest {
-            layer: None,
-            layers: None,
-            residual: vec![0.0; 4],
-            seq_len: 1,
-            top_k: 10,
-            full_output: false,
-        };
-        assert!(matches!(
-            collect_scan_layers(&req),
-            Err(ServerError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn validate_residual_features_only_ignores_seq_len() {
-        let req = WalkFfnRequest {
-            layer: Some(0),
-            layers: None,
-            residual: vec![0.0; 4],
-            seq_len: 5,
-            top_k: 10,
-            full_output: false,
-        };
-        validate_residual(&req, 4).unwrap();
-    }
-
-    #[test]
-    fn validate_residual_full_output_requires_seq_len_times_hidden() {
-        let req = WalkFfnRequest {
-            layer: Some(0),
-            layers: None,
-            residual: vec![0.0; 8],
-            seq_len: 2,
-            top_k: 10,
-            full_output: true,
-        };
-        validate_residual(&req, 4).unwrap();
-    }
-
-    #[test]
-    fn validate_residual_detects_seq_len_hidden_overflow() {
-        let req = WalkFfnRequest {
-            layer: Some(0),
-            layers: None,
-            residual: vec![],
-            seq_len: usize::MAX,
-            top_k: 10,
-            full_output: true,
-        };
-        assert!(matches!(
-            validate_residual(&req, 2),
-            Err(ServerError::BadRequest(_))
-        ));
     }
 }

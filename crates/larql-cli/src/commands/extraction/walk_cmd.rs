@@ -26,7 +26,7 @@ fn rss_mb() -> f64 {
 use clap::Args;
 use larql_inference::{
     predict_with_ffn, predict_with_router, vindex::WalkFfn, InferenceModel, LayerFfnRouter,
-    ModelWeights, RemoteFfnConfig, RemoteWalkBackend, SparseFfn, WeightFfn,
+    LayerShardedBackend, ModelWeights, SparseFfn, WeightFfn,
 };
 use larql_vindex::{
     load_vindex_embeddings, load_vindex_tokenizer, ndarray, tokenizers, IndexLoadCallbacks,
@@ -605,10 +605,9 @@ fn run_predict_q4k_remote(
     let verbose = args.verbose;
     let url = args.ffn_remote.as_ref().expect("ffn_remote is set");
     let timeout = std::time::Duration::from_secs(args.ffn_remote_timeout_secs);
-    let config = RemoteFfnConfig::new(url).with_timeout(timeout);
 
     vlog!(verbose, "Connecting to remote FFN: {url}");
-    let remote = RemoteWalkBackend::connect(config)?;
+    let remote = LayerShardedBackend::connect(url, timeout)?;
     if remote.hidden_size() != weights.hidden_size {
         return Err(format!(
             "remote hidden_size {} != local hidden_size {} — client and server \
@@ -620,9 +619,9 @@ fn run_predict_q4k_remote(
     }
     vlog!(
         verbose,
-        "  connected: hidden={} url={}",
+        "  connected: hidden={} primary={}",
         remote.hidden_size(),
-        remote.base_url()
+        remote.primary_url()
     );
 
     // Build a fresh VectorIndex with the q4k attention mmap wired in.
@@ -887,10 +886,9 @@ fn run_predict_remote(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let verbose = args.verbose;
     let timeout = std::time::Duration::from_secs(args.ffn_remote_timeout_secs);
-    let config = RemoteFfnConfig::new(url).with_timeout(timeout);
 
     vlog!(verbose, "Connecting to remote FFN: {url}");
-    let remote = RemoteWalkBackend::connect(config)?;
+    let remote = LayerShardedBackend::connect(url, timeout)?;
     if remote.hidden_size() != weights.hidden_size {
         return Err(format!(
             "remote hidden_size {} != local attention hidden_size {} \
@@ -902,9 +900,9 @@ fn run_predict_remote(
     }
     vlog!(
         verbose,
-        "  connected: hidden={} url={}",
+        "  connected: hidden={} primary={}",
         remote.hidden_size(),
-        remote.base_url()
+        remote.primary_url()
     );
 
     let start = Instant::now();

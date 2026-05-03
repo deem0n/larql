@@ -81,6 +81,9 @@ pub struct LoadedModel {
     /// architecture where each shard hosts a tight set of (layer, expert)
     /// units rather than a contiguous expert range.
     pub unit_filter: Option<Arc<std::collections::HashSet<(usize, usize)>>>,
+    /// Remote MoE expert backend wired via `--moe-shards` or `--moe-units-manifest`.
+    /// When `Some`, the walk-ffn handler uses this for MoE layers instead of local dispatch.
+    pub moe_remote: Option<Arc<larql_inference::ffn::RemoteMoeBackend>>,
 
     /// Lazy-initialised Metal backend for GPU expert dispatch.
     /// `Some(Some(backend))` = initialised, available; `Some(None)` =
@@ -372,6 +375,7 @@ mod loaded_model_tests {
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             expert_filter: None,
             unit_filter: None,
+            moe_remote: None,
             #[cfg(feature = "metal-experts")]
             metal_backend: std::sync::OnceLock::new(),
             #[cfg(feature = "metal-experts")]

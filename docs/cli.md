@@ -135,10 +135,11 @@ larql shannon decode google/gemma-3-4b-it --vindex ./gemma-q4k.vindex --metal --
 Without `--vindex`, `encode` / `decode` rerun the dense model for each
 recovered token and are intended only for short excerpts. With `--vindex
 --metal`, Q4K vindexes use the Metal KV-cache path and a full-vocabulary
-LM-head query for each forced token, which makes the arithmetic-code demo
-practical for longer clips. The payload is real entropy-coded data; the file
-also includes a small header with the first token, token count, original byte
-count, context size, and payload length.
+LM-head query for each forced token. The vindex codec is segmented into
+512-token arithmetic blocks so encode/decode stay byte-exact despite tiny GPU
+float drift. The payload is real entropy-coded data; the file also includes a
+small header with the first token, token count, original byte count, context
+size, and payload length.
 
 ### `larql pull`
 
