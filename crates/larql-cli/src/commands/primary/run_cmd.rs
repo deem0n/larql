@@ -377,9 +377,19 @@ fn run_with_moe_shards(
         return Err("internal error: run_with_moe_shards called with neither flag".into());
     };
 
-    eprintln!("Connecting to {} MoE shard(s)…", configs.len());
+    let num_shards = configs.len();
+    // Initialise compute backend early so we can report it in the topology banner.
+    let backend = larql_compute::default_backend();
+    eprintln!("Connecting to {} MoE shard(s)…", num_shards);
     let remote = RemoteMoeBackend::connect(configs)
         .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;
+    eprintln!("  Attention:  {} (local)", backend.name());
+    eprintln!("  Router:     local");
+    eprintln!(
+        "  Experts:    remote  (sharded across {} endpoint{})",
+        num_shards,
+        if num_shards == 1 { "" } else { "s" }
+    );
 
     // Client loads attn + dense FFN + norms + router weights — no expert bytes.
     let mut cb = larql_vindex::SilentLoadCallbacks;
@@ -396,9 +406,6 @@ fn run_with_moe_shards(
         .load_interleaved_q4k(vindex_path)
         .map_err(|e| format!("failed to load interleaved Q4K: {e}"))?;
     let _ = index.load_lm_head_q4(vindex_path);
-
-    // Metal: attention + dense FFN on GPU; MoE experts dispatched to shards.
-    let backend = larql_compute::default_backend();
 
     // Prompt-shape options (centralised in `larql_inference::chat::render_user_prompt`):
     //   default              → chat_template.jinja with auto-injected default system prompt for Gemma 4
@@ -445,9 +452,29 @@ fn run_with_moe_shards(
     let n = result.decode_ms.len();
     if n > 0 {
         let avg = result.decode_ms.iter().sum::<f64>() / n as f64;
+        let tok_s = 1000.0 / avg;
+        let num_layers = weights.num_layers;
+        let hidden = weights.hidden_size;
+        let top_k = weights.arch.num_experts_per_token();
+        let experts_invoked = num_layers * top_k * n;
+        // One f32 residual vector per layer per shard in each direction.
+        let bytes_per_token = num_layers * num_shards * hidden * std::mem::size_of::<f32>();
+        let kb = |b: usize| b as f64 / 1024.0;
+        eprintln!();
+        eprintln!("  decode:          {tok_s:.1} tok/s");
         eprintln!(
-            "[grid] {n} tokens · {avg:.0} ms/tok · {:.1} tok/s",
-            1000.0 / avg
+            "  experts invoked: {experts_invoked}  ({num_layers} layers × top-{top_k} × {n} token{})",
+            if n == 1 { "" } else { "s" }
+        );
+        eprintln!(
+            "  bytes sent:      ~{:.0} KB  ({num_layers} layers × {num_shards} shard{} × hidden × f32)",
+            kb(bytes_per_token * n),
+            if num_shards == 1 { "" } else { "s" }
+        );
+        eprintln!(
+            "  bytes recv:      ~{:.0} KB  ({num_layers} layers × {num_shards} shard{} × hidden × f32)",
+            kb(bytes_per_token * n),
+            if num_shards == 1 { "" } else { "s" }
         );
     }
     Ok(())

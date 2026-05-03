@@ -63,7 +63,7 @@ pub(super) struct OraclePqExceptionArgs {
     #[arg(long, default_value = "1.0,0.25,0.1")]
     tail_fracs: String,
 
-    /// Training-position selector for exception fitting: residual-error, prompt-kl, or position-restore-kl.
+    /// Training-position selector for exception fitting: residual-error, prompt-kl, position-restore-kl, or position-restore-ce.
     #[arg(long, default_value = "residual-error")]
     tail_selector: String,
 
@@ -133,6 +133,7 @@ enum TailSelector {
     ResidualError,
     PromptKl,
     PositionRestoreKl,
+    PositionRestoreCe,
 }
 
 impl TailSelector {
@@ -141,8 +142,9 @@ impl TailSelector {
             "residual-error" => Ok(Self::ResidualError),
             "prompt-kl" => Ok(Self::PromptKl),
             "position-restore-kl" => Ok(Self::PositionRestoreKl),
+            "position-restore-ce" => Ok(Self::PositionRestoreCe),
             other => Err(format!(
-                "invalid --tail-selector '{other}', expected residual-error, prompt-kl, or position-restore-kl"
+                "invalid --tail-selector '{other}', expected residual-error, prompt-kl, position-restore-kl, or position-restore-ce"
             )
             .into()),
         }
@@ -153,7 +155,12 @@ impl TailSelector {
             Self::ResidualError => "residual-error",
             Self::PromptKl => "prompt-kl",
             Self::PositionRestoreKl => "position-restore-kl",
+            Self::PositionRestoreCe => "position-restore-ce",
         }
+    }
+
+    fn is_position_restore(self) -> bool {
+        matches!(self, Self::PositionRestoreKl | Self::PositionRestoreCe)
     }
 }
 
@@ -326,7 +333,7 @@ pub(super) fn run_oracle_pq_exception(
     } else {
         HashMap::new()
     };
-    let position_scores = if tail_selector == TailSelector::PositionRestoreKl {
+    let position_scores = if tail_selector.is_position_restore() {
         eprintln!("Measuring position-local restore gains for exception selection");
         measure_fit_position_restore_gains(
             &mut weights,
@@ -341,6 +348,7 @@ pub(super) fn run_oracle_pq_exception(
             &base_tables,
             &w_o_heads,
             base_config,
+            tail_selector,
             args.position_candidates_per_prompt,
         )?
     } else {
@@ -648,6 +656,9 @@ fn fit_exception_catalogs(
                             TailSelector::PositionRestoreKl => *position_scores
                                 .get(&(*head, prompt_idx, pos))
                                 .unwrap_or(&0.0),
+                            TailSelector::PositionRestoreCe => *position_scores
+                                .get(&(*head, prompt_idx, pos))
+                                .unwrap_or(&0.0),
                         };
                         samples
                             .get_mut(head)
@@ -809,6 +820,7 @@ fn measure_fit_position_restore_gains(
     tables: &HashMap<(HeadId, PqConfig), ModeDTable>,
     w_o_heads: &HashMap<HeadId, Vec<Vec<f32>>>,
     base_config: PqConfig,
+    tail_selector: TailSelector,
     candidates_per_prompt: usize,
 ) -> Result<HashMap<(HeadId, usize, usize), f64>, Box<dyn std::error::Error>> {
     let mut scores = HashMap::new();
@@ -833,6 +845,7 @@ fn measure_fit_position_restore_gains(
             larql_inference::vindex::predict_q4k_hidden(weights, &token_ids, index, None);
         let baseline_logits = final_logits(weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
+        let baseline_top1 = argmax(&baseline_logits);
 
         for head in heads {
             let basis = bases
@@ -861,6 +874,7 @@ fn measure_fit_position_restore_gains(
             let base_logits = final_logits(weights, &base_hidden);
             let base_logp = log_softmax(&base_logits);
             let base_kl = kl_logp(&baseline_logp, &base_logp);
+            let base_ce = -token_prob(&base_logp, baseline_top1).ln();
 
             let mut candidates = capture_head_position_sq_errors(
                 weights, index, &token_ids, *head, basis, pca_basis, head_means, codebook, table,
@@ -876,8 +890,18 @@ fn measure_fit_position_restore_gains(
                 )?;
                 let restored_logits = final_logits(weights, &restored_hidden);
                 let restored_logp = log_softmax(&restored_logits);
-                let restored_kl = kl_logp(&baseline_logp, &restored_logp);
-                let gain = (base_kl - restored_kl).max(0.0);
+                let gain = match tail_selector {
+                    TailSelector::PositionRestoreKl => {
+                        let restored_kl = kl_logp(&baseline_logp, &restored_logp);
+                        base_kl - restored_kl
+                    }
+                    TailSelector::PositionRestoreCe => {
+                        let restored_ce = -token_prob(&restored_logp, baseline_top1).ln();
+                        base_ce - restored_ce
+                    }
+                    TailSelector::ResidualError | TailSelector::PromptKl => 0.0,
+                }
+                .max(0.0);
                 scores.insert((*head, prompt_idx, position), gain);
             }
         }

@@ -3,6 +3,7 @@ mod basis;
 mod capture;
 pub mod cmd;
 mod edit_catalog;
+mod gamma_address;
 mod input;
 mod metrics;
 mod oracle;

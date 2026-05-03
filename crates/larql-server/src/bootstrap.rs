@@ -306,6 +306,7 @@ pub fn load_single_vindex(
 
     if let Some((start, end)) = opts.expert_filter {
         info!("  Experts: {start}–{end} (shard filter)");
+        info!("  Endpoints: POST /v1/expert/batch, /v1/experts/layer-batch, GET /v1/stats");
     }
 
     let num_layers = config.num_layers;

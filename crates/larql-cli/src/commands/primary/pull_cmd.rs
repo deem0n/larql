@@ -62,6 +62,12 @@ pub struct PullArgs {
     /// align, override only if you changed `publish --slice-repo-template`.
     #[arg(long, default_value = DEFAULT_SIBLING_TEMPLATE)]
     pub sibling_template: String,
+
+    /// Download the vindex to this path instead of the default local cache.
+    /// Useful for container deployments where weights live on a mounted volume.
+    /// If the path already exists it is left unchanged (idempotent).
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<std::path::PathBuf>,
 }
 
 pub fn run(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -81,10 +87,10 @@ pub fn run(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref preset) = args.preset {
         let sibling = render_sibling_repo(model, preset, &args.sibling_template)?;
         eprintln!("Resolving --preset {preset} → {sibling}");
-        return pull_one(&sibling, /*print_siblings=*/ false);
+        return pull_one(&sibling, /*print_siblings=*/ false, None);
     }
 
-    pull_one(model, /*print_siblings=*/ true)
+    pull_one(model, /*print_siblings=*/ true, args.output.as_deref())
 }
 
 /// HuggingFace repos look like `owner/name` — exactly one `/`, neither
@@ -156,12 +162,62 @@ fn download_with_indicatif(hf_path: &str) -> Result<PathBuf, larql_vindex::Vinde
     })
 }
 
+/// Recursively copy a directory tree (used when rename() crosses filesystems).
+fn copy_dir_all(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dst_path = dst.join(entry.file_name());
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve + download a single repo, then optionally probe for siblings.
-fn pull_one(model: &str, print_siblings: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn pull_one(
+    model: &str,
+    print_siblings: bool,
+    output: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // If --output is set and already populated, skip the download.
+    if let Some(out) = output {
+        if out.join("index.json").exists() {
+            eprintln!(
+                "Vindex already present at {} — skipping download.",
+                out.display()
+            );
+            return Ok(());
+        }
+    }
+
     let hf_path = normalise_hf_path(model)?;
     eprintln!("Pulling {hf_path}...");
     let cached: PathBuf = download_with_indicatif(&hf_path)?;
     eprintln!("Cached at: {}", cached.display());
+
+    // If --output is set, move the downloaded vindex to the requested path.
+    if let Some(out) = output {
+        if out != cached.as_path() {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Try rename first (fast, same filesystem); fall back to copy.
+            if std::fs::rename(&cached, out).is_err() {
+                eprintln!("Rename failed (cross-device?), copying...");
+                copy_dir_all(&cached, out)?;
+            }
+            eprintln!("Vindex available at: {}", out.display());
+            return Ok(());
+        }
+    }
 
     if let Ok(cfg) = larql_vindex::load_vindex_config(&cached) {
         eprintln!(
@@ -224,7 +280,7 @@ fn pull_collection(slug_or_url: &str) -> Result<(), Box<dyn std::error::Error>> 
 /// Pull the full repo + every default sibling preset. Missing siblings
 /// log a warning; only the full repo is hard-required.
 fn pull_all_slices(model: &str, template: &str) -> Result<(), Box<dyn std::error::Error>> {
-    pull_one(model, /*print_siblings=*/ false)?;
+    pull_one(model, /*print_siblings=*/ false, None)?;
     for preset in DEFAULT_SIBLING_PRESETS {
         let sibling = match render_sibling_repo(model, preset, template) {
             Ok(s) => s,
@@ -234,7 +290,7 @@ fn pull_all_slices(model: &str, template: &str) -> Result<(), Box<dyn std::error
             }
         };
         eprintln!("\n→ Pulling sibling `{preset}` ({sibling})");
-        if let Err(e) = pull_one(&sibling, /*print_siblings=*/ false) {
+        if let Err(e) = pull_one(&sibling, /*print_siblings=*/ false, None) {
             eprintln!("  skipped: {e}");
         }
     }

@@ -44,6 +44,9 @@ pub enum Part {
     Gate,
     DownMeta,
     Ffn,
+    /// Per-layer Q4K expert weight directory (`layers/layer_XX.weights`).
+    /// Required for MoE expert-server deployment.
+    ExpertLayers,
     LmHead,
     Router,
     Tokenizer,
@@ -61,6 +64,9 @@ impl Part {
             "gate" | "gate_vectors" | "gates" => Some(Self::Gate),
             "down_meta" | "meta" => Some(Self::DownMeta),
             "ffn" | "interleaved" | "up_down" => Some(Self::Ffn),
+            "expert_layers" | "expert-layers" | "layers" | "expert_weights" => {
+                Some(Self::ExpertLayers)
+            }
             "lm_head" | "lmhead" => Some(Self::LmHead),
             "router" | "router_weights" => Some(Self::Router),
             "tokenizer" | "tok" => Some(Self::Tokenizer),
@@ -82,12 +88,13 @@ impl Part {
             Self::Gate => filename == GATE_VECTORS_BIN || filename.starts_with("gate_vectors_"),
             Self::DownMeta => filename == DOWN_META_BIN || filename == "down_meta.jsonl",
             Self::Ffn => {
-                filename.starts_with("interleaved")
+                (filename.starts_with("interleaved") && !is_backup(filename))
                     || filename == UP_WEIGHTS_BIN
                     || filename == DOWN_WEIGHTS_BIN
                     || filename == UP_FEATURES_BIN
                     || filename == DOWN_FEATURES_BIN
             }
+            Self::ExpertLayers => false, // directory, handled by slice_vindex directly
             Self::LmHead => filename.starts_with("lm_head"),
             Self::Router => filename == "router_weights.bin",
             Self::Tokenizer => filename == TOKENIZER_JSON,
@@ -131,13 +138,29 @@ pub fn preset_parts(preset: &str) -> Result<BTreeSet<Part>, String> {
         ],
         "browse" => &[Embed, Gate, DownMeta, Tokenizer, Labels, Readme],
         "router" => &[Router, Tokenizer, Manifest, Labels, Readme],
+        "expert-server" | "expert_server" | "moe-server" => {
+            // Embed + Norms required: load_single_vindex unconditionally opens
+            // embeddings.bin and norms.bin even for expert-only servers.
+            &[Embed, Norms, ExpertLayers, Tokenizer, Manifest]
+        }
         "all" => &[
-            Embed, Norms, Attn, Gate, DownMeta, Ffn, LmHead, Router, Tokenizer, Manifest, Labels,
+            Embed,
+            Norms,
+            Attn,
+            Gate,
+            DownMeta,
+            Ffn,
+            ExpertLayers,
+            LmHead,
+            Router,
+            Tokenizer,
+            Manifest,
+            Labels,
             Readme,
         ],
         other => {
             return Err(format!(
-                "unknown preset '{other}'. Expected: client, attn, embed, server, browse, router, all"
+                "unknown preset '{other}'. Expected: client, attn, embed, server, browse, router, expert-server, all"
             ));
         }
     };
@@ -158,7 +181,8 @@ pub struct SliceArgs {
     /// Comma-separated parts to include.
     ///
     /// Valid names: `embed`, `norms`, `attn`, `gate`, `down_meta`, `ffn`,
-    /// `lm_head`, `router`, `tokenizer`, `manifest`, `labels`, `readme`.
+    /// `expert_layers` / `layers`, `lm_head`, `router`, `tokenizer`,
+    /// `manifest`, `labels`, `readme`.
     /// `index.json` is always copied.
     ///
     /// Mutually compatible with `--preset` (the union is taken).
@@ -166,13 +190,14 @@ pub struct SliceArgs {
     pub parts: Vec<String>,
 
     /// Preset that expands to a part list:
-    ///   * `client`  — attn + embed + norms + tokenizer (2-tier; pairs with `larql run --ffn URL`)
-    ///   * `attn`    — attn + norms only (3-tier; pairs with `larql run --embed URL --ffn URL`, ADR-0008)
-    ///   * `embed`   — embed + tokenizer (embed-server slice; pairs with `larql serve --embed-only`)
-    ///   * `server`  — gate + ffn + down_meta + embed + norms + tokenizer (pairs with `larql serve --ffn-only`)
-    ///   * `browse`  — gate + embed + down_meta (no forward pass)
-    ///   * `router`  — router_weights + tokenizer (MoE router; dense models error out)
-    ///   * `all`     — every part (full vindex, useful for `--force` clones)
+    ///   * `client`         — attn + embed + norms + tokenizer (2-tier; pairs with `larql run --ffn URL`)
+    ///   * `attn`           — attn + norms only (3-tier; pairs with `larql run --embed URL --ffn URL`, ADR-0008)
+    ///   * `embed`          — embed + tokenizer (embed-server slice; pairs with `larql serve --embed-only`)
+    ///   * `server`         — gate + ffn + down_meta + embed + norms + tokenizer (pairs with `larql serve --ffn-only`)
+    ///   * `browse`         — gate + embed + down_meta (no forward pass)
+    ///   * `router`         — router_weights + tokenizer (MoE router; dense models error out)
+    ///   * `expert-server`  — norms + expert_layers (layers/) + tokenizer + manifest (CPU MoE expert server; fly.io deploy)
+    ///   * `all`            — every part (full vindex, useful for `--force` clones)
     #[arg(long)]
     pub preset: Option<String>,
 
@@ -234,7 +259,7 @@ pub fn slice_vindex(
         return Err("--output must differ from source vindex".into());
     }
 
-    // Enumerate source files.
+    // Enumerate source files (flat files only; layers/ handled separately below).
     let mut copied: Vec<(String, u64)> = Vec::new();
     let mut copy_paths: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -257,6 +282,29 @@ pub fn slice_vindex(
             skipped.push(name);
         }
     }
+
+    // Enumerate layers/ entries so they appear in copied / total_bytes
+    // and are included in the dry-run report.
+    let want_expert_layers = parts.contains(&Part::ExpertLayers);
+    let mut layer_copy_pairs: Vec<(PathBuf, PathBuf)> = Vec::new(); // (src, dst)
+    if want_expert_layers {
+        let layers_src = src.join("layers");
+        if layers_src.is_dir() {
+            for entry in std::fs::read_dir(&layers_src)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if !meta.is_file() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_string();
+                let dst_path = dst.join("layers").join(&name);
+                copied.push((format!("layers/{name_str}"), meta.len()));
+                layer_copy_pairs.push((entry.path(), dst_path));
+            }
+        }
+    }
+
     copied.sort_by(|a, b| a.0.cmp(&b.0));
     copy_paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     skipped.sort();
@@ -306,6 +354,14 @@ pub fn slice_vindex(
             std::fs::write(&dst_path, json)?;
         } else {
             std::fs::copy(src_path, &dst_path)?;
+        }
+    }
+
+    // Copy layers/ directory if ExpertLayers part is requested.
+    if !layer_copy_pairs.is_empty() {
+        std::fs::create_dir_all(dst.join("layers"))?;
+        for (src_path, dst_path) in &layer_copy_pairs {
+            std::fs::copy(src_path, dst_path)?;
         }
     }
 
@@ -411,6 +467,10 @@ fn effective_level(
     candidate.min(source_level)
 }
 
+fn is_backup(filename: &str) -> bool {
+    filename.ends_with(".bak") || filename.ends_with(".tmp") || filename.ends_with(".orig")
+}
+
 fn part_name(p: &Part) -> &'static str {
     match p {
         Part::Embed => "embed",
@@ -419,6 +479,7 @@ fn part_name(p: &Part) -> &'static str {
         Part::Gate => "gate",
         Part::DownMeta => "down_meta",
         Part::Ffn => "ffn",
+        Part::ExpertLayers => "expert_layers",
         Part::LmHead => "lm_head",
         Part::Router => "router",
         Part::Tokenizer => "tokenizer",

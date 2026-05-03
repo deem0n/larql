@@ -27,7 +27,7 @@ use crate::layer_graph::generate::eos::EosConfig;
 use crate::layer_graph::generate::lm_head_topk as lm_topk;
 use crate::layer_graph::pipeline_layer::{
     attention_geometry_for_arch_layer, build_pipeline_layers, kv_cache_shapes_for_arch,
-    DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+    patch_pipeline_layers_for_remote_moe, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
 };
 
 /// IDs of tokens that should never be picked during text generation.
@@ -439,7 +439,7 @@ pub fn generate_with_remote_moe(
         .packed_matrix_bytes(intermediate, hidden)
         .ok_or_else(|| RemoteMoeError::BadResponse("unsupported interleaved FFN format".into()))?;
 
-    let layers = build_pipeline_layers(
+    let mut layers = build_pipeline_layers(
         weights,
         index,
         0..num_layers,
@@ -447,6 +447,11 @@ pub fn generate_with_remote_moe(
         q4_ffn_per_matrix,
         ffn_format,
     );
+    // Client-only vindexes (--moe-shards without local expert bytes) have
+    // layer.moe = None for every layer, so has_moe = false and moe_fn would
+    // never be called.  Inject stubs so the Metal decode knows to dispatch to
+    // moe_fn (the remote shard callback) instead of local cpu_moe_forward.
+    patch_pipeline_layers_for_remote_moe(&mut layers, weights);
 
     let attention = attention_geometry_for_arch_layer(weights, 0);
 
@@ -864,7 +869,7 @@ pub fn generate_with_remote_moe_batch(
     let q4_ffn_per_matrix = ffn_format
         .packed_matrix_bytes(intermediate, hidden)
         .ok_or_else(|| RemoteMoeError::BadResponse("unsupported interleaved FFN format".into()))?;
-    let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
+    let mut layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
         weights,
         index,
         0..num_layers,
@@ -872,6 +877,7 @@ pub fn generate_with_remote_moe_batch(
         q4_ffn_per_matrix,
         ffn_format,
     );
+    patch_pipeline_layers_for_remote_moe(&mut layers, weights);
 
     let attention = attention_geometry_for_arch_layer(weights, 0);
 

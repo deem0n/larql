@@ -106,35 +106,58 @@ pub fn publish_vindex_with_opts(
         std::collections::HashMap::new()
     };
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(vindex_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
-    files.sort();
+    // Collect files from the root and any immediate subdirectories (e.g. layers/).
+    let mut files: Vec<(PathBuf, String)> = Vec::new(); // (abs_path, repo_path)
+    for entry in std::fs::read_dir(vindex_dir)?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            files.push((path, name));
+        } else if path.is_dir() {
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            for sub in std::fs::read_dir(&path)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+            {
+                let sub_path = sub.path();
+                if sub_path.is_file() {
+                    let sub_name = sub_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    files.push((sub_path, format!("{dir_name}/{sub_name}")));
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| a.1.cmp(&b.1));
 
-    for file_path in &files {
-        let filename = file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+    for (file_path, filename) in &files {
         let size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
 
         // Skip-if-unchanged: compare local SHA256 against remote lfs.oid.
         if opts.skip_unchanged {
-            if let Some(remote_sha) = remote_lfs.get(&filename) {
+            if let Some(remote_sha) = remote_lfs.get(filename) {
                 if let Ok(local_sha) = crate::format::checksums::sha256_file(file_path) {
                     if local_sha == *remote_sha {
-                        callbacks.on_file_skipped(&filename, size, remote_sha);
+                        callbacks.on_file_skipped(filename, size, remote_sha);
                         continue;
                     }
                 }
             }
         }
 
-        callbacks.on_file_start(&filename, size);
-        upload_file_to_hf(repo_id, &token, file_path, &filename, callbacks, repo_type)?;
-        callbacks.on_file_done(&filename);
+        callbacks.on_file_start(filename, size);
+        upload_file_to_hf(repo_id, &token, file_path, filename, callbacks, repo_type)?;
+        callbacks.on_file_done(filename);
     }
 
     let url = hf_repo_url(repo_type, repo_id);

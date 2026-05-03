@@ -149,6 +149,8 @@ input.rs           prompt loading, held-out splits, and CLI string parsers
 metrics.rs         KL, entropy, top-k, and distribution helpers
 oracle.rs          roundtrip and low-rank oracle checks
 edit_catalog.rs    full-vector residual-edit catalogue diagnostics in hidden/PCA space
+gamma_address.rs   gamma-aligned supervised address probes over raw layer input
+                  and diagonal-affine projections toward later residual states
 oracle_pq.rs       PQ experiment orchestration and address probe evaluation
 oracle_pq_address.rs
                   address-probe, previous-FFN feature-key, attention-relation-key,
@@ -165,8 +167,8 @@ oracle_pq_stability.rs
                   PQ code distribution stability diagnostics
 pq.rs              PQ codebooks, Mode D tables, and k-means mechanics
 pq_exception.rs    base-PQ-plus-exception residual catalogue diagnostics, with
-                  residual-error/prompt-KL/position-restore tail selectors
-                  and k-means/exemplar fits
+                  residual-error/prompt-KL/position-restore-KL/CE tail
+                  selectors and k-means/exemplar fits
 reports.rs         JSON artifact schemas
 runtime.rs         thin shim over inference Q4K tensor insertion/removal
 sanity.rs          no-op/subtract/residual-delta equivalence checks

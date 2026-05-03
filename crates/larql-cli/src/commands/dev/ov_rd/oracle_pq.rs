@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use super::address::{attention_relation_key, prev_ffn_feature_key};
 use super::basis::*;
+use super::gamma_address::fit_gamma_projected_address_models;
 use super::input::*;
 use super::metrics::*;
 use super::oracle_pq_address::{
@@ -159,6 +160,22 @@ pub(super) struct OraclePqArgs {
     /// L2 weight decay for supervised binary-hyperplane group address probes.
     #[arg(long, default_value_t = 1e-4)]
     address_supervised_l2: f32,
+
+    /// Fit and evaluate supervised group address probes after a diagonal
+    /// affine gamma-alignment projection from the layer input toward later
+    /// post-layer residual snapshots.
+    #[arg(long)]
+    address_gamma_projected_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-gamma-projected-group-probe.
+    #[arg(long, default_value = "0")]
+    address_gamma_projected_groups: String,
+
+    /// Comma-separated post-layer residual snapshots used as gamma-alignment
+    /// targets, e.g. 20,26,29,33. The raw layer-input supervised probe is
+    /// always included as gamma_raw for comparison.
+    #[arg(long, default_value = "20,26,29,33")]
+    address_gamma_projected_layers: String,
 
     /// Report train/eval PQ code distribution stability for selected groups.
     #[arg(long)]
@@ -362,6 +379,51 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                 if group >= config.groups {
                     return Err(format!(
                         "--address-supervised-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut gamma_projected_groups = parse_usize_list(&args.address_gamma_projected_groups)?;
+    gamma_projected_groups.sort_unstable();
+    gamma_projected_groups.dedup();
+    let mut gamma_projected_layers = parse_usize_list(&args.address_gamma_projected_layers)?;
+    gamma_projected_layers.sort_unstable();
+    gamma_projected_layers.dedup();
+    if args.address_gamma_projected_group_probe {
+        if gamma_projected_groups.is_empty() {
+            return Err("--address-gamma-projected-group-probe requires at least one --address-gamma-projected-groups value".into());
+        }
+        if gamma_projected_layers.is_empty() {
+            return Err("--address-gamma-projected-layers must include at least one layer".into());
+        }
+        for &layer in &gamma_projected_layers {
+            if layer >= weights.num_layers {
+                return Err(format!(
+                    "--address-gamma-projected-layers includes layer {layer}, but the model has only {} layers",
+                    weights.num_layers
+                )
+                .into());
+            }
+        }
+        for head in &selected_heads {
+            for &layer in &gamma_projected_layers {
+                if layer < head.layer {
+                    return Err(format!(
+                        "--address-gamma-projected-layers includes post-L{layer}, before target L{}H{}",
+                        head.layer, head.head
+                    )
+                    .into());
+                }
+            }
+        }
+        for config in &configs {
+            for &group in &gamma_projected_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-gamma-projected-groups includes group {group}, but config {:?} has only {} groups",
                         config, config.groups
                     )
                     .into());
@@ -638,6 +700,37 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     } else {
         HashMap::new()
     };
+    let address_gamma_projected_models = if args.address_gamma_projected_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-gamma-projected-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting gamma-projected supervised group address probes for groups {:?} (post_layers={:?}, epochs={}, lr={}, l2={})",
+            gamma_projected_groups,
+            gamma_projected_layers,
+            args.address_supervised_epochs,
+            args.address_supervised_lr,
+            args.address_supervised_l2
+        );
+        fit_gamma_projected_address_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &gamma_projected_groups,
+            &gamma_projected_layers,
+            args.address_supervised_epochs,
+            args.address_supervised_lr,
+            args.address_supervised_l2,
+        )?
+    } else {
+        HashMap::new()
+    };
     let address_prev_ffn_feature_models = if args.address_prev_ffn_feature_group_probe {
         if !args.mode_d_check {
             return Err("--address-prev-ffn-feature-group-probe requires --mode-d-check".into());
@@ -722,6 +815,7 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         || args.address_group_importance
         || args.address_lsh_group_probe
         || args.address_supervised_group_probe
+        || args.address_gamma_projected_group_probe
         || args.address_key_group_probe
         || args.address_majority_group_probe
         || args.address_prev_ffn_feature_group_probe
@@ -1240,6 +1334,89 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                     }
                 }
 
+                if args.address_gamma_projected_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for gamma-projected group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let gamma_models = address_gamma_projected_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                            format!(
+                                "missing gamma-projected group probe models for L{} H{} {:?}",
+                                head.layer, head.head, config
+                            )
+                        })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for gamma-projected group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let layer_input =
+                        capture_layer_input_hidden(&mut weights, &token_ids, &index, head.layer)?;
+                    for gamma_model in gamma_models {
+                        let projected_input = gamma_model.project_layer_input(&layer_input)?;
+                        let selected_group_keys = gamma_model.selected_group_keys();
+                        for (probe_name, use_oracle_rest) in [
+                            (
+                                format!(
+                                    "{}_groups_{:?}_oracle_rest",
+                                    gamma_model.name, gamma_projected_groups
+                                ),
+                                true,
+                            ),
+                            (
+                                format!(
+                                    "{}_groups_{:?}_majority_rest",
+                                    gamma_model.name, gamma_projected_groups
+                                ),
+                                false,
+                            ),
+                        ] {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let base_codes = if use_oracle_rest {
+                                        oracle_codes.as_slice()
+                                    } else {
+                                        group_majority.as_slice()
+                                    };
+                                    gamma_model.supervised.predict_selected_groups(
+                                        &projected_input,
+                                        pos,
+                                        base_codes,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_name,
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
+                        }
+                    }
+                }
+
                 if args.address_prev_ffn_feature_group_probe {
                     let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
                         format!(
@@ -1687,6 +1864,17 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         address_supervised_epochs: args.address_supervised_epochs,
         address_supervised_lr: args.address_supervised_lr,
         address_supervised_l2: args.address_supervised_l2,
+        address_gamma_projected_group_probe: args.address_gamma_projected_group_probe,
+        address_gamma_projected_groups: if args.address_gamma_projected_group_probe {
+            gamma_projected_groups
+        } else {
+            Vec::new()
+        },
+        address_gamma_projected_layers: if args.address_gamma_projected_group_probe {
+            gamma_projected_layers
+        } else {
+            Vec::new()
+        },
         address_code_stability: args.address_code_stability,
         address_code_stability_groups: if args.address_code_stability {
             code_stability_groups

@@ -449,6 +449,76 @@ pub fn build_pipeline_layers<'a>(
         .collect()
 }
 
+/// For `--moe-shards` (remote expert) deployments: the client vindex has no
+/// per-layer expert bytes, so `build_moe_weights` returns `None` for every
+/// layer, `has_moe = false`, and the Metal decode never calls `moe_fn`.
+///
+/// This function patches that by injecting a stub `MoeLayerWeights` for every
+/// MoE-capable layer whose `moe` field is still `None`.  The stub has empty
+/// expert slices — they are never read when `moe_fn` is `Some` (the remote
+/// dispatch closure supersedes local `cpu_moe_forward`).  Norm weights are
+/// populated from `weights.vectors` (loaded from `norms.bin` in the client
+/// slice) so post-MoE normalisation remains correct.
+pub fn patch_pipeline_layers_for_remote_moe<'a>(
+    layers: &mut [FullPipelineLayer<'a>],
+    weights: &'a ModelWeights,
+) {
+    let arch = &*weights.arch;
+    if !arch.is_hybrid_moe() {
+        return;
+    }
+    for (i, layer) in layers.iter_mut().enumerate() {
+        if layer.moe.is_some() {
+            continue;
+        }
+        if arch.moe_router_key(i).is_none() {
+            continue;
+        }
+        layer.moe = Some(build_moe_stub(weights, arch, i));
+    }
+}
+
+fn build_moe_stub<'a>(
+    weights: &'a ModelWeights,
+    arch: &dyn larql_models::ModelArchitecture,
+    layer: usize,
+) -> MoeLayerWeights<'a> {
+    let sl = |k: Option<String>| -> &'a [f32] {
+        k.and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+    // expert_data_format is never read when moe_fn fires (remote path); match
+    // what build_moe_weights would use so any fallback cpu_moe_forward still
+    // decodes correctly if it ever runs.
+    let expert_data_format = if weights.has_per_layer_ffn() {
+        QuantFormat::Q4_K
+    } else {
+        QuantFormat::BF16
+    };
+    MoeLayerWeights {
+        experts_gate_up: vec![],
+        experts_down: vec![],
+        expert_data_format,
+        router_proj: &[],
+        router_scale: sl(arch.moe_router_scale_key(layer)),
+        router_per_expert_scale: sl(arch.moe_router_per_expert_scale_key(layer)),
+        router_norm: sl(arch.moe_router_norm_key(layer)),
+        router_norm_parameter_free: arch.moe_router_norm_parameter_free(),
+        router_input_scalar: arch.moe_router_input_scalar().unwrap_or(1.0),
+        pre_experts_norm: sl(arch.moe_pre_experts_norm_key(layer)),
+        post_ffn1_norm: sl(arch.moe_post_ffn1_norm_key(layer)),
+        post_experts_norm: sl(arch.moe_post_experts_norm_key(layer)),
+        num_experts: arch.num_experts(),
+        top_k: arch.num_experts_per_token(),
+        intermediate_size: arch.moe_intermediate_size(),
+        activation: match arch.activation() {
+            larql_models::Activation::GeluTanh => larql_compute::Activation::GeluTanh,
+            _ => larql_compute::Activation::Silu,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

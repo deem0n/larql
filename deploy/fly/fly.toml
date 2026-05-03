@@ -1,0 +1,37 @@
+# larql expert-server — fly.io deployment config.
+# Deploy two apps: larql-expert-a (experts 0-63) and larql-expert-b (experts 64-127).
+# Or a single app with all experts for the simple demo.
+
+app = "larql-expert-server"
+primary_region = "lhr"   # London — change to your closest region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  VINDEX_PATH = "/data/vindex"
+  HF_REPO = "chrishayuk/gemma-4-26b-a4b-it-vindex-expert-server"
+  # EXPERTS = "0-63"    # Uncomment and set per-shard
+  # LAYERS  = "0-14"   # Uncomment for layer sharding
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # Keep alive for demo; set true to save cost
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 20
+    soft_limit = 10
+
+[[vm]]
+  size = "performance-8x"   # 8 vCPU, 16 GB RAM — fits 12 GB mmap'd expert weights
+  memory = "16gb"
+
+[[mounts]]
+  source = "expert_data"
+  destination = "/data"
+  initial_size = "25gb"

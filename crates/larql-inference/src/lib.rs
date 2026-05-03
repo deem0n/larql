@@ -134,9 +134,9 @@ pub use chat::{wrap_chat_prompt, wrap_prompt_raw, wrap_with_vindex_template, Cha
 pub use error::InferenceError;
 pub use ffn::graph_backend::{GateIndex, IndexBuildCallbacks, SilentIndexCallbacks};
 pub use ffn::{
-    BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights,
-    RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError,
-    RemoteWalkBackend, ShardConfig, SparseFfn, WeightFfn,
+    BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
+    RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
+    ShardConfig, SparseFfn, WeightFfn,
 };
 pub use forward::{
     apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,

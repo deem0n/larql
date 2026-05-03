@@ -37,18 +37,28 @@ impl LayerShardedBackend {
         } else {
             let config = RemoteFfnConfig::new(spec).with_timeout(timeout);
             let backend = RemoteWalkBackend::connect(config)?;
-            vec![LayerShard { start: 0, end: usize::MAX, backend }]
+            vec![LayerShard {
+                start: 0,
+                end: usize::MAX,
+                backend,
+            }]
         };
         Ok(Self { shards })
     }
 
     pub fn hidden_size(&self) -> usize {
-        self.shards.first().map(|s| s.backend.hidden_size()).unwrap_or(0)
+        self.shards
+            .first()
+            .map(|s| s.backend.hidden_size())
+            .unwrap_or(0)
     }
 
     /// URL of the first shard (for logging/display).
     pub fn primary_url(&self) -> &str {
-        self.shards.first().map(|s| s.backend.base_url()).unwrap_or("")
+        self.shards
+            .first()
+            .map(|s| s.backend.base_url())
+            .unwrap_or("")
     }
 
     fn shard_for(&self, layer: usize) -> Option<&RemoteWalkBackend> {
@@ -67,11 +77,7 @@ impl FfnBackend for LayerShardedBackend {
         }
     }
 
-    fn forward_with_activation(
-        &self,
-        layer: usize,
-        x: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>) {
+    fn forward_with_activation(&self, layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         match self.shard_for(layer) {
             Some(shard) => shard.forward_with_activation(layer, x),
             None => {
@@ -86,7 +92,8 @@ impl FfnBackend for LayerShardedBackend {
         layer: usize,
         h_post_attn: &Array2<f32>,
     ) -> Option<Array2<f32>> {
-        self.shard_for(layer)?.forward_moe_full_layer(layer, h_post_attn)
+        self.shard_for(layer)?
+            .forward_moe_full_layer(layer, h_post_attn)
     }
 
     fn name(&self) -> &str {
@@ -115,10 +122,16 @@ fn parse_shard_map(spec: &str, timeout: Duration) -> Result<Vec<LayerShard>, Rem
         })?;
         let config = RemoteFfnConfig::new(url).with_timeout(timeout);
         let backend = RemoteWalkBackend::connect(config)?;
-        shards.push(LayerShard { start, end, backend });
+        shards.push(LayerShard {
+            start,
+            end,
+            backend,
+        });
     }
     if shards.is_empty() {
-        return Err(RemoteFfnError::Client("--ffn: no valid shard segments".into()));
+        return Err(RemoteFfnError::Client(
+            "--ffn: no valid shard segments".into(),
+        ));
     }
     Ok(shards)
 }
@@ -127,5 +140,9 @@ fn parse_layer_range(s: &str) -> Option<(usize, usize)> {
     let mut parts = s.splitn(2, '-');
     let start: usize = parts.next()?.trim().parse().ok()?;
     let end: usize = parts.next()?.trim().parse().ok()?;
-    if start <= end { Some((start, end)) } else { None }
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
 }

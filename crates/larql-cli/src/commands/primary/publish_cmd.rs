@@ -602,6 +602,8 @@ impl larql_vindex::PublishCallbacks for CliPublishCallbacks {
     }
 
     fn on_file_start(&mut self, filename: &str, size: u64) {
+        let mb = size as f64 / 1024.0 / 1024.0;
+        eprintln!("  ↑ {filename} ({mb:.0} MB)");
         let bar = self.mp.add(ProgressBar::new(size));
         bar.set_style(make_upload_style());
         bar.set_message(truncate_msg(filename, 28));
@@ -614,10 +616,11 @@ impl larql_vindex::PublishCallbacks for CliPublishCallbacks {
         }
     }
 
-    fn on_file_done(&mut self, _filename: &str) {
+    fn on_file_done(&mut self, filename: &str) {
         if let Some(bar) = self.current.take() {
             bar.finish();
         }
+        eprintln!("    ✓ {filename}");
     }
 
     fn on_file_skipped(&mut self, filename: &str, _size: u64, sha256: &str) {
