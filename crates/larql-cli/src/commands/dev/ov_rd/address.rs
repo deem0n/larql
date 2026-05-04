@@ -157,6 +157,7 @@ impl AddressSupervisedGroupModel {
 pub(super) struct AddressAttentionClusterGroupModel {
     pub(super) name: String,
     pub(super) groups: Vec<usize>,
+    pub(super) qk_rank: Option<usize>,
     pub(super) centroids: Vec<Vec<f64>>,
     pub(super) group_majority: Vec<usize>,
     pub(super) group_maps: Vec<HashMap<String, usize>>,
@@ -218,6 +219,22 @@ pub(super) fn prev_ffn_feature_probe_names() -> Vec<&'static str> {
         "token_prev_ffn_top8_hash",
         "position_prev_ffn_top1",
         "position_prev_ffn_top8_hash",
+    ]
+}
+
+pub(super) fn ffn_first_feature_probe_names() -> Vec<&'static str> {
+    vec![
+        "ffn_first_top1",
+        "ffn_first_top2_hash",
+        "ffn_first_top4_hash",
+        "ffn_first_top8_hash",
+        "ffn_first_top16_hash",
+        "stratum_ffn_first_top1",
+        "stratum_ffn_first_top8_hash",
+        "token_ffn_first_top1",
+        "token_ffn_first_top8_hash",
+        "position_ffn_first_top1",
+        "position_ffn_first_top8_hash",
     ]
 }
 
@@ -307,11 +324,11 @@ pub(super) fn attention_cluster_key(
     cluster: usize,
 ) -> String {
     let token = token_ids.get(position).copied().unwrap_or(0);
-    if name.starts_with("stratum_attn_cluster_") {
+    if name.contains("stratum_attn_cluster_") {
         format!("s:{stratum}|ac:{cluster}")
-    } else if name.starts_with("position_attn_cluster_") {
+    } else if name.contains("position_attn_cluster_") {
         format!("p:{position}|ac:{cluster}")
-    } else if name.starts_with("token_attn_cluster_") {
+    } else if name.contains("token_attn_cluster_") {
         format!("t:{token}|ac:{cluster}")
     } else {
         format!("ac:{cluster}")
@@ -360,7 +377,49 @@ pub(super) fn prev_ffn_feature_key(
     }
 }
 
-fn attention_argmax(weights: &[f32], position: usize) -> usize {
+pub(super) fn ffn_first_feature_key(
+    name: &str,
+    token_ids: &[u32],
+    stratum: &str,
+    position: usize,
+    features: &[usize],
+) -> String {
+    let token = token_ids.get(position).copied().unwrap_or(0);
+    let top1 = features
+        .first()
+        .map(|feature| feature.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let top2 = features
+        .iter()
+        .take(2)
+        .map(|feature| feature.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let top2 = if top2.is_empty() {
+        "none".to_string()
+    } else {
+        top2
+    };
+    let top4 = feature_set_key(features, 4);
+    let top8 = feature_set_key(features, 8);
+    let top16 = feature_set_key(features, 16);
+    match name {
+        "ffn_first_top1" => format!("ff1:{top1}"),
+        "ffn_first_top2_hash" => format!("ff2:{top2}"),
+        "ffn_first_top4_hash" => format!("ff4:{top4}"),
+        "ffn_first_top8_hash" => format!("ff8:{top8}"),
+        "ffn_first_top16_hash" => format!("ff16:{top16}"),
+        "stratum_ffn_first_top1" => format!("s:{stratum}|ff1:{top1}"),
+        "stratum_ffn_first_top8_hash" => format!("s:{stratum}|ff8:{top8}"),
+        "token_ffn_first_top1" => format!("t:{token}|ff1:{top1}"),
+        "token_ffn_first_top8_hash" => format!("t:{token}|ff8:{top8}"),
+        "position_ffn_first_top1" => format!("p:{position}|ff1:{top1}"),
+        "position_ffn_first_top8_hash" => format!("p:{position}|ff8:{top8}"),
+        _ => format!("ff1:{top1}"),
+    }
+}
+
+pub(super) fn attention_argmax(weights: &[f32], position: usize) -> usize {
     let causal_len = (position + 1).min(weights.len());
     weights
         .iter()
@@ -394,9 +453,9 @@ fn attention_topk_key(weights: &[f32], position: usize, k: usize) -> String {
     }
 }
 
-fn attention_entropy_bucket(weights: &[f32], position: usize) -> usize {
+pub(super) fn attention_entropy_bits(weights: &[f32], position: usize) -> f64 {
     let causal_len = (position + 1).min(weights.len());
-    let entropy_bits = weights
+    weights
         .iter()
         .take(causal_len)
         .copied()
@@ -405,7 +464,11 @@ fn attention_entropy_bucket(weights: &[f32], position: usize) -> usize {
             let p = p as f64;
             -p * p.log2()
         })
-        .sum::<f64>();
+        .sum::<f64>()
+}
+
+fn attention_entropy_bucket(weights: &[f32], position: usize) -> usize {
+    let entropy_bits = attention_entropy_bits(weights, position);
     ((entropy_bits * 2.0).floor() as usize).min(16)
 }
 

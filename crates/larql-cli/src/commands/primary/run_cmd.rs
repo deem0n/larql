@@ -110,6 +110,26 @@ pub struct RunArgs {
     #[arg(long, default_value = "60")]
     pub ffn_timeout_secs: u64,
 
+    /// Dense FFN dispatch strategy when `--ffn` is set.
+    ///
+    ///   streaming  (default) — 60 sequential round-trips per decode token,
+    ///              one per layer.  Exact: each layer's FFN input uses the
+    ///              correct h_post_attn from the previous layer.
+    ///
+    ///   batch      — parallel predispatch: all 60 layers fired in parallel
+    ///              threads, then injected in a second Metal pass.
+    ///              Approximate but much faster: wall time ≈ one HTTP round
+    ///              trip instead of 60.  Combine with
+    ///              `--ffn-predispatch-iters 2` for better accuracy.
+    #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
+    pub ffn_dispatch: String,
+
+    /// Number of predispatch iterations per token when `--ffn-dispatch batch`
+    /// is set.  1 (default) = one parallel dispatch + two Metal passes;
+    /// 2 = two dispatches + three passes, more accurate.
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub ffn_predispatch_iters: usize,
+
     /// Use Metal GPU backend for Q4K inference (macOS only).
     #[arg(long)]
     pub metal: bool,
@@ -189,12 +209,19 @@ pub struct RunArgs {
     ///              round-trips per decode token.  Exact: each layer's expert
     ///              input uses the correct h_post_attn.
     ///
-    ///   batch      — two Metal passes per token + ONE batch gRPC call per
-    ///              shard.  Approximate: pass-1 h_post_attn lacks prior
-    ///              layers' expert contributions, but error is small.
-    ///              Faster on servers with many CPU cores.
+    ///   batch      — parallel batch dispatch: all layers in one round trip,
+    ///              approximate.  Combine with `--moe-predispatch-iters 2` for
+    ///              better accuracy.
     #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
     pub moe_dispatch: String,
+
+    /// Number of predispatch iterations per token when `--moe-dispatch batch`
+    /// is set.  1 (default) = one dispatch + two passes; 2 = two dispatches +
+    /// three passes.  Each additional iteration improves routing accuracy by
+    /// incorporating prior expert contributions into h_post_attn before
+    /// re-routing, at the cost of one extra remote round-trip per token.
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub moe_predispatch_iters: usize,
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -209,6 +236,21 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.experts {
         return experts::run(&vindex_path, &args);
+    }
+
+    if let Some(ref ffn_url) = args.ffn {
+        let prompt = args.prompt.as_deref().ok_or(
+            "--ffn requires a prompt argument (chat mode not yet supported with --ffn-dispatch batch)",
+        )?;
+        return run_with_remote_ffn(
+            &vindex_path,
+            prompt,
+            ffn_url,
+            args.ffn_timeout_secs,
+            args.max_tokens,
+            &args.ffn_dispatch,
+            args.ffn_predispatch_iters,
+        );
     }
 
     if args.moe_shards.is_some() && args.moe_units_manifest.is_some() {
@@ -231,6 +273,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.moe_units_manifest.as_deref(),
             args.max_tokens,
             &args.moe_dispatch,
+            args.moe_predispatch_iters,
         );
     }
 
@@ -317,6 +360,8 @@ fn build_walk_args(
         metal: args.metal,
         ffn_remote: args.ffn.clone(),
         ffn_remote_timeout_secs: args.ffn_timeout_secs,
+        ffn_dispatch: args.ffn_dispatch.clone(),
+        ffn_predispatch_iters: args.ffn_predispatch_iters,
     }
 }
 
@@ -332,6 +377,7 @@ fn run_with_moe_shards(
     units_manifest: Option<&std::path::Path>,
     max_tokens: usize,
     dispatch: &str,
+    predispatch_iters: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use larql_inference::ffn::moe_remote::{parse_unit_manifest, RemoteMoeBackend, ShardConfig};
     use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
@@ -434,7 +480,15 @@ fn run_with_moe_shards(
     let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
     let result = if dispatch == "batch" {
         generate_with_remote_moe_batch(
-            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend, &eos,
+            &weights,
+            &tokenizer,
+            prompt_ids,
+            max_tokens,
+            &index,
+            &remote,
+            &*backend,
+            &eos,
+            predispatch_iters,
         )
     } else {
         generate_with_remote_moe(
@@ -475,6 +529,107 @@ fn run_with_moe_shards(
             "  bytes recv:      ~{:.0} KB  ({num_layers} layers × {num_shards} shard{} × hidden × f32)",
             kb(bytes_per_token * n),
             if num_shards == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+/// `--ffn URL` dispatch path for dense models.
+///
+/// Metal runs attention on the local GPU. Every layer's FFN is a round trip
+/// to the remote server at `ffn_url` via `LayerShardedBackend`. The local
+/// vindex supplies attention weights; the remote server supplies FFN outputs.
+///
+/// This is analogous to `run_with_moe_shards` for hybrid-MoE models, but
+/// simpler: there is no local FFN and no router — every layer unconditionally
+/// calls the remote server.
+fn run_with_remote_ffn(
+    vindex_path: &std::path::Path,
+    prompt: &str,
+    ffn_url: &str,
+    ffn_timeout_secs: u64,
+    max_tokens: usize,
+    dispatch: &str,
+    predispatch_iters: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use larql_inference::{
+        generate_with_remote_ffn, generate_with_remote_ffn_batch, LayerShardedBackend,
+    };
+    use std::time::Duration;
+
+    let timeout = Duration::from_secs(ffn_timeout_secs);
+    let backend = larql_compute::default_backend();
+    eprintln!("Connecting to remote FFN at {ffn_url}…");
+    let remote = LayerShardedBackend::connect(ffn_url, timeout)
+        .map_err(|e| format!("failed to connect to remote FFN server: {e}"))?;
+    eprintln!("  Attention:  {} (local)", backend.name());
+    eprintln!("  FFN:        remote  ({})  dispatch={dispatch}", ffn_url);
+
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load client weights: {e}"))?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
+        .map_err(|e| format!("failed to load tokenizer: {e}"))?;
+    let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load vindex: {e}"))?;
+    index
+        .load_attn_q4k(vindex_path)
+        .map_err(|e| format!("failed to load attn Q4K: {e}"))?;
+    index
+        .load_interleaved_q4k(vindex_path)
+        .map_err(|e| format!("failed to load interleaved Q4K: {e}"))?;
+    let _ = index.load_lm_head_q4(vindex_path);
+
+    let wrapped_prompt =
+        larql_inference::chat::render_user_prompt(vindex_path, weights.arch.family(), prompt)?;
+    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
+        .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
+    eprintln!("[chat] tokenised to {} ids", prompt_ids.len());
+
+    let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
+    let result = if dispatch == "batch" {
+        generate_with_remote_ffn_batch(
+            &weights,
+            &tokenizer,
+            prompt_ids,
+            max_tokens,
+            &index,
+            &*backend,
+            &remote,
+            &eos,
+            predispatch_iters,
+        )
+    } else {
+        generate_with_remote_ffn(
+            &weights, &tokenizer, prompt_ids, max_tokens, &index, &*backend, &remote, &eos,
+        )
+    }
+    .map_err(|e| format!("remote-ffn generate failed ({dispatch}): {e}"))?;
+
+    for tok in &result.tokens {
+        print!("{tok}");
+    }
+    if !result.tokens.is_empty() {
+        println!();
+    }
+    let n = result.decode_ms.len();
+    if n > 0 {
+        let avg = result.decode_ms.iter().sum::<f64>() / n as f64;
+        let tok_s = 1000.0 / avg;
+        let num_layers = weights.num_layers;
+        let hidden = weights.hidden_size;
+        // One f32 residual in each direction per layer.
+        let bytes_per_token = num_layers * hidden * std::mem::size_of::<f32>();
+        let kb = |b: usize| b as f64 / 1024.0;
+        eprintln!();
+        eprintln!("  decode:     {tok_s:.1} tok/s");
+        eprintln!(
+            "  bytes sent: ~{:.0} KB  ({num_layers} layers × hidden × f32)",
+            kb(bytes_per_token * n)
+        );
+        eprintln!(
+            "  bytes recv: ~{:.0} KB  ({num_layers} layers × hidden × f32)",
+            kb(bytes_per_token * n)
         );
     }
     Ok(())

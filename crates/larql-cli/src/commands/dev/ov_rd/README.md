@@ -18,6 +18,7 @@ oracle table exists
 Mode D residual-table materialization works
 held-out mean/p95 can pass
 the current dominant group-0 code is not addressable from shallow state
+full/reduced-QK attention-pattern clusters also fail on the hard L0H6 group
 ```
 
 ## Engine Boundary
@@ -37,6 +38,7 @@ larql_inference::vindex::predict_q4k_hidden_with_mapped_head_residual_delta
 larql_inference::vindex::predict_q4k_hidden_with_replaced_head_residual_delta
 larql_inference::vindex::predict_q4k_hidden_with_original_head_residual_delta
 larql_inference::attention::run_attention_block_with_pre_o_and_all_attention_weights
+larql_inference::attention::run_attention_block_with_pre_o_and_reduced_qk_attention_weights
 ```
 
 Those APIs preserve the hard runtime invariants:
@@ -149,12 +151,18 @@ input.rs           prompt loading, held-out splits, and CLI string parsers
 metrics.rs         KL, entropy, top-k, and distribution helpers
 oracle.rs          roundtrip and low-rank oracle checks
 edit_catalog.rs    full-vector residual-edit catalogue diagnostics in hidden/PCA space
-gamma_address.rs   gamma-aligned supervised address probes over raw layer input
-                  and diagonal-affine projections toward later residual states
-oracle_pq.rs       PQ experiment orchestration and address probe evaluation
+gamma_address.rs   gamma-aligned supervised address probes over raw layer input,
+                  diagonal-affine projections toward later residual states,
+                  fixed random low-rank projections, and learned low-rank
+                  target-residual bridges
+oracle_pq.rs       PQ experiment orchestration, address probe evaluation, and
+                  direct code-level rule diagnostics
 oracle_pq_address.rs
-                  address-probe, previous-FFN feature-key, attention-relation-key,
-                  attention-cluster-key, and majority-code fitting
+                  address-probe, previous-FFN feature-key, FFN-first feature-key,
+                  attention-relation-key, full/reduced-QK attention-cluster-key,
+                  code-substitution/coarsening controls, code-occurrence export,
+                  oracle binary code/default upper bounds, and majority-code
+                  fitting
 oracle_pq_eval.rs  shared predicted-address evaluation helper
 oracle_pq_fit.rs   PQ codebook fitting
 oracle_pq_forward.rs

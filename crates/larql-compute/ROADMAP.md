@@ -1,5 +1,38 @@
 # Roadmap — larql-compute
 
+## ✅ Metal GPU dense FFN server — `run_dense_ffn_q4k` (2026-05-04)
+
+**Status**: Shipped.
+
+`MetalBackend::run_dense_ffn_q4k` in `crates/larql-compute/src/metal/moe_dispatch.rs`
+provides a Metal GPU forward pass for one dense FFN layer given pre-loaded Q4K weight
+buffers. Mirrors the structure of `run_experts_prestaged_metal` but takes separate
+gate, up, and down buffers (not combined gate+up as in the MoE path).
+
+Used by `larql-server::routes::walk_ffn::handle_walk_ffn_q8k` (under
+`--features metal-experts`) to serve the dense remote-FFN path on GPU.
+
+**Per-layer dispatch geometry** (`q4k_matvec_pipeline.rows_per_tg` / `threads_per_tg`,
+not hardcoded) — same fix as the 2026-04-28 dispatch geometry correction.
+
+Bench (Gemma 4 31B Q4K, M3 Max, single-machine localhost):
+
+| Metric | Before | Metal server | Δ |
+|---|---|---|---|
+| Streaming (60 × sequential HTTP, CPU NEON) | 0.1 tok/s | 0.6 tok/s | 6× |
+| Batch (1 × parallel HTTP, CPU NEON) | — | 1.6 tok/s | — |
+| Batch (1 × parallel HTTP, Metal GPU) | 1.6 tok/s | **6.5 tok/s** | **4×** |
+
+Bottleneck at 6.5 tok/s: attention at 92ms/token (60%). Two-pass batch structure
+(capture pass + apply pass) doubles the local Metal attention cost. FFN at 60ms
+is at the 400 GB/s GPU bandwidth ceiling for 11.7 GB/token of Q4K weight reads.
+
+**Build separation required**: `--features metal-experts` must NOT be used for
+`larql-cli` (causes 10.7 vs 18.9 tok/s regression on Gemma 4 26B-A4B due to Metal
+pipeline init overhead in the standard decode path). Only the server binary uses that flag.
+
+---
+
 ## ✅ NEON Q4_K matvec — shipped 2026-05-01 (8.6× CPU MoE sweep speedup)
 
 **Status**: Done. New module `crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs`
@@ -112,18 +145,22 @@ Acceptance: callers should not need to know whether a model has uniform,
 sliding/global, or otherwise heterogeneous attention geometry before invoking a
 backend decode path.
 
-## Current state (2026-04-28, M3 Max, real vindex)
+## Current state (2026-05-04, M3 Max, real vindex)
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, post 2026-05-02 dispatch fix) | **83–84** | 11.9ms | current baseline; lm_head 1.85ms (was 2.95ms), gap to ollama 1.18× |
+| **LARQL Metal** (gemma3-4b-q4k, confirmed 2026-05-04) | **83.2** | 12.0ms | current baseline; lm_head 1.85ms (was 2.95ms), gap to ollama 1.18× |
 | **LARQL Metal** (gemma3-4b-q4k-v2, pre 2026-05-02) | 76 | 13.1ms | pre-fix baseline; stride-32 lm_head workaround |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | 70.1 | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
 | **Ollama** gemma3:4b | 98.5–99.7 | ~10.0ms | reference (same hardware, same prompt) |
 | **Gap** | LARQL is **~1.18×** slower | ~2.0ms/tok | per-stage decomposition below |
-| **LARQL Metal** (gemma4-26B-A4B, MoE Q4K, post 2026-05-02 fix) | **19.4** | ~52ms | dispatch geometry corrected; output coherent multilingual |
+| **LARQL Metal** (gemma4-26B-A4B, MoE Q4K, confirmed 2026-05-04) | **18.9** | ~53ms | MoE experts on CPU NEON; output coherent multilingual |
 | **LARQL Metal** (gemma4-26B-A4B, pre 2026-05-02) | 5.1 | ~194ms | bug-locked under dispatch-geometry mismatch; degraded output |
 | **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; remaining ~37ms expert work |
+| **Remote-FFN batch, Metal GPU server** (gemma4-31B Q4K, 2026-05-04) | **6.5** | 153ms | `run_dense_ffn_q4k`; 92ms attn local + 60ms FFN remote Metal GPU |
+| **Remote-FFN batch, CPU server** (gemma4-31B Q4K) | 1.6 | ~625ms | same HTTP path, server uses CPU NEON |
+| **Remote-FFN streaming** (gemma4-31B Q4K) | 0.6 | ~1670ms | Q8K wire via `/v1/walk-ffn-q8k`; 60 sequential HTTP round-trips |
+| **Local Metal** (gemma4-31B Q4K) | blocked | — | heterogeneous attention geometry (A1-A3); see `larql-inference/ROADMAP.md` |
 
 > ⚠ **The earlier "81–84 tok/s" number was on broken code.** Bisected
 > 2026-04-28: commit `077884b "working on performance"` (2026-04-27)
@@ -250,14 +287,19 @@ below was on the pre-fix baseline — kept for context.
 | # | Lever | Estimated win | Status | File / approach |
 |---|---|---|---|---|
 | **D-ATTN-MTG** | Multi-TG `attn_fused` retry — preserve 12 TGs while fusing qk_norm_rope + kv_append + attend | 0.2–0.4 ms/tok within the 3.48 ms attention bucket | Open. First attempt regressed −1.45 ms because the merge collapsed TG count 12→8; the multi-TG-per-head variant (split QKV+attend across 2 TGs/head, total ≥12) is untried. ADR-015 § "Lesson — diagnostic order" applies. | `metal/shaders/attn_fused.rs` rewrite; gated on `LARQL_FUSED_ATTN=1` until verified |
-| **D-FFN-PROFILE** | Split `encode_ffn` profiler boundary (gate_up vs activation+down) | Diagnostic, not perf. Tells us whether the 6.13 ms FFN bucket is gate+up-bound or down-bound, which informs whether **D-FFN-FUSE** is worth pursuing | Open. `LARQL_PROFILE_SPLIT=1` currently reports attn vs full-FFN; finer granularity needs a commit/wait boundary inserted between gate+up and down inside `encode_q4k_ffn`. | `metal/decode/encode_ffn.rs` + `metal/decode/profile.rs` |
-| **D-FFN-FUSE** | Q6_K geglu+down fusion with cheaper-activation variant | ~0.2 ms/tok | Open. First attempt (`q6k_geglu_gelu_tanh_down`) regressed because `tanh` was recomputed 2560× per output row. Needs precomputed activation in a small kernel, then a `q6k_matvec_f32in` variant. | `metal/shaders/q6k_geglu_*` |
+| **D-FFN-PROFILE** | Split `encode_ffn` profiler boundary (gate_up vs activation+down) | Diagnostic, not perf. | **SHIPPED 2026-05-04.** `LARQL_PROFILE_SPLIT=1` + `--profile` bench now shows three separate GPU buckets per step. Measured on Gemma 3 4B (10-token steady state): **attn=3.3ms (34%), gate+up=3.5ms (36%), act+down=2.8ms (29%)** — all three roughly equal thirds. Gate+up is the largest single kernel. See `metal/decode/encode_ffn.rs` (split helpers) + `profile.rs` (GateUp/Down stages) + `bench_cmd.rs` (sub-rows). | `metal/decode/encode_ffn.rs` + `metal/decode/profile.rs` |
+| **D-FFN-FUSE** | Q6_K geglu+down fusion with cheaper-activation variant | ~0.2 ms/tok | **BLOCKED — all-NaN bug with production weights.** Kernel passes unit parity tests (synthetic data, production geometry). On real vindex decode: `down_out` = all 2560 NaN even in a fresh encoder with valid gate/up inputs (max±12). Metal API validation reports no errors. Bug not found by static analysis. Possible cause: interaction between production Q6_K block values and the fused kernel's inner-loop accumulation. Needs Metal shader debugger. Wired behind `LARQL_FUSED_Q6K_DOWN=1` (opt-in, broken). | `metal/shaders/q6k_geglu_down.rs` + `encode_ffn.rs` |
 | **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | 3–4× prefill speedup on long prompts (closes 4–14× prefill gap to ollama) | Open. Kernel + parity tests shipped; only O-proj wired (within-noise impact). FFN sites are clean per-position matvec → matmul swaps; QKV requires a fused QKV matmul or fallback to per-projection matmul. | `metal/ops/full_pipeline/{stages,ffn}.rs` |
 
-**Sequencing rationale**: do **D-FFN-PROFILE** first (cheap, diagnostic).
-If gate+up dominates → D-ATTN-MTG won't move much, prioritise FFN. If
-down dominates → D-FFN-FUSE earns its complexity. Either way, the
-profiler split is the next decision before chasing the smaller wins.
+**Sequencing rationale (updated 2026-05-04)**: D-FFN-PROFILE shipped; data
+shows all three buckets roughly equal thirds (~34/36/29%). Gate+up is the
+largest but already bandwidth-bound at 74% LPDDR5X peak — no headroom left.
+D-FFN-FUSE targets act+down (~0.24 ms from GEGLU dispatch overhead) but is
+blocked by an unexplained production NaN. **Next unblocked levers:**
+D-ATTN-MTG (attention bucket, 0.2–0.4 ms, requires TG-count fix) or
+D-PREFILL-MM (prefill only, independent). D-PREFILL-MM is the cleanest
+because it's isolated to the prefill path and its kernel + parity tests
+are already shipped.
 **D-PREFILL-MM** is independent (prefill-only, doesn't touch decode).
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)
@@ -1223,3 +1265,4 @@ Single kernel per layer: norm → QKV → attention → O → residual → norm 
 | **Ollama EXCEEDED** | **2026-04-09** | **8.5ms / 117 tok/s = 0.83x Ollama (17% faster)** |
 | Fused Q4_K geglu+down disabled by default — `LARQL_FUSED_DOWN=1` opt-in | 2026-04-30 | The `q4k_geglu_silu_down` / `q4k_geglu_gelu_tanh_down` shaders pass their unit tests but produce all-NaN at the prefill output for production-shape weights (Gemma 3 4B q4k-downq4k → 2560/2560 NaN; Gemma 4 31B q4k → empty output). Separated path (existing GEGLU dispatch + `q4k_matvec`) is correct for the same shapes. Default flipped in `metal::stages::ffn::encode_gated`; perf parity to be re-tested if/when the fused kernel is fixed |
 | Metal MoE expert kernel — accuracy bug at inter=704 | 2026-04-30 | See top-of-file "Open" section. cos≈0.7 vs CPU reference for Gemma 4 26B-A4B-it MoE; same shaders are correct for dense FFN. Workaround: server defaults to CPU expert dispatch (`LARQL_USE_METAL_EXPERTS=1` to opt back in). Once fixed: ~3-4× grid speedup (3.5 tok/s → ~10 tok/s) since server compute is 95% of token wall time |
+| **NaN on Gemma 4 31B global-attention layers** | **2026-05-04** | `kv_append_attend_fused` used a fixed `tg_scores[1024]` threadgroup array. Global layers (window_size=0) grow unboundedly — once the KV cache exceeds 1024 positions, `tg_scores[t - t_start]` overflowed, corrupting scores → `exp()` produced Inf → softmax NaN. Fix: guard `use_fused_kv_aa` with `attn_span <= SHORT_ATTENTION_SPAN`; global layers fall through to `encode_kv_attend` which auto-selects `kv_attention_long` (4096-entry array) past 1024 tokens. Also fixed: `v_norm_batched` read/write race when `x` and `out` aliased the same buffer (threadgroup barrier missing between reduction and write-back phases; cos≈0.997 drift on L0). |

@@ -27,7 +27,8 @@
 //!   - `(T=18,  num_q=8, num_kv=4,  head_dim=256)`  — Gemma 3 4B
 //!   - `(T=18,  num_q=32, num_kv=16, head_dim=256)` — Gemma 4 31B sliding
 //!   - `(T=18,  num_q=32, num_kv=4,  head_dim=512)` — Gemma 4 31B global ←
-//!   - `(T=512, num_q=8, num_kv=2,  head_dim=128)` — long context
+//!   - `(T=512, num_q=8, num_kv=2,  head_dim=128)` — short scores path
+//!   - `(T=2048,num_q=32,num_kv=4,  head_dim=512)` — long scores path
 
 extern crate blas_src;
 
@@ -109,7 +110,13 @@ fn run_kv_attention(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.kv_attend_pipeline);
+    let span = larql_compute::metal::ops::kv_cache::attention_span(t_val, window_size);
+    let pipeline = if span > larql_compute::metal::ops::kv_cache::SHORT_ATTENTION_SPAN {
+        &metal.kv_attend_long_pipeline
+    } else {
+        &metal.kv_attend_pipeline
+    };
+    enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(&q_buf), 0);
     enc.set_buffer(1, Some(&k_buf), 0);
     enc.set_buffer(2, Some(&v_buf), 0);
@@ -213,4 +220,12 @@ fn kv_attention_t512_long_context() {
     // scores buffer is sized 1024 — anything beyond that uses the
     // larger-buffer variant; this test sits inside the cheap path.
     assert_kv_attention_matches_cpu("long T=512", 512, 8, 2, 128);
+}
+
+#[test]
+fn kv_attention_t2048_gemma4_global_long_context() {
+    // Gemma 4 31B global layers are full-attention with head_dim=512.
+    // Once T passes 1024 they must use kv_attention_long; the short shader's
+    // 1024-entry scores buffer would otherwise write out of bounds.
+    assert_kv_attention_matches_cpu("gemma4 global T=2048", 2048, 32, 4, 512);
 }

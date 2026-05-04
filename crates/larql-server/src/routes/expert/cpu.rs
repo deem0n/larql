@@ -8,6 +8,8 @@
 //! pattern that re-applied pre_norm K times and allocated three Vec<f32>
 //! per matmul.
 
+use larql_compute::Q8KActivation;
+
 use crate::env_flags;
 use crate::error::ServerError;
 use crate::state::AppState;
@@ -180,6 +182,7 @@ pub fn run_experts_cpu_batch(
         );
 
     let t_par = t_norm_start.elapsed() - t_norm;
+    let _ = t_par; // used in timing block below
     if timing_enabled {
         eprintln!(
             "[run_experts_cpu] layer={layer} K={} arch={:.2}ms norm={:.2}ms \
@@ -191,5 +194,81 @@ pub fn run_experts_cpu_batch(
             t_start.elapsed().as_secs_f32() * 1000.0,
         );
     }
+    Ok(out)
+}
+
+/// Expert dispatch with a pre-quantised Q8K activation — skips `pre_experts_norm`
+/// and `quantize_h_norm_for_q4k` because the client already did both.  4× less
+/// upload traffic; server goes straight to the Q4K × Q8K matvec.
+pub fn run_experts_cpu_batch_q8k_prenormed(
+    state: &AppState,
+    layer: usize,
+    q8k: &Q8KActivation,
+    expert_ids: &[usize],
+    expert_weights: &[f32],
+) -> Result<Vec<f32>, ServerError> {
+    use larql_compute::cpu::ops::moe::{run_single_expert_q4k_q8k_into, ExpertScratch};
+    use rayon::prelude::*;
+
+    let model = state.model_or_err(None)?;
+    let weights = model
+        .get_or_load_weights()
+        .map_err(ServerError::InferenceUnavailable)?;
+    let arch = &*weights.arch;
+    let hidden = q8k.qs.len();
+    if hidden == 0 || expert_ids.is_empty() {
+        return Ok(vec![0.0f32; hidden]);
+    }
+    let inter = arch.moe_intermediate_size();
+    let activation = larql_inference::activation_from_arch(arch);
+    let inter_padded = {
+        let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+        inter.div_ceil(block) * block
+    };
+
+    let resolve_bytes =
+        |eid: usize| -> Option<(&[u8], &[u8])> { weights.get_layer_entry_bytes(layer, eid) };
+
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Option<ExpertScratch>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    let out = expert_ids
+        .par_iter()
+        .zip(expert_weights.par_iter())
+        .filter(|(_, &w)| w != 0.0)
+        .fold(
+            || vec![0.0f32; hidden],
+            |mut acc, (&eid, &w)| {
+                let Some((gu_bytes, dn_bytes)) = resolve_bytes(eid) else {
+                    return acc;
+                };
+                SCRATCH.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let scratch = borrow
+                        .get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
+                    if scratch.gate_out.len() != inter {
+                        *scratch = ExpertScratch::new(hidden, inter, inter_padded);
+                    }
+                    let h2 = run_single_expert_q4k_q8k_into(
+                        scratch, q8k, gu_bytes, dn_bytes, inter, activation,
+                    );
+                    for (a, &v) in acc.iter_mut().zip(h2.iter()) {
+                        *a += w * v;
+                    }
+                });
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f32; hidden],
+            |mut a, b| {
+                for (x, &y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            },
+        );
     Ok(out)
 }

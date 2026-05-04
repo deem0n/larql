@@ -252,6 +252,7 @@ impl MetalBackend {
                 enc_b,
                 &kv_cache.layers[layer_idx],
                 &self.kv_attend_pipeline,
+                Some(&self.kv_attend_long_pipeline),
                 &q_out,
                 &attn_out,
                 layer_num_q_heads,

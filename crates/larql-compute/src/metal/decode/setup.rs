@@ -79,6 +79,11 @@ pub(super) struct DecodeScratch {
     pub inter_padded: usize,
     pub num_layers: usize,
     pub has_moe: bool,
+
+    /// Clones of every buffer returned by `BufferCache::output` during
+    /// construction.  Handed to a `ScratchGuard` in the decode function so
+    /// all scratch buffers are returned to the pool after the decode step.
+    pub scratch_clones: Vec<metal::Buffer>,
 }
 
 impl DecodeScratch {
@@ -179,7 +184,32 @@ impl DecodeScratch {
         let o_q8s_scratch = bufs.output((max_q_dim / 32 * 4) as u64);
         let scaled_scratch = bufs.output((hidden * 4) as u64);
 
-        let has_moe = layers.iter().any(|l| l.moe.is_some());
+        let has_moe = layers.iter().any(|l| l.moe.is_some() || l.ffn_is_remote);
+
+        // Collect clones of every output buffer so the decode function can
+        // return them to the scratch pool after the GPU step completes.
+        let scratch_clones = vec![
+            h_a.clone(),
+            h_b.clone(),
+            q_out.clone(),
+            k_out.clone(),
+            v_out.clone(),
+            norm_f32_buf.clone(),
+            attn_out_buf.clone(),
+            o_out_buf.clone(),
+            h_post_attn.clone(),
+            ffn_norm_out.clone(),
+            ffn_q8.clone(),
+            ffn_q8s.clone(),
+            up_out.clone(),
+            act_buf.clone(),
+            down_out.clone(),
+            gate_out_scratch.clone(),
+            normed_scratch.clone(),
+            o_q8_scratch.clone(),
+            o_q8s_scratch.clone(),
+            scaled_scratch.clone(),
+        ];
 
         Self {
             wq_bufs,
@@ -219,6 +249,7 @@ impl DecodeScratch {
             inter_padded,
             num_layers,
             has_moe,
+            scratch_clones,
         }
     }
 }

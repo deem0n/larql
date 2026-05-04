@@ -589,6 +589,241 @@ impl MetalBackend {
         );
     }
 
+    // ── Profile-split helpers ────────────────────────────────────────────────
+    // Used only when LARQL_PROFILE_SPLIT=1. Each encodes exactly one half of
+    // the FFN so a commit/wait boundary between them measures gate+up vs
+    // act+down separately. Caller must not commit between the two halves of
+    // the same layer — only between gate_up_phase and down_phase.
+
+    /// Encode the gate+up dispatch only. Writes to `bufs.gate_out_scratch`
+    /// and `bufs.up_out`; does NOT encode activation or down.
+    pub(super) fn encode_ffn_gate_up_phase(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        layer: &FullPipelineLayer,
+        bufs: &FfnBufs<'_>,
+        dims: FfnDims,
+        ffn_uses_q4k: bool,
+    ) {
+        let FfnDims { hidden, inter, .. } = dims;
+        let inter_val = inter as u32;
+        let hidden_val = hidden as u32;
+        let ffn_is_q4kf = layer.gate.format == crate::QuantFormat::Q4_KF;
+
+        if ffn_is_q4kf {
+            use crate::metal::shaders::q4kf_ffn_gate_up as q4kf_gu;
+            use crate::metal::shaders::q4kf_qkv_proj as q4kf;
+            if layer.is_gated() {
+                let n = (inter as u64).div_ceil(q4kf_gu::ROWS_PER_TG);
+                enc.set_compute_pipeline_state(&self.q4kf_ffn_gate_up_pipeline.state);
+                enc.set_buffer(0, Some(bufs.gate_w), 0);
+                enc.set_buffer(1, Some(bufs.up_w), 0);
+                enc.set_buffer(2, Some(bufs.ffn_norm_out), 0);
+                enc.set_buffer(3, Some(bufs.gate_out_scratch), 0);
+                enc.set_buffer(4, Some(bufs.up_out), 0);
+                enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n * 2, 1, 1),
+                    MTLSize::new(q4kf_gu::THREADS_PER_TG, 1, 1),
+                );
+            } else {
+                let n = (inter as u64).div_ceil(q4kf::ROWS_PER_TG);
+                enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
+                enc.set_buffer(0, Some(bufs.up_w), 0);
+                enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
+                enc.set_buffer(2, Some(bufs.up_out), 0);
+                enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n, 1, 1),
+                    MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
+                );
+            }
+        } else if ffn_uses_q4k {
+            use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
+            let rows = self.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg;
+            let tgs = self.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg;
+            if layer.is_gated() {
+                let n = (inter as u64).div_ceil(rows);
+                enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_8sg_pipeline.state);
+                enc.set_buffer(0, Some(bufs.gate_w), 0);
+                enc.set_buffer(1, Some(bufs.up_w), 0);
+                enc.set_buffer(2, Some(bufs.ffn_norm_out), 0);
+                enc.set_buffer(3, Some(bufs.gate_out_scratch), 0);
+                enc.set_buffer(4, Some(bufs.up_out), 0);
+                enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(n * 2, 1, 1), MTLSize::new(tgs, 1, 1));
+            } else {
+                let rpt = self.q4k_matvec_pipeline.rows_per_tg;
+                let tpt = self.q4k_matvec_pipeline.threads_per_tg;
+                let n = (inter as u64).div_ceil(rpt);
+                enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+                enc.set_buffer(0, Some(bufs.up_w), 0);
+                enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
+                enc.set_buffer(2, Some(bufs.up_out), 0);
+                enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(n, 1, 1), MTLSize::new(tpt, 1, 1));
+            }
+        } else {
+            // Q4_0 path
+            let kernel = &self.q4.matvec;
+            let n = (inter as u64).div_ceil(kernel.rows_per_tg);
+            let tg = MTLSize::new(kernel.threads_per_tg, 1, 1);
+            if layer.is_gated() {
+                enc.set_compute_pipeline_state(&kernel.state);
+                enc.set_buffer(0, Some(bufs.gate_w), 0);
+                enc.set_buffer(1, Some(bufs.ffn_q8), 0);
+                enc.set_buffer(2, Some(bufs.ffn_q8s), 0);
+                enc.set_buffer(3, Some(bufs.gate_out_scratch), 0);
+                enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(n, 1, 1), tg);
+                enc.set_buffer(0, Some(bufs.up_w), 0);
+                enc.set_buffer(3, Some(bufs.up_out), 0);
+                enc.dispatch_thread_groups(MTLSize::new(n, 1, 1), tg);
+            } else {
+                enc.set_compute_pipeline_state(&kernel.state);
+                enc.set_buffer(0, Some(bufs.up_w), 0);
+                enc.set_buffer(1, Some(bufs.ffn_q8), 0);
+                enc.set_buffer(2, Some(bufs.ffn_q8s), 0);
+                enc.set_buffer(3, Some(bufs.up_out), 0);
+                enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(n, 1, 1), tg);
+            }
+        }
+    }
+
+    /// Encode the activation (GEGLU/SiLU) + down dispatch only. Reads from
+    /// `bufs.gate_out_scratch` / `bufs.up_out` written by `encode_ffn_gate_up_phase`.
+    pub(super) fn encode_ffn_down_phase(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        layer: &FullPipelineLayer,
+        bufs: &FfnBufs<'_>,
+        dims: FfnDims,
+        ffn_uses_q4k: bool,
+    ) {
+        let FfnDims {
+            hidden,
+            inter,
+            inter_padded,
+        } = dims;
+        let inter_val = inter as u32;
+        let inter_padded_val = inter_padded as u32;
+        let hidden_val = hidden as u32;
+        let ffn_is_q4kf = layer.gate.format == crate::QuantFormat::Q4_KF;
+
+        if ffn_is_q4kf {
+            if layer.is_gated() {
+                self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
+                self.encode_qmv_down(enc, layer, bufs, hidden, inter);
+            } else {
+                self.encode_activation(
+                    enc,
+                    layer,
+                    bufs.up_out,
+                    bufs.act_buf,
+                    inter_val,
+                    inter as u64,
+                );
+                use crate::metal::shaders::q4kf_qkv_proj as q4kf;
+                let n = (hidden as u64).div_ceil(q4kf::ROWS_PER_TG);
+                enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
+                enc.set_buffer(0, Some(bufs.down_w), 0);
+                enc.set_buffer(1, Some(bufs.act_buf), 0);
+                enc.set_buffer(2, Some(bufs.down_out), 0);
+                enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n, 1, 1),
+                    MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
+                );
+            }
+        } else if ffn_uses_q4k {
+            if layer.is_gated() {
+                let use_fused_q6k = std::env::var("LARQL_FUSED_Q6K_DOWN").is_ok()
+                    && layer.down.format == crate::QuantFormat::Q6_K
+                    && matches!(layer.activation, crate::Activation::GeluTanh);
+                if layer.down.format == crate::QuantFormat::Q4_K {
+                    self.encode_q4k_fused_geglu_down(
+                        enc,
+                        layer,
+                        bufs,
+                        hidden,
+                        inter_padded,
+                        hidden_val,
+                        inter_padded_val,
+                    );
+                } else if use_fused_q6k {
+                    let kh = &self.q6k_geglu_gelu_tanh_down_pipeline;
+                    let n_tgs = (hidden as u64).div_ceil(kh.rows_per_tg);
+                    enc.set_compute_pipeline_state(&kh.state);
+                    enc.set_buffer(0, Some(bufs.down_w), 0);
+                    enc.set_buffer(1, Some(bufs.gate_out_scratch), 0);
+                    enc.set_buffer(2, Some(bufs.up_out), 0);
+                    enc.set_buffer(3, Some(bufs.down_out), 0);
+                    enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(
+                        metal::MTLSize::new(n_tgs, 1, 1),
+                        metal::MTLSize::new(kh.threads_per_tg, 1, 1),
+                    );
+                } else {
+                    self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
+                    self.encode_qmv_down(enc, layer, bufs, hidden, inter_padded);
+                }
+            } else {
+                self.encode_activation(
+                    enc,
+                    layer,
+                    bufs.up_out,
+                    bufs.act_buf,
+                    inter_val,
+                    inter as u64,
+                );
+                let rpt = self.q4k_matvec_pipeline.rows_per_tg;
+                let tpt = self.q4k_matvec_pipeline.threads_per_tg;
+                let n = (hidden as u64).div_ceil(rpt);
+                enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+                enc.set_buffer(0, Some(bufs.down_w), 0);
+                enc.set_buffer(1, Some(bufs.act_buf), 0);
+                enc.set_buffer(2, Some(bufs.down_out), 0);
+                enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(
+                    4,
+                    4,
+                    &inter_padded_val as *const u32 as *const std::ffi::c_void,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(n, 1, 1), MTLSize::new(tpt, 1, 1));
+            }
+        } else {
+            // Q4_0
+            if layer.is_gated() {
+                self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
+            } else {
+                self.encode_activation(
+                    enc,
+                    layer,
+                    bufs.up_out,
+                    bufs.act_buf,
+                    inter_val,
+                    inter as u64,
+                );
+            }
+            enc.set_compute_pipeline_state(&self.q4.f32_matvec);
+            enc.set_buffer(0, Some(bufs.down_w), 0);
+            enc.set_buffer(1, Some(bufs.act_buf), 0);
+            enc.set_buffer(2, Some(bufs.down_out), 0);
+            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+        }
+    }
+
     fn encode_activation(
         &self,
         enc: &ComputeCommandEncoderRef,

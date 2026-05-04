@@ -48,7 +48,14 @@ pub fn gpu_elapsed_ms(cmd: &CommandBufferRef) -> f64 {
 pub enum DecodeStage {
     /// Attention block: input norm → QKV → QK-norm → RoPE → V-norm → KV-attend → O.
     Attention,
-    /// Dense FFN: post-attn residual+norm → gate, up, GELU, down → post-FFN residual.
+    /// Dense FFN gate+up dispatch only (fused or separate). Recorded when
+    /// `LARQL_PROFILE_SPLIT=1` is set; replaces `DenseFfn` for the fine split.
+    GateUp,
+    /// FFN activation (GEGLU/SiLU) + down matvec + post-FFN residual.
+    /// Paired with `GateUp` in the fine-split path.
+    Down,
+    /// Coarse FFN bucket (gate+up+act+down+residual together). Only emitted
+    /// when the fine split isn't active; kept for legacy callers.
     DenseFfn,
     /// Final norm + lm_head (only if recorded; many decode paths run it on CPU).
     #[allow(dead_code)]
@@ -72,6 +79,10 @@ pub struct TokenGpuTime {
     pub n_cmd_buffers: usize,
     /// Per-stage GPU time accumulators. Updated by `record_stage`.
     pub attn_ms: f64,
+    /// Gate+up dispatch (fine split). Zero when coarse split is active.
+    pub gate_up_ms: f64,
+    /// Activation+down+residual (fine split). Zero when coarse split is active.
+    pub down_ms: f64,
     pub dense_ffn_ms: f64,
     pub final_ms: f64,
     pub other_ms: f64,
@@ -93,6 +104,8 @@ impl TokenGpuTime {
             self.n_cmd_buffers += 1;
             match stage {
                 DecodeStage::Attention => self.attn_ms += elapsed,
+                DecodeStage::GateUp => self.gate_up_ms += elapsed,
+                DecodeStage::Down => self.down_ms += elapsed,
                 DecodeStage::DenseFfn => self.dense_ffn_ms += elapsed,
                 DecodeStage::Final => self.final_ms += elapsed,
                 DecodeStage::Other => self.other_ms += elapsed,
@@ -125,18 +138,36 @@ impl TokenGpuTime {
         if stage_timing {
             let total = self.total_gpu_ms;
             let pct = |v: f64| if total > 0.0 { v / total * 100.0 } else { 0.0 };
-            eprintln!(
-                "[gpu-timing/stage] attn={:.2}ms ({:.0}%)  dense_ffn={:.2}ms ({:.0}%)  \
-                 final={:.2}ms ({:.0}%)  other={:.2}ms ({:.0}%)",
-                self.attn_ms,
-                pct(self.attn_ms),
-                self.dense_ffn_ms,
-                pct(self.dense_ffn_ms),
-                self.final_ms,
-                pct(self.final_ms),
-                self.other_ms,
-                pct(self.other_ms),
-            );
+            if self.gate_up_ms > 0.0 || self.down_ms > 0.0 {
+                // Fine split: gate+up and act+down measured separately.
+                eprintln!(
+                    "[gpu-timing/stage] attn={:.2}ms ({:.0}%)  \
+                     gate+up={:.2}ms ({:.0}%)  act+down={:.2}ms ({:.0}%)  \
+                     other={:.2}ms ({:.0}%)",
+                    self.attn_ms,
+                    pct(self.attn_ms),
+                    self.gate_up_ms,
+                    pct(self.gate_up_ms),
+                    self.down_ms,
+                    pct(self.down_ms),
+                    self.other_ms,
+                    pct(self.other_ms),
+                );
+            } else {
+                // Coarse split: whole FFN in one bucket.
+                eprintln!(
+                    "[gpu-timing/stage] attn={:.2}ms ({:.0}%)  dense_ffn={:.2}ms ({:.0}%)  \
+                     final={:.2}ms ({:.0}%)  other={:.2}ms ({:.0}%)",
+                    self.attn_ms,
+                    pct(self.attn_ms),
+                    self.dense_ffn_ms,
+                    pct(self.dense_ffn_ms),
+                    self.final_ms,
+                    pct(self.final_ms),
+                    self.other_ms,
+                    pct(self.other_ms),
+                );
+            }
         }
     }
 }

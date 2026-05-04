@@ -13,10 +13,13 @@ use super::codec::{
     decode_binary_batch, decode_binary_single, encode_binary_request, extract_response_latency_ms,
     RemoteLatencyStats, WalkFfnSingleResponse, BINARY_CT,
 };
+use super::q8k_wire::{decode_q8k_batch_response, encode_q8k_batch_request, Q8K_BATCH_CT};
 use crate::ffn::FfnBackend;
+use larql_compute::cpu::ops::q4k_q8k_dot::Q8KActivation;
 
 const STATS_PATH: &str = "/v1/stats";
 const WALK_FFN_PATH: &str = "/v1/walk-ffn";
+const WALK_FFN_Q8K_PATH: &str = "/v1/walk-ffn-q8k";
 const HIDDEN_SIZE_KEY: &str = "hidden_size";
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -235,6 +238,53 @@ impl RemoteWalkBackend {
                 "batch response has neither 'layer' nor 'results'".into(),
             ))
         }
+    }
+
+    /// Q8K batch FFN call — sends pre-normed Q8K activations for one or more
+    /// layers in a single HTTP round trip to `/v1/walk-ffn-q8k`.
+    ///
+    /// Returns a map from layer index to output floats, same as `call_batch`.
+    ///
+    /// Falls back to `Err` with a "not supported" message when the server
+    /// returns 404 (older server without the Q8K endpoint), so callers can
+    /// gracefully fall back to the f32 path.
+    pub fn call_q8k_layers(
+        &self,
+        layers: &[(usize, &Q8KActivation)],
+    ) -> Result<HashMap<usize, Vec<f32>>, RemoteFfnError> {
+        let url = format!("{}{WALK_FFN_Q8K_PATH}", self.config.base_url);
+        let body = encode_q8k_batch_request(layers);
+
+        let first_layer = layers.first().map(|(l, _)| *l).unwrap_or(0);
+        let resp = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, Q8K_BATCH_CT)
+            .body(body)
+            .send()
+            .map_err(|e| RemoteFfnError::Http {
+                layer: first_layer,
+                cause: e.to_string(),
+            })?;
+
+        // 404 means the server doesn't support the Q8K endpoint yet.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RemoteFfnError::BadResponse(
+                "server does not support /v1/walk-ffn-q8k (404)".into(),
+            ));
+        }
+        if !resp.status().is_success() {
+            return Err(RemoteFfnError::ServerError {
+                status: resp.status().as_u16(),
+                body: resp.text().unwrap_or_default(),
+            });
+        }
+
+        let resp_bytes = resp
+            .bytes()
+            .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
+
+        decode_q8k_batch_response(&resp_bytes).map_err(RemoteFfnError::BadResponse)
     }
 
     /// Measure round-trip latency breakdown over `n` calls.

@@ -83,6 +83,7 @@ impl MetalBackend {
                 ffn_up_bias: None,
                 ffn_down_bias: None,
                 moe: None,
+                ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
             })

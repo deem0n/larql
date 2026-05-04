@@ -68,6 +68,21 @@ pub trait DecodeBackend {
     /// Reset KV cache (for new prompt).
     fn reset_kv_cache(&self) {}
 
+    /// Return the number of token positions currently committed to the KV cache.
+    fn kv_cache_len(&self) -> usize {
+        0
+    }
+
+    /// Roll back the KV cache to a previously saved length.  Safe to call with
+    /// any `len ≤ current_len`; the physical K/V data below `len` is preserved
+    /// (positions 0..len are not zeroed), so a subsequent decode pass starting
+    /// from position `len` will produce correct attention over the prior tokens.
+    ///
+    /// Used by iterative predispatch: all but the final Metal pass call
+    /// `truncate_kv_cache(saved_len)` so that only the last pass permanently
+    /// advances the sequence length.
+    fn truncate_kv_cache(&self, _len: usize) {}
+
     /// Pre-allocate the KV cache with per-layer shapes. Required for
     /// asymmetric attention geometry (Gemma 4 alternates sliding/global).
     fn preallocate_kv_cache_per_layer(&self, _shapes: &[(usize, usize)], _max_seq: usize) {}

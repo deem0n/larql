@@ -48,6 +48,7 @@
 mod backend;
 mod config;
 mod error;
+pub mod multi_layer_wire;
 mod router;
 mod shard;
 mod stream;
@@ -61,6 +62,12 @@ mod tests;
 pub use backend::RemoteMoeBackend;
 pub use config::{parse_unit_manifest, ShardConfig, UnitManifest, UnitShard};
 pub use error::RemoteMoeError;
+pub use multi_layer_wire::{
+    decode_multi_layer_request, decode_multi_layer_request_q8k, decode_multi_layer_response,
+    encode_multi_layer_request, encode_multi_layer_request_q8k, encode_multi_layer_response,
+    MultiLayerResult, MultiLayerTask, MultiLayerTaskQ8K, MULTI_LAYER_BATCH_CONTENT_TYPE,
+    MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
+};
 pub use router::MoeRouterWeights;
 pub use stream::{InflightMoe, ShardStream};
 pub use wire::{

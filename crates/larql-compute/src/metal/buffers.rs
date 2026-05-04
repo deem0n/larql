@@ -19,9 +19,17 @@ const PAGE_SIZE: usize = 16384;
 /// Buffer cache for Metal GPU buffers.
 /// Weight matrices from mmap'd files have stable addresses — their GPU buffers
 /// are created once and reused for all subsequent calls.
+/// Scratch output buffers are pooled by size — `output()` returns an existing
+/// buffer of the requested size rather than calling `device.new_buffer` each
+/// time. This eliminates ~21 GPU allocations per decode step which were the
+/// dominant CPU overhead for large models (31B: 86KB × 21 = ~200ms/token).
 pub struct BufferCache {
     device: Device,
     cache: Mutex<HashMap<CacheKey, Buffer>>,
+    /// Pool of pre-allocated scratch buffers keyed by byte length.
+    /// Each entry is a Vec of available (not currently in use) buffers.
+    /// Grows on first use; reused on subsequent decode steps.
+    scratch_pool: Mutex<HashMap<u64, Vec<Buffer>>>,
 }
 
 impl BufferCache {
@@ -29,6 +37,7 @@ impl BufferCache {
         Self {
             device: device.clone(),
             cache: Mutex::new(HashMap::new()),
+            scratch_pool: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,9 +169,30 @@ impl BufferCache {
     }
 
     /// Create an empty output buffer of given byte size.
+    /// Return a scratch output buffer of at least `bytes` bytes.
+    /// Reuses a pooled buffer when one of the exact size is available,
+    /// otherwise allocates once and adds it to the pool for future calls.
+    /// Callers treat the buffer as write-before-read scratch space.
     pub fn output(&self, bytes: u64) -> Buffer {
+        let mut pool = self.scratch_pool.lock().unwrap();
+        if let Some(buf) = pool.entry(bytes).or_default().pop() {
+            return buf;
+        }
         self.device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    }
+
+    /// Return a scratch buffer to the pool after it is no longer needed.
+    /// Must be called after `cmd.wait_until_completed()` — the GPU must
+    /// have finished writing before the buffer is recycled.
+    pub fn recycle(&self, buf: Buffer) {
+        let bytes = buf.length();
+        self.scratch_pool
+            .lock()
+            .unwrap()
+            .entry(bytes)
+            .or_default()
+            .push(buf);
     }
 
     /// Number of cached buffers (for diagnostics).
@@ -177,6 +207,41 @@ impl BufferCache {
 
     fn is_page_aligned(ptr: *const c_void, bytes: usize) -> bool {
         (ptr as usize).is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE)
+    }
+}
+
+/// RAII guard that returns scratch buffers to the pool when dropped.
+/// Create one per decode step; it holds clones of all output buffers allocated
+/// via `BufferCache::output`. Dropping the guard (at any function-exit path,
+/// including early returns) recycles all held buffers automatically.
+///
+/// **Invariant**: only drop after `cmd.wait_until_completed()` so the GPU has
+/// finished writing. The decode functions satisfy this: the guard is created
+/// early, but by the time it drops the final command buffer has been waited on.
+pub struct ScratchGuard<'a> {
+    bufs: Vec<Buffer>,
+    cache: &'a BufferCache,
+}
+
+impl<'a> ScratchGuard<'a> {
+    pub fn new(cache: &'a BufferCache) -> Self {
+        Self {
+            bufs: Vec::new(),
+            cache,
+        }
+    }
+
+    /// Track a buffer for recycling. Call once per `BufferCache::output()` call.
+    pub fn track(&mut self, buf: &Buffer) {
+        self.bufs.push(buf.clone());
+    }
+}
+
+impl Drop for ScratchGuard<'_> {
+    fn drop(&mut self) {
+        for buf in self.bufs.drain(..) {
+            self.cache.recycle(buf);
+        }
     }
 }
 

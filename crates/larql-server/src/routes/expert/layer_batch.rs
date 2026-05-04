@@ -13,12 +13,13 @@
 //! `LARQL_MOE_WIRE_F16=1` for LAN deployments where the savings cancel
 //! the conversion CPU cost.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::Response;
+use tokio::sync::Semaphore;
 
 use larql_inference::ffn::moe_remote::{
     decode_layer_batch_request, decode_layer_batch_request_f16, encode_layer_batch_response,
@@ -30,6 +31,31 @@ use crate::error::ServerError;
 use crate::state::AppState;
 
 use super::cpu::run_experts_cpu_batch;
+
+// Limits concurrent `run_experts_cpu_batch` calls to the number of logical
+// CPUs on the machine.  Without this, 30 simultaneous predispatch requests
+// each try to use rayon's global thread pool, causing ~30× oversubscription
+// that balloons server compute from ~4 ms to ~180 ms per token.
+//
+// With the semaphore: at most N_CORES calls run simultaneously, each using
+// rayon efficiently.  Wall time ≈ ceil(30 / N_CORES) × 1 ms per layer —
+// ~4 ms on 8 cores vs 180 ms unthrottled.
+//
+// `LARQL_COMPUTE_CONCURRENCY=N` overrides the auto-detected core count.
+fn compute_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("LARQL_COMPUTE_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+            });
+        Semaphore::new(n)
+    })
+}
 
 pub async fn handle_experts_layer_batch(
     State(state): State<Arc<AppState>>,
@@ -52,13 +78,13 @@ pub async fn handle_experts_layer_batch(
     let expert_ids: Vec<usize> = expert_ids_u32.iter().map(|&e| e as usize).collect();
 
     let t_spawn_in = std::time::Instant::now();
-    // `spawn_blocking` (vs `block_in_place`): we want the compute on the
-    // dedicated blocking thread pool so tokio's worker threads stay free
-    // for the hot HTTP path.  Tried block_in_place (2026-05-01): saved
-    // the ~25 µs transition server-side but made sweep ~0.3 ms slower
-    // because tokio kept spawning replacement OS workers when every
-    // request blocked the worker.  spawn_blocking's pool reuses threads
-    // and works better for the hot-path-blocks-every-call pattern.
+    // Acquire a compute slot before spawning.  Limits concurrent
+    // `run_experts_cpu_batch` calls to N_CORES so rayon is not oversubscribed
+    // when many predispatch requests arrive simultaneously.
+    let _permit = compute_semaphore()
+        .acquire()
+        .await
+        .map_err(|_| ServerError::Internal("compute semaphore closed".into()))?;
     let (weighted_sum, t_spawn_internal) = tokio::task::spawn_blocking(move || {
         let t_in = std::time::Instant::now();
         let r = run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights);
@@ -117,6 +143,10 @@ pub async fn handle_experts_layer_batch_f16(
     let expert_ids: Vec<usize> = expert_ids_u32.iter().map(|&e| e as usize).collect();
 
     let t_spawn_in = std::time::Instant::now();
+    let _permit = compute_semaphore()
+        .acquire()
+        .await
+        .map_err(|_| ServerError::Internal("compute semaphore closed".into()))?;
     let (weighted_sum, t_spawn_internal) = tokio::task::spawn_blocking(move || {
         let t_in = std::time::Instant::now();
         let r = run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights);

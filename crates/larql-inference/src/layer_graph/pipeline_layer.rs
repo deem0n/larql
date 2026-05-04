@@ -175,6 +175,7 @@ pub fn build_arch_params<'a>(
             .map(|v| v.as_slice()),
 
         moe: build_moe_weights(weights, arch, layer),
+        ffn_is_remote: false,
         moe_combined_output_norm: arch.moe_has_combined_output_norm(),
         moe_outer_post_norm: arch
             .moe_post_outer_norm_key(layer)
@@ -447,6 +448,21 @@ pub fn build_pipeline_layers<'a>(
             build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
         })
         .collect()
+}
+
+/// For `--ffn URL` (remote dense FFN) deployments: all FFN work is delegated
+/// to a remote server via `moe_fn` on every layer. This function sets
+/// `ffn_is_remote = true` on all layers, which causes the Metal decode loop
+/// to skip the local GPU FFN dispatches and route all FFN output through the
+/// `moe_fn` callback instead.
+///
+/// No MoE stub injection is needed: the `has_moe` check in `setup.rs` now
+/// also fires on `ffn_is_remote`, so the interleave path is taken for every
+/// layer even without `layer.moe` being set.
+pub fn patch_pipeline_layers_for_remote_ffn(layers: &mut [FullPipelineLayer<'_>]) {
+    for layer in layers.iter_mut() {
+        layer.ffn_is_remote = true;
+    }
 }
 
 /// For `--moe-shards` (remote expert) deployments: the client vindex has no

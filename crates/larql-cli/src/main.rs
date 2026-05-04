@@ -276,6 +276,9 @@ impl From<ChatArgs> for run_cmd::RunArgs {
             moe_shards: None,
             moe_units_manifest: None,
             moe_dispatch: "streaming".to_string(),
+            moe_predispatch_iters: 1,
+            ffn_dispatch: "streaming".to_string(),
+            ffn_predispatch_iters: 1,
         }
     }
 }

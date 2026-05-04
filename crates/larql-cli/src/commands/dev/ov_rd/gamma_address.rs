@@ -52,6 +52,32 @@ impl GammaProjectedAddressModel {
                 }
                 Ok(Array2::from_shape_vec(layer_input.raw_dim(), rows)?)
             }
+            GammaProjectionSource::RandomProjection(map) => {
+                let mut rows = Vec::with_capacity(layer_input.nrows() * map.rank);
+                for row in layer_input.rows() {
+                    rows.extend(
+                        map.project(row.as_slice().ok_or(
+                            "layer input row was not contiguous during random projection",
+                        )?),
+                    );
+                }
+                Ok(Array2::from_shape_vec(
+                    (layer_input.nrows(), map.rank),
+                    rows,
+                )?)
+            }
+            GammaProjectionSource::LearnedLowRank(map) => {
+                let mut rows = Vec::with_capacity(layer_input.nrows() * map.rank);
+                for row in layer_input.rows() {
+                    rows.extend(map.project(row.as_slice().ok_or(
+                        "layer input row was not contiguous during learned gamma projection",
+                    )?));
+                }
+                Ok(Array2::from_shape_vec(
+                    (layer_input.nrows(), map.rank),
+                    rows,
+                )?)
+            }
         }
     }
 }
@@ -60,6 +86,8 @@ impl GammaProjectedAddressModel {
 pub(super) enum GammaProjectionSource {
     Raw,
     DiagonalAffine(DiagonalAffineMap),
+    RandomProjection(RandomProjectionMap),
+    LearnedLowRank(LearnedLowRankMap),
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +102,80 @@ impl DiagonalAffineMap {
         row.iter()
             .enumerate()
             .map(|(dim, &x)| self.mean_y[dim] + self.slope[dim] * (x - self.mean_x[dim]))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RandomProjectionMap {
+    input_dim: usize,
+    rank: usize,
+    seed: u64,
+}
+
+impl RandomProjectionMap {
+    fn new(input_dim: usize, rank: usize, seed: u64) -> Self {
+        Self {
+            input_dim,
+            rank,
+            seed,
+        }
+    }
+
+    fn project(&self, row: &[f32]) -> Vec<f32> {
+        let scale = (self.input_dim as f32).sqrt().max(1.0);
+        let mut out = vec![0.0_f32; self.rank];
+        for (out_dim, value) in out.iter_mut().enumerate() {
+            let mut sum = 0.0_f32;
+            for (in_dim, &x) in row.iter().enumerate() {
+                let hash = splitmix64(
+                    self.seed
+                        ^ ((out_dim as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        ^ ((in_dim as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)),
+                );
+                let sign = if hash & 1 == 0 { -1.0 } else { 1.0 };
+                sum += sign * x;
+            }
+            *value = sum / scale;
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LearnedLowRankMap {
+    mean_x: Vec<f32>,
+    mean_y: Vec<f32>,
+    basis_y: Vec<Vec<f32>>,
+    weights: Vec<Vec<f32>>,
+    bias: Vec<f32>,
+    rank: usize,
+}
+
+impl LearnedLowRankMap {
+    fn project(&self, row: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0_f32; self.rank];
+        for (component, value) in out.iter_mut().enumerate() {
+            let mut sum = self.bias[component];
+            for (dim, &x) in row.iter().enumerate() {
+                sum += self.weights[component][dim] * (x - self.mean_x[dim]);
+            }
+            *value = sum;
+        }
+        out
+    }
+
+    fn target_coordinates(&self, target: &[f32]) -> Vec<f32> {
+        self.basis_y
+            .iter()
+            .map(|basis| {
+                target
+                    .iter()
+                    .zip(self.mean_y.iter())
+                    .zip(basis.iter())
+                    .map(|((&y, &mean), &direction)| (y - mean) * direction)
+                    .sum()
+            })
             .collect()
     }
 }
@@ -100,6 +202,13 @@ pub(super) fn fit_gamma_projected_address_models(
     codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
     selected_groups: &[usize],
     projection_layers: &[usize],
+    random_ranks: &[usize],
+    random_seeds: &[u64],
+    learned_ranks: &[usize],
+    learned_epochs: usize,
+    learned_lr: f32,
+    learned_l2: f32,
+    learned_pca_iters: usize,
     epochs: usize,
     lr: f32,
     l2: f32,
@@ -160,6 +269,44 @@ pub(super) fn fit_gamma_projected_address_models(
         }
     }
 
+    let mut learned_maps_by_head_layer_rank: HashMap<(HeadId, usize, usize), LearnedLowRankMap> =
+        HashMap::new();
+    for head in heads {
+        let head_samples = samples_by_head.get(head).cloned().unwrap_or_default();
+        for &projection_layer in projection_layers {
+            let pairs = head_samples
+                .iter()
+                .filter_map(|sample| {
+                    sample
+                        .targets
+                        .get(&projection_layer)
+                        .map(|target| (sample.raw_input.as_slice(), target.as_slice()))
+                })
+                .collect::<Vec<_>>();
+            if pairs.is_empty() {
+                continue;
+            }
+            for &rank in learned_ranks {
+                learned_maps_by_head_layer_rank.insert(
+                    (*head, projection_layer, rank),
+                    fit_learned_low_rank_map(
+                        &pairs,
+                        dim,
+                        rank,
+                        learned_pca_iters,
+                        learned_epochs,
+                        learned_lr,
+                        learned_l2,
+                        ((*head).layer as u64) << 32
+                            ^ ((*head).head as u64) << 24
+                            ^ (projection_layer as u64) << 8
+                            ^ rank as u64,
+                    ),
+                );
+            }
+        }
+    }
+
     let mut out = HashMap::new();
     for ((head, config), _) in codebooks {
         let train_samples = samples_by_head_config
@@ -215,11 +362,66 @@ pub(super) fn fit_gamma_projected_address_models(
                 l2,
             ));
         }
+        for &rank in random_ranks {
+            for &seed in random_seeds {
+                let map = RandomProjectionMap::new(dim, rank, seed);
+                let projected_rows = train_samples
+                    .iter()
+                    .map(|sample| map.project(&sample.raw_input))
+                    .collect::<Vec<_>>();
+                models.push(fit_one_projected_model(
+                    &format!("random_rank{rank}_seed{seed}"),
+                    GammaProjectionSource::RandomProjection(map),
+                    &projected_rows,
+                    &train_samples,
+                    *config,
+                    selected_groups,
+                    &group_majority,
+                    epochs,
+                    lr,
+                    l2,
+                ));
+            }
+        }
+        for &projection_layer in projection_layers {
+            for &rank in learned_ranks {
+                let Some(map) = learned_maps_by_head_layer_rank
+                    .get(&(*head, projection_layer, rank))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let projected_rows = train_samples
+                    .iter()
+                    .map(|sample| map.project(&sample.raw_input))
+                    .collect::<Vec<_>>();
+                models.push(fit_one_projected_model(
+                    &format!("gamma_learned_post_l{projection_layer}_rank{rank}"),
+                    GammaProjectionSource::LearnedLowRank(map),
+                    &projected_rows,
+                    &train_samples,
+                    *config,
+                    selected_groups,
+                    &group_majority,
+                    epochs,
+                    lr,
+                    l2,
+                ));
+            }
+        }
 
         out.insert((*head, *config), models);
     }
 
     Ok(out)
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn fit_one_projected_model(
@@ -319,6 +521,161 @@ fn fit_diagonal_affine_map(pairs: &[(&[f32], &[f32])], dim: usize) -> DiagonalAf
         mean_x,
         mean_y,
         slope,
+    }
+}
+
+fn fit_learned_low_rank_map(
+    pairs: &[(&[f32], &[f32])],
+    dim: usize,
+    rank: usize,
+    pca_iters: usize,
+    epochs: usize,
+    lr: f32,
+    l2: f32,
+    seed: u64,
+) -> LearnedLowRankMap {
+    let (mean_x, mean_y) = pair_means(pairs, dim);
+    let basis_y = fit_target_power_pca_basis(pairs, &mean_y, dim, rank, pca_iters, seed);
+    let mut map = LearnedLowRankMap {
+        mean_x,
+        mean_y,
+        basis_y,
+        weights: vec![vec![0.0_f32; dim]; rank],
+        bias: vec![0.0_f32; rank],
+        rank,
+    };
+    let target_coords = pairs
+        .iter()
+        .map(|(_, target)| map.target_coordinates(target))
+        .collect::<Vec<_>>();
+    let input_norms = pairs
+        .iter()
+        .map(|(input, _)| {
+            input
+                .iter()
+                .zip(map.mean_x.iter())
+                .map(|(&x, &mean)| {
+                    let centered = x - mean;
+                    centered * centered
+                })
+                .sum::<f32>()
+                .max(1.0)
+        })
+        .collect::<Vec<_>>();
+
+    for _ in 0..epochs {
+        for (sample_idx, (input, _)) in pairs.iter().enumerate() {
+            let norm = input_norms[sample_idx];
+            let step = lr / norm;
+            for component in 0..rank {
+                let mut pred = map.bias[component];
+                for (dim_idx, &x) in input.iter().enumerate() {
+                    pred += map.weights[component][dim_idx] * (x - map.mean_x[dim_idx]);
+                }
+                let err = pred - target_coords[sample_idx][component];
+                map.bias[component] -= lr * err * 0.01;
+                for (dim_idx, &x) in input.iter().enumerate() {
+                    let centered = x - map.mean_x[dim_idx];
+                    let grad = err * centered + l2 * map.weights[component][dim_idx];
+                    map.weights[component][dim_idx] -= step * grad;
+                }
+            }
+        }
+    }
+    map
+}
+
+fn pair_means(pairs: &[(&[f32], &[f32])], dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let n = pairs.len().max(1) as f64;
+    let mut mean_x = vec![0.0_f64; dim];
+    let mut mean_y = vec![0.0_f64; dim];
+    for &(x, y) in pairs {
+        for dim_idx in 0..dim {
+            mean_x[dim_idx] += x[dim_idx] as f64;
+            mean_y[dim_idx] += y[dim_idx] as f64;
+        }
+    }
+    (
+        mean_x.into_iter().map(|value| (value / n) as f32).collect(),
+        mean_y.into_iter().map(|value| (value / n) as f32).collect(),
+    )
+}
+
+fn fit_target_power_pca_basis(
+    pairs: &[(&[f32], &[f32])],
+    mean_y: &[f32],
+    dim: usize,
+    rank: usize,
+    pca_iters: usize,
+    seed: u64,
+) -> Vec<Vec<f32>> {
+    let mut basis = Vec::with_capacity(rank);
+    for component in 0..rank {
+        let mut v = deterministic_unit_vector(dim, seed ^ component as u64);
+        orthonormalize(&mut v, &basis);
+        for _ in 0..pca_iters {
+            let mut next = vec![0.0_f64; dim];
+            for &(_, y) in pairs {
+                let dot = y
+                    .iter()
+                    .zip(mean_y.iter())
+                    .zip(v.iter())
+                    .map(|((&yi, &mean), &vi)| (yi - mean) as f64 * vi as f64)
+                    .sum::<f64>();
+                for dim_idx in 0..dim {
+                    next[dim_idx] += (y[dim_idx] - mean_y[dim_idx]) as f64 * dot;
+                }
+            }
+            let inv_n = 1.0 / pairs.len().max(1) as f64;
+            let mut next_f32 = next
+                .into_iter()
+                .map(|value| (value * inv_n) as f32)
+                .collect::<Vec<_>>();
+            orthonormalize(&mut next_f32, &basis);
+            v = next_f32;
+        }
+        basis.push(v);
+    }
+    basis
+}
+
+fn deterministic_unit_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut values = (0..dim)
+        .map(|idx| {
+            let hash = splitmix64(seed ^ (idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+            let unit = ((hash >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64));
+            (2.0 * unit - 1.0) as f32
+        })
+        .collect::<Vec<_>>();
+    normalize(&mut values);
+    values
+}
+
+fn orthonormalize(v: &mut [f32], basis: &[Vec<f32>]) {
+    for prev in basis {
+        let dot = v
+            .iter()
+            .zip(prev.iter())
+            .map(|(&a, &b)| a as f64 * b as f64)
+            .sum::<f64>() as f32;
+        for (value, &prev_value) in v.iter_mut().zip(prev.iter()) {
+            *value -= dot * prev_value;
+        }
+    }
+    normalize(v);
+}
+
+fn normalize(v: &mut [f32]) {
+    let norm = v
+        .iter()
+        .map(|&value| value as f64 * value as f64)
+        .sum::<f64>()
+        .sqrt();
+    if norm > 1e-12 {
+        let inv = (1.0 / norm) as f32;
+        for value in v {
+            *value *= inv;
+        }
     }
 }
 

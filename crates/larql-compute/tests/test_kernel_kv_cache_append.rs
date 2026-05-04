@@ -163,6 +163,7 @@ fn attend(
         enc,
         cache,
         &metal.kv_attend_pipeline,
+        Some(&metal.kv_attend_long_pipeline),
         &q_buf,
         &out_buf,
         num_q,

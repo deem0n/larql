@@ -96,6 +96,19 @@ pub struct FfnStore {
     pub q4k_ffn_cache_lru: Mutex<std::collections::VecDeque<usize>>,
     /// Cap on `q4k_ffn_cache`. 0 = unlimited (default).
     pub q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize,
+    /// Lock-free per-slot dequant cache for the parallel-batch server path.
+    ///
+    /// `q4k_ffn_once[layer][c]` is populated at most once per process
+    /// lifetime via `OnceLock::get_or_init`.  After the first call for a
+    /// given (layer, component) all reads are a single atomic load + Arc
+    /// clone — no mutex, no LRU, no contention across rayon workers.
+    ///
+    /// Memory cost (31B, all 60 layers, all 3 components):
+    ///   60 × 3 × (intermediate × hidden × 4 bytes) ≈ 60 × 3 × 462 MB ≈ 83 GB f32.
+    /// In practice only the down component (component=2) is fetched from
+    /// this cache; gate/up use the NEON Q4K×Q8K kernel directly on mmap
+    /// bytes and never populate their slots here.
+    pub q4k_ffn_once: Vec<[std::sync::OnceLock<Option<Arc<Vec<f32>>>>; 3]>,
     /// FP4 / FP8 FFN storage (exp 26).
     pub fp4_storage: Option<Arc<crate::index::fp4_storage::Fp4Storage>>,
 }
@@ -114,6 +127,9 @@ impl FfnStore {
             q4k_ffn_cache: Mutex::new((0..num_layers).map(|_| [None, None, None]).collect()),
             q4k_ffn_cache_lru: Mutex::new(std::collections::VecDeque::new()),
             q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize::new(0),
+            q4k_ffn_once: (0..num_layers)
+                .map(|_| std::array::from_fn(|_| std::sync::OnceLock::new()))
+                .collect(),
             fp4_storage: None,
         }
     }
@@ -137,6 +153,9 @@ impl Clone for FfnStore {
             q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize::new(
                 self.q4k_ffn_cache_max_layers.load(Ordering::Relaxed),
             ),
+            q4k_ffn_once: (0..nl)
+                .map(|_| std::array::from_fn(|_| std::sync::OnceLock::new()))
+                .collect(),
             fp4_storage: self.fp4_storage.clone(),
         }
     }

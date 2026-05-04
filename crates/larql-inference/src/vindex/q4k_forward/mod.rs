@@ -34,4 +34,4 @@ pub use interventions::{
 pub use metal::predict_q4k_metal;
 pub use remote_ffn::{predict_q4k_hidden_with_ffn, predict_q4k_with_ffn};
 pub use tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
-pub use walk_ffn::q4k_ffn_forward_layer;
+pub use walk_ffn::{q4k_ffn_forward_layer, q4k_ffn_forward_layer_q8k};

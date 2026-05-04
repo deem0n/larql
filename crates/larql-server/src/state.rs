@@ -99,6 +99,14 @@ pub struct LoadedModel {
     pub moe_scratches: std::sync::Mutex<
         std::collections::HashMap<(usize, usize, usize), Arc<larql_compute::MoeScratch>>,
     >,
+    /// Per-layer pre-loaded Q4K weight buffers for Metal dense FFN dispatch.
+    /// `[gate_buf, up_buf, down_buf]` for each layer. Lazily populated on first
+    /// Metal FFN request from the interleaved Q4K mmap (zero-copy via
+    /// `new_buffer_with_bytes_no_copy` for page-aligned mmap data).
+    /// Only populated when the server has interleaved Q4K data loaded.
+    #[cfg(feature = "metal-experts")]
+    pub metal_ffn_layer_bufs:
+        std::sync::OnceLock<Vec<[larql_compute::MetalBuffer; 3]>>,
 }
 
 impl LoadedModel {
@@ -380,6 +388,8 @@ mod loaded_model_tests {
             metal_backend: std::sync::OnceLock::new(),
             #[cfg(feature = "metal-experts")]
             moe_scratches: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "metal-experts")]
+            metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         }
     }
 

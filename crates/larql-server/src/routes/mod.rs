@@ -44,10 +44,13 @@ const PATCHES_APPLY: &str = "/v1/patches/apply";
 const PATCHES: &str = "/v1/patches";
 const PATCH_BY_NAME: &str = "/v1/patches/{name}";
 const WALK_FFN: &str = "/v1/walk-ffn";
+const WALK_FFN_Q8K: &str = "/v1/walk-ffn-q8k";
 const EXPERT_TOPOLOGY: &str = "/v1/expert/topology";
 const EXPERT_BATCH: &str = "/v1/expert/batch";
 const EXPERTS_LAYER_BATCH: &str = "/v1/experts/layer-batch";
 const EXPERTS_LAYER_BATCH_F16: &str = "/v1/experts/layer-batch-f16";
+const EXPERTS_MULTI_LAYER_BATCH: &str = "/v1/experts/multi-layer-batch";
+const EXPERTS_MULTI_LAYER_BATCH_Q8K: &str = "/v1/experts/multi-layer-batch-q8k";
 const EXPERT: &str = "/v1/expert/{layer}/{expert_id}";
 const EXPLAIN_INFER: &str = "/v1/explain-infer";
 const INSERT: &str = "/v1/insert";
@@ -92,6 +95,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(PATCHES, get(patches::handle_list_patches))
         .route(PATCH_BY_NAME, delete(patches::handle_remove_patch))
         .route(WALK_FFN, post(walk_ffn::handle_walk_ffn))
+        .route(WALK_FFN_Q8K, post(walk_ffn::handle_walk_ffn_q8k))
         .route(EXPERT_TOPOLOGY, get(topology::handle_topology))
         .route(
             EXPERT_BATCH,
@@ -105,6 +109,16 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(
             EXPERTS_LAYER_BATCH_F16,
             post(expert::handle_experts_layer_batch_f16)
+                .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
+        )
+        .route(
+            EXPERTS_MULTI_LAYER_BATCH,
+            post(expert::handle_experts_multi_layer_batch)
+                .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
+        )
+        .route(
+            EXPERTS_MULTI_LAYER_BATCH_Q8K,
+            post(expert::handle_experts_multi_layer_batch_q8k)
                 .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
         )
         .route(EXPERT, post(expert::handle_expert))

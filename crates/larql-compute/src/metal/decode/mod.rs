@@ -221,7 +221,16 @@ impl MetalBackend {
             inter_padded,
             num_layers,
             has_moe,
+            scratch_clones,
         } = scratch;
+        // Return scratch buffers to the pool when this decode step exits.
+        let _scratch_guard = {
+            let mut g = super::buffers::ScratchGuard::new(&self.bufs);
+            for buf in scratch_clones {
+                g.track(&buf);
+            }
+            g
+        };
         let mut h_buf = &h_init;
         // Split mode: when a fire+collect callback pair is present, defer
         // FFN encoding for MoE layers until *after* the remote MoE call has
@@ -349,6 +358,10 @@ impl MetalBackend {
             // they can run in parallel with the remote MoE round trip.  For
             // non-MoE layers (or non-split mode) we encode them inline as
             // before.
+            //
+            // Also skip when ffn_is_remote: the entire FFN for this layer
+            // will be provided by the remote server via moe_fn, so there
+            // is no local FFN work to encode on the GPU.
             let defer_ffn_for_split = split_mode && layer.moe.is_some();
 
             // Stage-timing boundary: when LARQL_PROFILE_SPLIT=1 (or the legacy
@@ -368,65 +381,72 @@ impl MetalBackend {
                 encoder_ended = false;
             }
 
-            if !defer_ffn_for_split {
-                // Step 6: FFN (format-aware Q4_KF / Q4_K / Q4_0)
-                self.encode_ffn_step(
-                    &enc,
-                    layer,
-                    encode_ffn::FfnBufs {
-                        gate_w: &gate_bufs[l],
-                        up_w: &up_bufs[l],
-                        down_w: &down_bufs[l],
-                        ffn_norm_out: &ffn_norm_out,
-                        ffn_q8: &ffn_q8,
-                        ffn_q8s: &ffn_q8s,
-                        gate_out_scratch: &gate_out_scratch,
-                        up_out: &up_out,
-                        act_buf: &act_buf,
-                        down_out: &down_out,
-                    },
-                    encode_ffn::FfnDims {
-                        hidden,
-                        inter,
-                        inter_padded,
-                    },
-                    ffn_uses_q4k,
-                );
-
-                // Step 7: Post-FFN residual. Default-on fused
-                // post_ffn_norm+residual_add when applicable; opt out via
-                // `LARQL_FUSED_POST_FFN_NORM=0` for diagnostics.
+            if !defer_ffn_for_split && !layer.ffn_is_remote {
+                let ffn_bufs = encode_ffn::FfnBufs {
+                    gate_w: &gate_bufs[l],
+                    up_w: &up_bufs[l],
+                    down_w: &down_bufs[l],
+                    ffn_norm_out: &ffn_norm_out,
+                    ffn_q8: &ffn_q8,
+                    ffn_q8s: &ffn_q8s,
+                    gate_out_scratch: &gate_out_scratch,
+                    up_out: &up_out,
+                    act_buf: &act_buf,
+                    down_out: &down_out,
+                };
+                let ffn_dims = encode_ffn::FfnDims {
+                    hidden,
+                    inter,
+                    inter_padded,
+                };
                 let use_fused_post_ffn = !matches!(
                     std::env::var("LARQL_FUSED_POST_FFN_NORM").as_deref(),
                     Ok("0") | Ok("false") | Ok("off") | Ok("no")
                 );
-                self.encode_post_ffn_residual(
-                    &enc,
-                    layer,
-                    encode_post_ffn::PostFfnBufs {
-                        down_out: &down_out,
-                        h_post_attn: &h_post_attn,
-                        new_h,
-                        normed_scratch: &normed_scratch,
-                    },
-                    hidden,
-                    use_fused_post_ffn,
-                );
+                let post_ffn_bufs = encode_post_ffn::PostFfnBufs {
+                    down_out: &down_out,
+                    h_post_attn: &h_post_attn,
+                    new_h,
+                    normed_scratch: &normed_scratch,
+                };
 
-                // Paired commit boundary: closes the FFN cmd buffer started
-                // after the attention boundary above so its GPU window
-                // attributes cleanly to DenseFfn instead of leaking into the
-                // next layer's attention buffer (the bug the prior single-
-                // sided LARQL_DECODE_STAGE_TIMING path had). Skipped when has_moe
-                // because the MoE interleave below handles its own commits.
                 if stage_timing_split && !has_moe {
+                    // Fine split: gate+up in one CB, act+down+residual in another.
+                    // Step 6a: gate+up
+                    self.encode_ffn_gate_up_phase(&enc, layer, &ffn_bufs, ffn_dims, ffn_uses_q4k);
                     enc.end_encoding();
                     cmd.commit();
                     cmd.wait_until_completed();
-                    gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::DenseFfn);
+                    gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::GateUp);
                     cmd = self.queue.new_command_buffer().to_owned();
                     enc = cmd.new_compute_command_encoder().to_owned();
                     encoder_ended = false;
+                    // Step 6b + 7: activation+down + post-FFN residual
+                    self.encode_ffn_down_phase(&enc, layer, &ffn_bufs, ffn_dims, ffn_uses_q4k);
+                    self.encode_post_ffn_residual(
+                        &enc,
+                        layer,
+                        post_ffn_bufs,
+                        hidden,
+                        use_fused_post_ffn,
+                    );
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::Down);
+                    cmd = self.queue.new_command_buffer().to_owned();
+                    enc = cmd.new_compute_command_encoder().to_owned();
+                    encoder_ended = false;
+                } else {
+                    // Production path: whole FFN in one encoder block.
+                    self.encode_ffn_step(&enc, layer, ffn_bufs, ffn_dims, ffn_uses_q4k);
+                    self.encode_post_ffn_residual(
+                        &enc,
+                        layer,
+                        post_ffn_bufs,
+                        hidden,
+                        use_fused_post_ffn,
+                    );
                 }
             }
 
@@ -616,8 +636,8 @@ impl MetalBackend {
         if profile::split_profile_requested() {
             profile::store_last_split_timings(profile::ProfileTimings {
                 attn_ms: gpu_time.attn_ms,
-                gate_up_ms: gpu_time.dense_ffn_ms,
-                down_ms: 0.0,
+                gate_up_ms: gpu_time.gate_up_ms,
+                down_ms: gpu_time.down_ms,
             });
         }
 

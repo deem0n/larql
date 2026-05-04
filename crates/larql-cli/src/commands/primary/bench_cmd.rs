@@ -17,6 +17,7 @@
 //!   --warmup N       decode steps to run first and discard (default: 3).
 //!   --backends LIST  comma-separated: `metal`, `cpu`. Default: `metal`.
 //!   --ollama MODEL   also query Ollama (e.g. `gemma3:4b`) via localhost.
+//!   --ffn URL        bench remote FFN path (attention local, FFN remote).
 //!   -v, --verbose
 
 use std::time::Instant;
@@ -60,6 +61,23 @@ pub struct BenchArgs {
     #[arg(long, value_name = "ENGINE,...")]
     pub engine: Option<String>,
 
+    /// Route FFN to a remote larql-server for the bench run.
+    /// Attention runs locally on Metal; each layer's FFN is a round trip to
+    /// the URL. Use this to bench the grid path for large models like 31B.
+    /// Example: `--ffn http://127.0.0.1:8080`
+    #[arg(long, value_name = "URL")]
+    pub ffn: Option<String>,
+
+    /// HTTP timeout in seconds for --ffn.
+    #[arg(long, default_value = "60")]
+    pub ffn_timeout_secs: u64,
+
+    /// Dispatch strategy for --ffn.
+    ///   streaming  (default) — one HTTP round-trip per layer per token.
+    ///   batch      — all layers in parallel (Q8K NEON) per token.
+    #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
+    pub ffn_dispatch: String,
+
     /// Print per-stage timing breakdown for each engine (markov-rs only for now).
     #[arg(long)]
     pub profile: bool,
@@ -75,6 +93,10 @@ struct BenchRow {
     avg_decode_ms: f64,
     tok_per_s: f64,
     stages: Option<larql_inference::layer_graph::generate::StageTimings>,
+    /// Remote FFN path breakdown: average FFN round-trip ms per token.
+    ffn_rtt_ms: Option<f64>,
+    /// Estimated local attention+norm+lmhead ms per token (= decode - ffn_rtt).
+    attn_ms: Option<f64>,
     n_steps: usize,
     note: String,
 }
@@ -98,9 +120,10 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let want_metal = requested_backends.contains(&"metal");
     let want_cpu = requested_backends.contains(&"cpu");
     let want_engine = args.engine.is_some();
-    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine {
+    let want_ffn = args.ffn.is_some();
+    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine && !want_ffn {
         return Err(
-            "no backends selected: pass --backends metal,cpu, --ollama, or --engine".into(),
+            "no backends selected: pass --backends metal,cpu, --ollama, --engine, or --ffn".into(),
         );
     }
 
@@ -244,6 +267,10 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(ref ffn_url) = args.ffn {
+        rows.push(run_remote_ffn_bench(&vindex_path, &args, ffn_url)?);
+    }
+
     print_table(&rows);
     Ok(())
 }
@@ -323,6 +350,9 @@ fn run_larql(
         );
     }
 
+    if args.profile {
+        std::env::set_var("LARQL_PROFILE_SPLIT", "1");
+    }
     let max_tokens = args.warmup + args.tokens;
     let num_layers = weights.num_layers;
     let t0 = Instant::now();
@@ -387,6 +417,8 @@ fn run_larql(
         avg_decode_ms,
         tok_per_s,
         stages,
+        ffn_rtt_ms: None,
+        attn_ms: None,
         n_steps: measured_n,
         note,
     })
@@ -495,6 +527,8 @@ fn run_engine(
         avg_decode_ms,
         tok_per_s,
         stages: None,
+        ffn_rtt_ms: None,
+        attn_ms: None,
         n_steps: measured_n,
         note,
     })
@@ -617,7 +651,162 @@ fn run_engine_q4k(
         avg_decode_ms,
         tok_per_s,
         stages: None,
+        ffn_rtt_ms: None,
+        attn_ms: None,
         n_steps: measured_n,
+        note,
+    })
+}
+
+/// Bench the remote-FFN path: attention runs locally on Metal, FFN is a
+/// round-trip to `ffn_url` via `LayerShardedBackend`.
+///
+/// Reports overall tok/s plus a breakdown:
+///   ffn-rtt  — time spent in the remote FFN closure (all layers summed)
+///   attn+    — remainder = local attn + norm + lm_head + embed
+fn run_remote_ffn_bench(
+    vindex_path: &std::path::Path,
+    args: &BenchArgs,
+    ffn_url: &str,
+) -> Result<BenchRow, Box<dyn std::error::Error>> {
+    use larql_inference::{
+        generate_with_remote_ffn, generate_with_remote_ffn_batch, LayerShardedBackend,
+    };
+    use std::time::Duration;
+
+    if args.verbose {
+        eprintln!("[bench] loading vindex for remote-ffn…");
+    }
+
+    let timeout = Duration::from_secs(args.ffn_timeout_secs);
+    let backend = larql_compute::default_backend();
+
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load client weights: {e}"))?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
+        .map_err(|e| format!("failed to load tokenizer: {e}"))?;
+    let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load vindex: {e}"))?;
+    index.load_attn_q4k(vindex_path)?;
+    index.load_interleaved_q4k(vindex_path)?;
+    let _ = index.load_lm_head_q4(vindex_path);
+
+    eprintln!("Connecting to remote FFN at {ffn_url}…");
+    let remote = LayerShardedBackend::connect(ffn_url, timeout)
+        .map_err(|e| format!("failed to connect to remote FFN: {e}"))?;
+    eprintln!("  Attention:  {} (local)", backend.name());
+    eprintln!("  FFN:        remote  ({})", ffn_url);
+
+    let wrapped_prompt =
+        larql_inference::chat::render_user_prompt(vindex_path, weights.arch.family(), &args.prompt)
+            .unwrap_or_else(|_| args.prompt.clone());
+    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
+        .map_err(|e| format!("tokenise: {e}"))?;
+
+    let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
+    let max_tokens = args.warmup + args.tokens;
+
+    let is_batch = args.ffn_dispatch.trim() == "batch";
+
+    // Warmup run — discarded. Amortises TCP connection, Metal init.
+    if args.verbose {
+        eprintln!("[bench] remote-ffn warmup ({} tokens)…", args.warmup.max(1));
+    }
+    if is_batch {
+        let _ = generate_with_remote_ffn_batch(
+            &weights,
+            &tokenizer,
+            prompt_ids.clone(),
+            args.warmup.max(1),
+            &index,
+            &*backend,
+            &remote,
+            &eos,
+            1,
+        );
+    } else {
+        let _ = generate_with_remote_ffn(
+            &weights,
+            &tokenizer,
+            prompt_ids.clone(),
+            args.warmup.max(1),
+            &index,
+            &*backend,
+            &remote,
+            &eos,
+        );
+    }
+
+    // Measured run.
+    let t_wall = std::time::Instant::now();
+    let result = if is_batch {
+        generate_with_remote_ffn_batch(
+            &weights,
+            &tokenizer,
+            prompt_ids.clone(),
+            max_tokens,
+            &index,
+            &*backend,
+            &remote,
+            &eos,
+            1,
+        )
+        .map_err(|e| format!("remote-ffn generate failed (batch): {e}"))?
+    } else {
+        generate_with_remote_ffn(
+            &weights,
+            &tokenizer,
+            prompt_ids.clone(),
+            max_tokens,
+            &index,
+            &*backend,
+            &remote,
+            &eos,
+        )
+        .map_err(|e| format!("remote-ffn generate failed: {e}"))?
+    };
+    let _wall_ms = t_wall.elapsed().as_secs_f64() * 1000.0;
+
+    let n_warm = args.warmup.min(result.decode_ms.len());
+    let measured_decode = &result.decode_ms[n_warm..];
+    let measured_ffn = &result.ffn_rtt_ms[n_warm.min(result.ffn_rtt_ms.len())..];
+    let n = measured_decode.len();
+
+    let (prefill_ms, avg_decode_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
+        (0.0, 0.0, 0.0, None, None)
+    } else {
+        let avg_decode = measured_decode.iter().sum::<f64>() / n as f64;
+        let avg_ffn = if measured_ffn.len() == n {
+            Some(measured_ffn.iter().sum::<f64>() / n as f64)
+        } else {
+            None
+        };
+        let avg_attn = avg_ffn.map(|f| (avg_decode - f).max(0.0));
+        (0.0, avg_decode, 1000.0 / avg_decode, avg_ffn, avg_attn)
+    };
+
+    let note = if n < args.tokens {
+        format!("early stop @{}/{}", n, args.tokens)
+    } else {
+        String::new()
+    };
+
+    let _ = weights; // keep alive
+
+    Ok(BenchRow {
+        backend: format!(
+            "remote-ffn-{} ({})",
+            if is_batch { "batch" } else { "stream" },
+            ffn_url
+        ),
+        prefill_ms,
+        avg_decode_ms,
+        tok_per_s,
+        stages: None,
+        ffn_rtt_ms,
+        attn_ms,
+        n_steps: n,
         note,
     })
 }
@@ -647,6 +836,8 @@ fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
         avg_decode_ms: 0.0,
         tok_per_s: 0.0,
         stages: None,
+        ffn_rtt_ms: None,
+        attn_ms: None,
         n_steps: 0,
         note: "not reachable (ollama serve on :11434?)".into(),
     };
@@ -712,6 +903,18 @@ fn print_table(rows: &[BenchRow]) {
                 s.gpu_ms_total,
                 pct(s.gpu_ms_total)
             );
+            if s.gate_up_ms_total > 0.0 {
+                println!(
+                    "      gate+up {:>6.3}ms  ({:>4.1}%)",
+                    s.gate_up_ms_total,
+                    pct(s.gate_up_ms_total)
+                );
+                println!(
+                    "      act+down{:>6.3}ms  ({:>4.1}%)",
+                    s.down_ms_total,
+                    pct(s.down_ms_total)
+                );
+            }
             println!(
                 "    final_norm{:>6.3}ms  ({:>4.1}%)",
                 s.norm_ms_total,
@@ -728,6 +931,40 @@ fn print_table(rows: &[BenchRow]) {
                 pct(s.detok_ms_total)
             );
         }
+    }
+
+    // Remote FFN breakdown for whichever row has it.
+    let ffn_row = rows.iter().find(|r| r.ffn_rtt_ms.is_some());
+    if let Some(r) = ffn_row {
+        let ffn = r.ffn_rtt_ms.unwrap();
+        let attn = r.attn_ms.unwrap_or(r.avg_decode_ms);
+        let total = r.avg_decode_ms;
+        let pct = |v: f64| {
+            if total > 0.0 {
+                (v / total) * 100.0
+            } else {
+                0.0
+            }
+        };
+        println!();
+        println!(
+            "  Per-stage average (remote-ffn, {} layers × RTT):",
+            r.backend.split('(').nth(0).unwrap_or("").trim()
+        );
+        println!(
+            "    attn+norm+lmhead {:>7.2}ms  ({:>4.1}%)",
+            attn,
+            pct(attn)
+        );
+        println!(
+            "    ffn round-trips  {:>7.2}ms  ({:>4.1}%)  ← remote",
+            ffn,
+            pct(ffn)
+        );
+        println!(
+            "    total/tok        {:>7.2}ms  →  {:.1} tok/s",
+            total, r.tok_per_s
+        );
     }
 
     // Top-line comparison: larql vs ollama, if both present.

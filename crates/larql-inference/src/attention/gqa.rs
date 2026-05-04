@@ -70,6 +70,73 @@ pub fn gqa_attention_with_all_weights(
     )
 }
 
+/// Capture every query-position attention distribution using only the first
+/// `qk_rank` dimensions of each Q/K head. This is a diagnostic surface for
+/// reduced-QK address probes; it does not compute a V-weighted output.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_reduced_qk_all_weights(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    softcap: Option<f32>,
+    qk_rank: usize,
+) -> AttentionAllWeights {
+    let rank = qk_rank.clamp(1, head_dim);
+    let mut captured_all_heads: Vec<Vec<Vec<f32>>> = Vec::with_capacity(num_q);
+    let scale_f32 = scale as f32;
+    let mut scores_buf = vec![0.0f32; seq_len];
+
+    for h in 0..num_q {
+        let mut captured_positions: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        let kv_h = h / reps;
+        let q_off = h * head_dim;
+        let kv_off = kv_h * head_dim;
+
+        for qi in 0..seq_len {
+            let causal_len = qi + 1;
+            let q_row = q.slice(ndarray::s![qi, q_off..q_off + rank]);
+            let k_block = k.slice(ndarray::s![0..causal_len, kv_off..kv_off + rank]);
+            let raw_scores = k_block.dot(&q_row);
+
+            for i in 0..causal_len {
+                let mut s = raw_scores[i] * scale_f32;
+                if let Some(cap) = softcap {
+                    s = (s / cap).tanh() * cap;
+                }
+                scores_buf[i] = s;
+            }
+
+            let max_val = scores_buf[..causal_len]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f64;
+            for score in scores_buf.iter_mut().take(causal_len) {
+                let e = ((*score - max_val) as f64).exp();
+                *score = e as f32;
+                sum += e;
+            }
+            let inv_sum = (1.0 / sum) as f32;
+            for score in scores_buf.iter_mut().take(causal_len) {
+                *score *= inv_sum;
+            }
+
+            let mut captured = vec![0.0f32; seq_len];
+            captured[..causal_len].copy_from_slice(&scores_buf[..causal_len]);
+            captured_positions.push(captured);
+        }
+        captured_all_heads.push(captured_positions);
+    }
+
+    AttentionAllWeights {
+        heads: captured_all_heads,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gqa_attention_capture(
     q: &Array2<f32>,

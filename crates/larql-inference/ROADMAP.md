@@ -1,6 +1,6 @@
 # Roadmap — larql-inference
 
-## Current: 72–75 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-02) | Ollama: ~96–104 tok/s | 4 KV engines
+## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines
 
 ## Open: Mechanistic research engine surface — Q4K interventions for OV/RD
 
@@ -37,11 +37,21 @@ The forward stack already routes most behavior through `ModelArchitecture` and
 or pass first-layer scalar geometry into backends that now support per-layer
 shape variation.
 
+**Confirmed blocker (2026-05-04):** Gemma 4 31B Q4K has 60 layers split into two
+geometry classes: 50 sliding-attention layers (head_dim=256, num_kv_heads=16,
+sliding_window=1024) and 10 full-attention layers at L5, L11, L17, L23, L29,
+L35, L41, L47, L53, L59 (head_dim=512, num_kv_heads=4). The Metal backend
+currently uses L0's sliding-attention geometry for all 60 layers. This produces
+corrupted KV state at L5 (the first global layer) and causes immediate EOS in
+`larql bench --metal`. A1-A3 are the direct fix path. Until they land, 31B local
+Metal is blocked; remote-FFN batch (§ run_dense_ffn_q4k) gives 6.5 tok/s on the
+same machine.
+
 Work items:
 
 | # | Item | Status |
 |---|------|--------|
-| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path, starting with MLA/DeepSeek | planned |
+| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path; first priority is Gemma 4 31B heterogeneous sliding/global attention (L0 geometry ≠ all-layer geometry) | planned |
 | A2 | Remove scalar `num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base` assumptions from decode/prefill call sites where `FullPipelineLayer` already carries per-layer values | planned |
 | A3 | Ensure all KV cache allocation paths use `layers[*].num_kv_heads` and `layers[*].head_dim`, not the caller's first-layer geometry fallback | planned |
 | A4 | Add architecture fixtures for heterogeneous geometry and unsupported-attention failures so GPU, CPU, trace, and vindex-backed paths agree | planned |
@@ -66,7 +76,7 @@ research artifact.
 | MI1 | Python `WalkModel.trace()` and `patch_activations()` use vindex `WalkFfn`, not dense fallback | shipped 2026-05-02 |
 | MI2 | Backend-parametric activation patching helpers for donor capture and recipient intervention | shipped 2026-05-02 |
 | MI3 | Trace artifact contract: complete ordered chains only, exact file length checks, `TRACE SAVE` requires `POSITIONS ALL` | shipped 2026-05-02 |
-| MI4 | Golden parity tests: TRACE final residual/logits match canonical forward across dense, WalkFfn, patched vindex, Q4K, and MoE paths | partial — dense/custom backend pinned |
+| MI4 | Golden parity tests: TRACE final residual/logits match canonical forward across dense, WalkFfn, patched vindex, Q4K, and MoE paths | partial — dense/custom backend pinned; GPU FFN server path (`run_dense_ffn_q4k`) shipped 2026-05-04, parity tests pending |
 | MI5 | Rich attribution objects: per-head attention writes, per-feature FFN activations, router/expert decisions, and path-level provenance | planned |
 | MI6 | Expanded causal operators: head patching, feature patching, FFN feature ablation, router/expert patching, and KV/residual boundary patching | planned |
 | MI7 | Q4K/MoE interpretability parity: trace and patch support for quantized dense and routed expert paths, with clear precision caveats | planned |

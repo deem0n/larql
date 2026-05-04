@@ -25,8 +25,8 @@ fn rss_mb() -> f64 {
 
 use clap::Args;
 use larql_inference::{
-    predict_with_ffn, predict_with_router, vindex::WalkFfn, InferenceModel, LayerFfnRouter,
-    LayerShardedBackend, ModelWeights, SparseFfn, WeightFfn,
+    generate_with_remote_ffn_batch, predict_with_ffn, predict_with_router, vindex::WalkFfn,
+    InferenceModel, LayerFfnRouter, LayerShardedBackend, ModelWeights, SparseFfn, WeightFfn,
 };
 use larql_vindex::{
     load_vindex_embeddings, load_vindex_tokenizer, ndarray, tokenizers, IndexLoadCallbacks,
@@ -123,6 +123,17 @@ pub struct WalkArgs {
     /// Per-request HTTP timeout (seconds) for `--ffn-remote`.
     #[arg(long, default_value = "60")]
     pub ffn_remote_timeout_secs: u64,
+
+    /// Dense FFN dispatch strategy when `--ffn-remote` is set.
+    ///
+    ///   streaming  (default) — sequential per-layer round-trips (exact).
+    ///   batch      — all layers fired in parallel, then injected (approximate).
+    #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
+    pub ffn_dispatch: String,
+
+    /// Number of predispatch iterations per token when `--ffn-dispatch batch`.
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub ffn_predispatch_iters: usize,
 }
 
 struct VerboseLoadCallbacks;
@@ -906,6 +917,71 @@ fn run_predict_remote(
     );
 
     let start = Instant::now();
+
+    if args.max_tokens > 1 && args.ffn_dispatch == "batch" {
+        // Batch predispatch: use Metal pipeline with parallel per-layer HTTP
+        // requests. Requires the Q4K vindex with interleaved FFN mmap.
+        use larql_inference::generate_with_remote_ffn_batch;
+        let mut cb = SilentLoadCallbacks;
+        let mut q4_index = VectorIndex::load_vindex(
+            args.index
+                .as_deref()
+                .expect("index required for batch dispatch"),
+            &mut cb,
+        )?;
+        q4_index.load_attn_q4k(
+            args.index
+                .as_deref()
+                .expect("index required for batch dispatch"),
+        )?;
+        q4_index.load_interleaved_q4k(
+            args.index
+                .as_deref()
+                .expect("index required for batch dispatch"),
+        )?;
+        let _ = q4_index.load_lm_head_q4(
+            args.index
+                .as_deref()
+                .expect("index required for batch dispatch"),
+        );
+        let backend = larql_compute::default_backend();
+        let wrapped_prompt = larql_inference::chat::render_user_prompt(
+            args.index.as_deref().expect("index required"),
+            weights.arch.family(),
+            args.prompt.as_str(),
+        )?;
+        let batch_ids = larql_inference::encode_prompt(tokenizer, &*weights.arch, &wrapped_prompt)
+            .map_err(|e| format!("tokenize error: {e}"))?;
+        let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(
+            args.index.as_deref().expect("index required"),
+        );
+        let result = generate_with_remote_ffn_batch(
+            weights,
+            tokenizer,
+            batch_ids,
+            args.max_tokens,
+            &q4_index,
+            &*backend,
+            &remote,
+            &eos,
+            args.ffn_predispatch_iters,
+        )
+        .map_err(|e| format!("remote-ffn batch generate failed: {e}"))?;
+        for tok in &result.tokens {
+            print!("{tok}");
+        }
+        if !result.tokens.is_empty() {
+            println!();
+        }
+        if verbose {
+            eprintln!(
+                "  Forward pass: {:.2}s  (FFN → {} batch)",
+                start.elapsed().as_secs_f64(),
+                url
+            );
+        }
+        return Ok(());
+    }
 
     if args.max_tokens > 1 {
         generate_stream(weights, tokenizer, &remote, token_ids, args, verbose);

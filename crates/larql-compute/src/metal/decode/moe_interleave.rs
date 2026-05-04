@@ -60,9 +60,15 @@ impl MetalBackend {
         moe_fn: &mut Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
         moe_collect_fn: &mut Option<&mut dyn FnMut(usize) -> Vec<f32>>,
     ) {
-        let Some(ref moe) = layer.moe else {
+        // Proceed when this is a hybrid-MoE layer (layer.moe is Some) OR when
+        // the entire FFN is remote (ffn_is_remote), which also routes through
+        // the moe_fn callback path instead of running a local GPU FFN.
+        if layer.moe.is_none() && !layer.ffn_is_remote {
             return;
-        };
+        }
+        // Borrow the MoE weights if present (used only in the local-expert
+        // fallback branch — never reached when moe_fn is Some or ffn_is_remote).
+        let moe_ref = layer.moe.as_ref();
 
         state.enc.end_encoding();
         state.cmd.commit();
@@ -147,15 +153,37 @@ impl MetalBackend {
         } else if let Some(ref mut f) = moe_fn {
             f(ctx.layer_idx, attn_slice)
         } else {
+            // Local expert fallback — only reachable when moe_fn is None and
+            // ffn_is_remote is false (otherwise we'd have taken a branch above).
+            let moe = moe_ref.expect("cpu_moe_forward requires moe weights");
             crate::cpu::ops::moe::cpu_moe_forward(attn_slice, moe, layer.norm_offset, layer.eps)
         };
 
-        // Accumulate the MoE contribution into the dense output buffer:
-        // new_h = h_post_attn + dense + moe_out.
+        // Accumulate the FFN contribution into the output buffer.
+        //
+        // Dense hybrid MoE path: new_h = (h_post_attn + dense_ffn) + moe_out.
+        //   The GPU has already written `h_post_attn + dense_ffn` into new_h,
+        //   so we add moe_out in-place.
+        //
+        // Remote-FFN path (ffn_is_remote): new_h = h_post_attn + remote_ffn_out.
+        //   The GPU did NOT run the local FFN, so new_h is uninitialised for
+        //   this layer. We set new_h[i] = h_post_attn[i] + moe_out[i] directly.
         let h_ptr = bufs.new_h.contents() as *mut f32;
-        unsafe {
-            for (i, v) in moe_out.iter().enumerate() {
-                *h_ptr.add(i) += v;
+        if layer.ffn_is_remote {
+            // Remote-FFN: new_h = h_post_attn + remote_ffn_out.
+            // attn_ptr was already computed above (h_post_attn contents).
+            unsafe {
+                for (i, v) in moe_out.iter().enumerate() {
+                    *h_ptr.add(i) = *attn_ptr.add(i) + v;
+                }
+            }
+        } else {
+            // Hybrid MoE: new_h already holds (h_post_attn + dense_ffn),
+            // add the expert contribution.
+            unsafe {
+                for (i, v) in moe_out.iter().enumerate() {
+                    *h_ptr.add(i) += v;
+                }
             }
         }
 

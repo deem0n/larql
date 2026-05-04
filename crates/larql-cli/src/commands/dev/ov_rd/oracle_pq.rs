@@ -8,22 +8,26 @@ use larql_vindex::{
 };
 use std::collections::HashMap;
 
-use super::address::{attention_relation_key, prev_ffn_feature_key};
+use super::address::{
+    attention_argmax, attention_relation_key, ffn_first_feature_key, prev_ffn_feature_key,
+};
 use super::basis::*;
 use super::gamma_address::fit_gamma_projected_address_models;
 use super::input::*;
 use super::metrics::*;
 use super::oracle_pq_address::{
-    fit_address_attention_cluster_group_models, fit_address_attention_relation_group_models,
+    collect_code_occurrences, fit_address_attention_cluster_group_models,
+    fit_address_attention_relation_group_models, fit_address_ffn_first_feature_group_models,
     fit_address_lsh_group_models, fit_address_prev_ffn_feature_group_models,
-    fit_address_probe_models, fit_address_supervised_group_models,
-    fit_majority_codes_for_codebooks,
+    fit_address_probe_models, fit_address_reduced_qk_cluster_group_models,
+    fit_address_supervised_group_models, fit_majority_codes_for_codebooks,
 };
 use super::oracle_pq_eval::evaluate_predicted_address;
 use super::oracle_pq_fit::fit_pq_codebooks;
 use super::oracle_pq_forward::{
-    capture_attention_relation_rows, capture_layer_input_hidden, capture_prev_ffn_feature_keys,
-    final_logits, forward_q4k_oracle_pq_head, forward_q4k_oracle_pq_mode_d_head,
+    capture_attention_relation_rows, capture_ffn_first_feature_keys, capture_layer_input_hidden,
+    capture_prev_ffn_feature_keys, capture_reduced_qk_attention_rows, final_logits,
+    forward_q4k_oracle_pq_head, forward_q4k_oracle_pq_mode_d_head,
 };
 use super::oracle_pq_mode_d::{corruption_keep_values, materialize_mode_d_tables};
 use super::oracle_pq_reports::OraclePqPointAccumulator;
@@ -103,6 +107,85 @@ pub(super) struct OraclePqArgs {
     #[arg(long, default_value = "0")]
     address_majority_groups: String,
 
+    /// Evaluate code-level behavioral substitution for selected PQ groups.
+    ///
+    /// Positions whose oracle group code equals a selected from-code are
+    /// substituted to each selected to-code while all other groups and
+    /// positions remain oracle-correct.
+    #[arg(long)]
+    address_code_substitution_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-code-substitution-group-probe.
+    #[arg(long, default_value = "0")]
+    address_code_substitution_groups: String,
+
+    /// Optional comma-separated source codes. Empty means all codes.
+    #[arg(long, default_value = "")]
+    address_code_substitution_from_codes: String,
+
+    /// Target codes. Use "majority" or a comma-separated list of codes.
+    #[arg(long, default_value = "majority")]
+    address_code_substitution_to_codes: String,
+
+    /// Export per-position occurrences for selected PQ group codes.
+    #[arg(long)]
+    address_code_occurrences: bool,
+
+    /// Comma-separated PQ groups for --address-code-occurrences.
+    #[arg(long, default_value = "0")]
+    address_code_occurrence_groups: String,
+
+    /// Optional comma-separated codes for --address-code-occurrences.
+    /// Empty means all codes.
+    #[arg(long, default_value = "")]
+    address_code_occurrence_codes: String,
+
+    /// Occurrence split to export: train, eval, or all.
+    #[arg(long, default_value = "eval")]
+    address_code_occurrence_split: String,
+
+    /// Evaluate a hard-coded code7 fallback rule for L0H6-style probes.
+    ///
+    /// For selected groups, predict special code when attention argmax is BOS
+    /// and stratum is not arithmetic; otherwise predict the train majority
+    /// code. Unselected groups remain oracle-correct.
+    #[arg(long)]
+    address_code7_bos_rule_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-code7-bos-rule-group-probe.
+    #[arg(long, default_value = "0")]
+    address_code7_bos_rule_groups: String,
+
+    /// Special code used by --address-code7-bos-rule-group-probe.
+    #[arg(long, default_value_t = 7)]
+    address_code7_bos_rule_code: usize,
+
+    /// Evaluate oracle upper bounds for a binary code7-vs-default address.
+    ///
+    /// Selected groups use the special code only where the oracle address has
+    /// that code and the requested structural filter matches; all other
+    /// positions use the train majority code. Unselected groups remain
+    /// oracle-correct.
+    #[arg(long)]
+    address_code7_oracle_binary_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-code7-oracle-binary-group-probe.
+    #[arg(long, default_value = "0")]
+    address_code7_oracle_binary_groups: String,
+
+    /// Special code used by --address-code7-oracle-binary-group-probe.
+    #[arg(long, default_value_t = 7)]
+    address_code7_oracle_binary_code: usize,
+
+    /// Comma-separated filters for oracle binary code7 upper bounds.
+    ///
+    /// Supported: all, natural_prose_bos, natural_prose_bos_or_prev.
+    #[arg(
+        long,
+        default_value = "all,natural_prose_bos,natural_prose_bos_or_prev"
+    )]
+    address_code7_oracle_binary_filters: String,
+
     /// Evaluate how sensitive Mode D is to address corruption.
     ///
     /// This keeps a prefix of oracle PQ groups and replaces the rest with
@@ -177,6 +260,38 @@ pub(super) struct OraclePqArgs {
     #[arg(long, default_value = "20,26,29,33")]
     address_gamma_projected_layers: String,
 
+    /// Comma-separated random projection ranks for the gamma bridge control,
+    /// e.g. 64,128. These are fixed Rademacher low-rank projections of the
+    /// layer input followed by the same supervised bit probes.
+    #[arg(long, default_value = "")]
+    address_gamma_random_ranks: String,
+
+    /// Comma-separated deterministic seeds for random projection ranks.
+    #[arg(long, default_value = "0")]
+    address_gamma_random_seeds: String,
+
+    /// Comma-separated learned bridge ranks for the gamma bridge test. These
+    /// fit a low-rank target-PCA proxy from layer input to later residual
+    /// snapshots before training the same supervised group-bit probes.
+    #[arg(long, default_value = "")]
+    address_gamma_learned_ranks: String,
+
+    /// SGD epochs for learned low-rank gamma bridge fitting.
+    #[arg(long, default_value_t = 8)]
+    address_gamma_learned_epochs: usize,
+
+    /// Normalized LMS learning rate for learned low-rank gamma bridge fitting.
+    #[arg(long, default_value_t = 0.5)]
+    address_gamma_learned_lr: f32,
+
+    /// L2 weight decay for learned low-rank gamma bridge fitting.
+    #[arg(long, default_value_t = 1e-5)]
+    address_gamma_learned_l2: f32,
+
+    /// Power-iteration steps for the learned bridge target PCA basis.
+    #[arg(long, default_value_t = 8)]
+    address_gamma_learned_pca_iters: usize,
+
     /// Report train/eval PQ code distribution stability for selected groups.
     #[arg(long)]
     address_code_stability: bool,
@@ -199,6 +314,22 @@ pub(super) struct OraclePqArgs {
     /// hash keys.
     #[arg(long, default_value_t = 4)]
     address_prev_ffn_feature_top_k: usize,
+
+    /// Fit and evaluate selected PQ groups from an FFN-first diagnostic state:
+    /// run the target layer's FFN on the pre-attention residual, use top
+    /// activation features as keys, but leave the real forward ordering
+    /// unchanged. This tests whether computed L0 FFN features would bootstrap
+    /// attention addressability under an FFN-first reorder.
+    #[arg(long)]
+    address_ffn_first_feature_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-ffn-first-feature-group-probe.
+    #[arg(long, default_value = "0")]
+    address_ffn_first_feature_groups: String,
+
+    /// Number of FFN-first activation features retained for feature hash keys.
+    #[arg(long, default_value_t = 4)]
+    address_ffn_first_feature_top_k: usize,
 
     /// Fit and evaluate selected PQ groups from discrete attention/relation
     /// state keys. This tests whether the dominant address is carried by QK
@@ -228,6 +359,30 @@ pub(super) struct OraclePqArgs {
     /// all cluster probe names for the selected k values.
     #[arg(long, default_value = "")]
     address_attention_cluster_probe_names: String,
+
+    /// Fit/evaluate selected PQ groups from attention-pattern clusters where
+    /// the attention distribution is recomputed from only the first r Q/K
+    /// dimensions. Use rank 0 for the full-QK control.
+    #[arg(long)]
+    address_reduced_qk_cluster_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-reduced-qk-cluster-group-probe.
+    #[arg(long, default_value = "0")]
+    address_reduced_qk_cluster_groups: String,
+
+    /// Comma-separated QK ranks. Rank 0 means full QK; positive ranks are
+    /// clamped to the layer head dimension.
+    #[arg(long, default_value = "0,128,64,32,16")]
+    address_reduced_qk_ranks: String,
+
+    /// Comma-separated k values for reduced-QK attention-pattern clustering.
+    #[arg(long, default_value = "16,32")]
+    address_reduced_qk_cluster_ks: String,
+
+    /// Optional comma-separated reduced-QK cluster probe names. Empty evaluates
+    /// all generated names.
+    #[arg(long, default_value = "")]
+    address_reduced_qk_cluster_probe_names: String,
 
     /// Comma-separated PQ groups whose centroids are fit separately per
     /// prompt stratum. This is a codebook-layout diagnostic for cases where a
@@ -326,6 +481,169 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             }
         }
     }
+    let mut code_substitution_groups = parse_usize_list(&args.address_code_substitution_groups)?;
+    code_substitution_groups.sort_unstable();
+    code_substitution_groups.dedup();
+    let mut code_substitution_from_codes =
+        parse_usize_list(&args.address_code_substitution_from_codes)?;
+    code_substitution_from_codes.sort_unstable();
+    code_substitution_from_codes.dedup();
+    let code_substitution_to_specs =
+        parse_code_substitution_to_specs(&args.address_code_substitution_to_codes)?;
+    if args.address_code_substitution_group_probe {
+        if code_substitution_groups.is_empty() {
+            return Err("--address-code-substitution-group-probe requires at least one --address-code-substitution-groups value".into());
+        }
+        if code_substitution_to_specs.is_empty() {
+            return Err("--address-code-substitution-group-probe requires at least one --address-code-substitution-to-codes value".into());
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            for &group in &code_substitution_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-code-substitution-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+            for &code in &code_substitution_from_codes {
+                if code >= levels {
+                    return Err(format!(
+                        "--address-code-substitution-from-codes includes code {code}, but config {:?} has only {levels} levels",
+                        config
+                    )
+                    .into());
+                }
+            }
+            for spec in &code_substitution_to_specs {
+                if let CodeSubstitutionToSpec::Code(code) = spec {
+                    if *code >= levels {
+                        return Err(format!(
+                            "--address-code-substitution-to-codes includes code {code}, but config {:?} has only {levels} levels",
+                            config
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+    }
+    let mut code_occurrence_groups = parse_usize_list(&args.address_code_occurrence_groups)?;
+    code_occurrence_groups.sort_unstable();
+    code_occurrence_groups.dedup();
+    let mut code_occurrence_codes = parse_usize_list(&args.address_code_occurrence_codes)?;
+    code_occurrence_codes.sort_unstable();
+    code_occurrence_codes.dedup();
+    let code_occurrence_split = args
+        .address_code_occurrence_split
+        .trim()
+        .to_ascii_lowercase();
+    if args.address_code_occurrences {
+        if code_occurrence_groups.is_empty() {
+            return Err(
+                "--address-code-occurrences requires at least one --address-code-occurrence-groups value"
+                    .into(),
+            );
+        }
+        if !matches!(code_occurrence_split.as_str(), "train" | "eval" | "all") {
+            return Err("--address-code-occurrence-split must be train, eval, or all".into());
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            for &group in &code_occurrence_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-code-occurrence-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+            for &code in &code_occurrence_codes {
+                if code >= levels {
+                    return Err(format!(
+                        "--address-code-occurrence-codes includes code {code}, but config {:?} has only {levels} levels",
+                        config
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut code7_bos_rule_groups = parse_usize_list(&args.address_code7_bos_rule_groups)?;
+    code7_bos_rule_groups.sort_unstable();
+    code7_bos_rule_groups.dedup();
+    if args.address_code7_bos_rule_group_probe {
+        if code7_bos_rule_groups.is_empty() {
+            return Err("--address-code7-bos-rule-group-probe requires at least one --address-code7-bos-rule-groups value".into());
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            for &group in &code7_bos_rule_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-code7-bos-rule-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+            if args.address_code7_bos_rule_code >= levels {
+                return Err(format!(
+                    "--address-code7-bos-rule-code is {}, but config {:?} has only {levels} levels",
+                    args.address_code7_bos_rule_code, config
+                )
+                .into());
+            }
+        }
+    }
+    let mut code7_oracle_binary_groups =
+        parse_usize_list(&args.address_code7_oracle_binary_groups)?;
+    code7_oracle_binary_groups.sort_unstable();
+    code7_oracle_binary_groups.dedup();
+    let code7_oracle_binary_filters = parse_string_list(&args.address_code7_oracle_binary_filters);
+    if args.address_code7_oracle_binary_group_probe {
+        if code7_oracle_binary_groups.is_empty() {
+            return Err("--address-code7-oracle-binary-group-probe requires at least one --address-code7-oracle-binary-groups value".into());
+        }
+        if code7_oracle_binary_filters.is_empty() {
+            return Err(
+                "--address-code7-oracle-binary-filters must include at least one filter".into(),
+            );
+        }
+        for filter in &code7_oracle_binary_filters {
+            if !matches!(
+                filter.as_str(),
+                "all" | "natural_prose_bos" | "natural_prose_bos_or_prev"
+            ) {
+                return Err(format!(
+                    "unsupported --address-code7-oracle-binary-filters value {filter:?}; expected all, natural_prose_bos, or natural_prose_bos_or_prev"
+                )
+                .into());
+            }
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            for &group in &code7_oracle_binary_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-code7-oracle-binary-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+            if args.address_code7_oracle_binary_code >= levels {
+                return Err(format!(
+                    "--address-code7-oracle-binary-code is {}, but config {:?} has only {levels} levels",
+                    args.address_code7_oracle_binary_code, config
+                )
+                .into());
+            }
+        }
+    }
     let mut lsh_groups = parse_usize_list(&args.address_lsh_groups)?;
     lsh_groups.sort_unstable();
     lsh_groups.dedup();
@@ -392,12 +710,33 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     let mut gamma_projected_layers = parse_usize_list(&args.address_gamma_projected_layers)?;
     gamma_projected_layers.sort_unstable();
     gamma_projected_layers.dedup();
+    let mut gamma_random_ranks = parse_usize_list(&args.address_gamma_random_ranks)?;
+    gamma_random_ranks.sort_unstable();
+    gamma_random_ranks.dedup();
+    let mut gamma_random_seeds = parse_usize_list(&args.address_gamma_random_seeds)?
+        .into_iter()
+        .map(|seed| seed as u64)
+        .collect::<Vec<_>>();
+    gamma_random_seeds.sort_unstable();
+    gamma_random_seeds.dedup();
+    let mut gamma_learned_ranks = parse_usize_list(&args.address_gamma_learned_ranks)?;
+    gamma_learned_ranks.sort_unstable();
+    gamma_learned_ranks.dedup();
     if args.address_gamma_projected_group_probe {
         if gamma_projected_groups.is_empty() {
             return Err("--address-gamma-projected-group-probe requires at least one --address-gamma-projected-groups value".into());
         }
-        if gamma_projected_layers.is_empty() {
-            return Err("--address-gamma-projected-layers must include at least one layer".into());
+        if gamma_projected_layers.is_empty()
+            && gamma_random_ranks.is_empty()
+            && gamma_learned_ranks.is_empty()
+        {
+            return Err("--address-gamma-projected-layers, --address-gamma-random-ranks, or --address-gamma-learned-ranks must include at least one value".into());
+        }
+        if !gamma_learned_ranks.is_empty() && gamma_projected_layers.is_empty() {
+            return Err(
+                "--address-gamma-learned-ranks requires at least one --address-gamma-projected-layers value"
+                    .into(),
+            );
         }
         for &layer in &gamma_projected_layers {
             if layer >= weights.num_layers {
@@ -418,6 +757,42 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                     .into());
                 }
             }
+        }
+        for &rank in &gamma_random_ranks {
+            if !(1..=weights.hidden_size).contains(&rank) {
+                return Err(format!(
+                    "--address-gamma-random-ranks includes rank {rank}, expected 1..={}",
+                    weights.hidden_size
+                )
+                .into());
+            }
+        }
+        if !gamma_random_ranks.is_empty() && gamma_random_seeds.is_empty() {
+            return Err(
+                "--address-gamma-random-seeds must include at least one seed when random ranks are enabled"
+                    .into(),
+            );
+        }
+        for &rank in &gamma_learned_ranks {
+            if !(1..=weights.hidden_size).contains(&rank) {
+                return Err(format!(
+                    "--address-gamma-learned-ranks includes rank {rank}, expected 1..={}",
+                    weights.hidden_size
+                )
+                .into());
+            }
+        }
+        if args.address_gamma_learned_epochs == 0 {
+            return Err("--address-gamma-learned-epochs must be greater than zero".into());
+        }
+        if args.address_gamma_learned_lr <= 0.0 {
+            return Err("--address-gamma-learned-lr must be greater than zero".into());
+        }
+        if args.address_gamma_learned_l2 < 0.0 {
+            return Err("--address-gamma-learned-l2 must be non-negative".into());
+        }
+        if args.address_gamma_learned_pca_iters == 0 {
+            return Err("--address-gamma-learned-pca-iters must be greater than zero".into());
         }
         for config in &configs {
             for &group in &gamma_projected_groups {
@@ -483,6 +858,28 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             }
         }
     }
+    let mut ffn_first_feature_groups = parse_usize_list(&args.address_ffn_first_feature_groups)?;
+    ffn_first_feature_groups.sort_unstable();
+    ffn_first_feature_groups.dedup();
+    if args.address_ffn_first_feature_group_probe {
+        if ffn_first_feature_groups.is_empty() {
+            return Err("--address-ffn-first-feature-group-probe requires at least one --address-ffn-first-feature-groups value".into());
+        }
+        if args.address_ffn_first_feature_top_k == 0 {
+            return Err("--address-ffn-first-feature-top-k must be greater than zero".into());
+        }
+        for config in &configs {
+            for &group in &ffn_first_feature_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-ffn-first-feature-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     let mut attention_relation_groups = parse_usize_list(&args.address_attention_relation_groups)?;
     attention_relation_groups.sort_unstable();
     attention_relation_groups.dedup();
@@ -529,6 +926,46 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                 if group >= config.groups {
                     return Err(format!(
                         "--address-attention-cluster-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut reduced_qk_cluster_groups = parse_usize_list(&args.address_reduced_qk_cluster_groups)?;
+    reduced_qk_cluster_groups.sort_unstable();
+    reduced_qk_cluster_groups.dedup();
+    let mut reduced_qk_ranks = parse_usize_list(&args.address_reduced_qk_ranks)?;
+    reduced_qk_ranks.sort_unstable();
+    reduced_qk_ranks.dedup();
+    let mut reduced_qk_cluster_ks = parse_usize_list(&args.address_reduced_qk_cluster_ks)?;
+    reduced_qk_cluster_ks.sort_unstable();
+    reduced_qk_cluster_ks.dedup();
+    let reduced_qk_cluster_probe_names =
+        parse_string_list(&args.address_reduced_qk_cluster_probe_names);
+    if args.address_reduced_qk_cluster_group_probe {
+        if reduced_qk_cluster_groups.is_empty() {
+            return Err("--address-reduced-qk-cluster-group-probe requires at least one --address-reduced-qk-cluster-groups value".into());
+        }
+        if reduced_qk_ranks.is_empty() {
+            return Err("--address-reduced-qk-ranks must include at least one rank".into());
+        }
+        if reduced_qk_cluster_ks.is_empty() {
+            return Err("--address-reduced-qk-cluster-ks must include at least one k".into());
+        }
+        for &cluster_count in &reduced_qk_cluster_ks {
+            if !(2..=128).contains(&cluster_count) {
+                return Err(
+                    "--address-reduced-qk-cluster-ks values must be between 2 and 128".into(),
+                );
+            }
+        }
+        for config in &configs {
+            for &group in &reduced_qk_cluster_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-reduced-qk-cluster-groups includes group {group}, but config {:?} has only {} groups",
                         config, config.groups
                     )
                     .into());
@@ -705,9 +1142,16 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             return Err("--address-gamma-projected-group-probe requires --mode-d-check".into());
         }
         eprintln!(
-            "Fitting gamma-projected supervised group address probes for groups {:?} (post_layers={:?}, epochs={}, lr={}, l2={})",
+            "Fitting gamma-projected supervised group address probes for groups {:?} (post_layers={:?}, random_ranks={:?}, random_seeds={:?}, learned_ranks={:?}, learned_epochs={}, learned_lr={}, learned_l2={}, learned_pca_iters={}, epochs={}, lr={}, l2={})",
             gamma_projected_groups,
             gamma_projected_layers,
+            gamma_random_ranks,
+            gamma_random_seeds,
+            gamma_learned_ranks,
+            args.address_gamma_learned_epochs,
+            args.address_gamma_learned_lr,
+            args.address_gamma_learned_l2,
+            args.address_gamma_learned_pca_iters,
             args.address_supervised_epochs,
             args.address_supervised_lr,
             args.address_supervised_l2
@@ -724,6 +1168,13 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             &codebooks,
             &gamma_projected_groups,
             &gamma_projected_layers,
+            &gamma_random_ranks,
+            &gamma_random_seeds,
+            &gamma_learned_ranks,
+            args.address_gamma_learned_epochs,
+            args.address_gamma_learned_lr,
+            args.address_gamma_learned_l2,
+            args.address_gamma_learned_pca_iters,
             args.address_supervised_epochs,
             args.address_supervised_lr,
             args.address_supervised_l2,
@@ -751,6 +1202,30 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             &codebooks,
             &prev_ffn_feature_groups,
             args.address_prev_ffn_feature_top_k,
+        )?
+    } else {
+        HashMap::new()
+    };
+    let address_ffn_first_feature_models = if args.address_ffn_first_feature_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-ffn-first-feature-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting FFN-first feature group address probes for groups {:?} (top_k={})",
+            ffn_first_feature_groups, args.address_ffn_first_feature_top_k
+        );
+        fit_address_ffn_first_feature_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &ffn_first_feature_groups,
+            args.address_ffn_first_feature_top_k,
         )?
     } else {
         HashMap::new()
@@ -802,6 +1277,31 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     } else {
         HashMap::new()
     };
+    let address_reduced_qk_cluster_models = if args.address_reduced_qk_cluster_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-reduced-qk-cluster-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting reduced-QK cluster group address probes for groups {:?} (ranks={:?}, k={:?})",
+            reduced_qk_cluster_groups, reduced_qk_ranks, reduced_qk_cluster_ks
+        );
+        fit_address_reduced_qk_cluster_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &reduced_qk_cluster_groups,
+            &reduced_qk_ranks,
+            &reduced_qk_cluster_ks,
+        )?
+    } else {
+        HashMap::new()
+    };
     if args.address_corruption_sweep && !args.mode_d_check {
         return Err("--address-corruption-sweep requires --mode-d-check".into());
     }
@@ -811,6 +1311,15 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     if args.address_majority_group_probe && !args.mode_d_check {
         return Err("--address-majority-group-probe requires --mode-d-check".into());
     }
+    if args.address_code_substitution_group_probe && !args.mode_d_check {
+        return Err("--address-code-substitution-group-probe requires --mode-d-check".into());
+    }
+    if args.address_code7_bos_rule_group_probe && !args.mode_d_check {
+        return Err("--address-code7-bos-rule-group-probe requires --mode-d-check".into());
+    }
+    if args.address_code7_oracle_binary_group_probe && !args.mode_d_check {
+        return Err("--address-code7-oracle-binary-group-probe requires --mode-d-check".into());
+    }
     let majority_codes = if args.address_corruption_sweep
         || args.address_group_importance
         || args.address_lsh_group_probe
@@ -818,9 +1327,14 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         || args.address_gamma_projected_group_probe
         || args.address_key_group_probe
         || args.address_majority_group_probe
+        || args.address_code_substitution_group_probe
+        || args.address_code7_bos_rule_group_probe
+        || args.address_code7_oracle_binary_group_probe
         || args.address_prev_ffn_feature_group_probe
+        || args.address_ffn_first_feature_group_probe
         || args.address_attention_relation_group_probe
         || args.address_attention_cluster_group_probe
+        || args.address_reduced_qk_cluster_group_probe
     {
         eprintln!("Fitting per-group majority codes for address diagnostics");
         fit_majority_codes_for_codebooks(
@@ -858,6 +1372,36 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     } else {
         HashMap::new()
     };
+
+    if args.address_code_occurrences {
+        let occurrence_prompts = match code_occurrence_split.as_str() {
+            "train" => fit_prompts.clone(),
+            "eval" => eval_prompts.clone(),
+            "all" => prompts.clone(),
+            _ => unreachable!("validated code occurrence split"),
+        };
+        eprintln!(
+            "Exporting code occurrences for groups {:?}, codes {:?}, split {}",
+            code_occurrence_groups, code_occurrence_codes, code_occurrence_split
+        );
+        let occurrences = collect_code_occurrences(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &occurrence_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &code_occurrence_groups,
+            &code_occurrence_codes,
+        )?;
+        let occurrence_path = args.out.join("code_occurrences.json");
+        let file = std::fs::File::create(&occurrence_path)?;
+        serde_json::to_writer_pretty(file, &occurrences)?;
+        eprintln!("Wrote {}", occurrence_path.display());
+    }
 
     let mut accumulators: HashMap<(HeadId, PqConfig), OraclePqPointAccumulator> = HashMap::new();
     for head in &selected_heads {
@@ -1142,6 +1686,272 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                             &selected_group_keys,
                             prompt_report,
                         );
+                }
+
+                if args.address_code_substitution_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for code substitution probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for code substitution probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let levels = 1usize << config.bits_per_group;
+                    let from_codes = if code_substitution_from_codes.is_empty() {
+                        (0..levels).collect::<Vec<_>>()
+                    } else {
+                        code_substitution_from_codes.clone()
+                    };
+                    for &group in &code_substitution_groups {
+                        for &from_code in &from_codes {
+                            let source_code_present = oracle_codes_by_position
+                                .iter()
+                                .any(|codes| codes[group] == from_code);
+                            for to_spec in &code_substitution_to_specs {
+                                let to_code = match *to_spec {
+                                    CodeSubstitutionToSpec::Majority => group_majority[group],
+                                    CodeSubstitutionToSpec::Code(code) => code,
+                                };
+                                if to_code == from_code {
+                                    continue;
+                                }
+                                let predicted_codes_by_position = oracle_codes_by_position
+                                    .iter()
+                                    .map(|oracle_codes| {
+                                        let mut codes = oracle_codes.clone();
+                                        if codes[group] == from_code {
+                                            codes[group] = to_code;
+                                        }
+                                        codes
+                                    })
+                                    .collect::<Vec<_>>();
+                                let prompt_report = if source_code_present {
+                                    evaluate_predicted_address(
+                                        &mut weights,
+                                        &token_ids,
+                                        &index,
+                                        *head,
+                                        mode_d_table,
+                                        &predicted_codes_by_position,
+                                        stratum,
+                                        label,
+                                        &baseline_logp,
+                                        baseline_top1,
+                                        &oracle_codes_by_position,
+                                    )?
+                                } else {
+                                    oracle_mode_d_address_report(
+                                        label,
+                                        stratum,
+                                        token_ids.len(),
+                                        config.groups,
+                                        mode_d_kl.unwrap_or(kl),
+                                        mode_d_top1_agree.unwrap_or(false),
+                                        baseline_top1_in_mode_d_top5.unwrap_or(false),
+                                    )
+                                };
+                                let to_label = match *to_spec {
+                                    CodeSubstitutionToSpec::Majority => {
+                                        format!("majority{}", group_majority[group])
+                                    }
+                                    CodeSubstitutionToSpec::Code(code) => code.to_string(),
+                                };
+                                let selected_group_keys = (0..config.groups)
+                                    .map(|candidate_group| {
+                                        if candidate_group == group {
+                                            format!("from{from_code}_to{to_label}")
+                                        } else {
+                                            "oracle".to_string()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                accumulators
+                                    .get_mut(&(*head, config))
+                                    .expect("oracle PQ accumulator missing")
+                                    .add_address_probe(
+                                        &format!(
+                                            "code_subst_g{group}_from{from_code}_to{to_label}_oracle_rest"
+                                        ),
+                                        &selected_group_keys,
+                                        prompt_report,
+                                    );
+                            }
+                        }
+                    }
+                }
+
+                if args.address_code7_bos_rule_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for code7 BOS rule probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for code7 BOS rule probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let attention_rows =
+                        capture_attention_relation_rows(&mut weights, &token_ids, &index, *head)?;
+                    let use_special_code = stratum != "arithmetic";
+                    let predicted_codes_by_position = oracle_codes_by_position
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, oracle_codes)| {
+                            let mut codes = oracle_codes.clone();
+                            let attention_weights =
+                                attention_rows.get(pos).map(Vec::as_slice).unwrap_or(&[]);
+                            let predicts_special = use_special_code
+                                && !attention_weights.is_empty()
+                                && attention_argmax(attention_weights, pos) == 0;
+                            for &group in &code7_bos_rule_groups {
+                                codes[group] = if predicts_special {
+                                    args.address_code7_bos_rule_code
+                                } else {
+                                    group_majority[group]
+                                };
+                            }
+                            codes
+                        })
+                        .collect::<Vec<_>>();
+                    let prompt_report = evaluate_predicted_address(
+                        &mut weights,
+                        &token_ids,
+                        &index,
+                        *head,
+                        mode_d_table,
+                        &predicted_codes_by_position,
+                        stratum,
+                        label,
+                        &baseline_logp,
+                        baseline_top1,
+                        &oracle_codes_by_position,
+                    )?;
+                    let selected_group_keys = (0..config.groups)
+                        .map(|group| {
+                            if code7_bos_rule_groups.contains(&group) {
+                                format!(
+                                    "bos_non_arithmetic_to_code{}_else_majority{}",
+                                    args.address_code7_bos_rule_code, group_majority[group]
+                                )
+                            } else {
+                                "oracle".to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    accumulators
+                        .get_mut(&(*head, config))
+                        .expect("oracle PQ accumulator missing")
+                        .add_address_probe(
+                            &format!(
+                                "code{}_bos_non_arithmetic_groups_{:?}_oracle_rest",
+                                args.address_code7_bos_rule_code, code7_bos_rule_groups
+                            ),
+                            &selected_group_keys,
+                            prompt_report,
+                        );
+                }
+
+                if args.address_code7_oracle_binary_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for code7 oracle binary probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for code7 oracle binary probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let attention_rows =
+                        capture_attention_relation_rows(&mut weights, &token_ids, &index, *head)?;
+                    for filter in &code7_oracle_binary_filters {
+                        let predicted_codes_by_position = oracle_codes_by_position
+                            .iter()
+                            .enumerate()
+                            .map(|(pos, oracle_codes)| {
+                                let mut codes = oracle_codes.clone();
+                                let attention_weights =
+                                    attention_rows.get(pos).map(Vec::as_slice).unwrap_or(&[]);
+                                let relation_matches = match filter.as_str() {
+                                    "all" => true,
+                                    "natural_prose_bos" => {
+                                        stratum == "natural_prose"
+                                            && !attention_weights.is_empty()
+                                            && attention_argmax(attention_weights, pos) == 0
+                                    }
+                                    "natural_prose_bos_or_prev" => {
+                                        stratum == "natural_prose"
+                                            && (!attention_weights.is_empty()
+                                                && (attention_argmax(attention_weights, pos) == 0
+                                                    || attention_argmax(attention_weights, pos)
+                                                        == pos.saturating_sub(1)))
+                                    }
+                                    _ => unreachable!("validated oracle binary filter"),
+                                };
+                                for &group in &code7_oracle_binary_groups {
+                                    codes[group] = if relation_matches
+                                        && oracle_codes[group]
+                                            == args.address_code7_oracle_binary_code
+                                    {
+                                        args.address_code7_oracle_binary_code
+                                    } else {
+                                        group_majority[group]
+                                    };
+                                }
+                                codes
+                            })
+                            .collect::<Vec<_>>();
+                        let prompt_report = evaluate_predicted_address(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                            stratum,
+                            label,
+                            &baseline_logp,
+                            baseline_top1,
+                            &oracle_codes_by_position,
+                        )?;
+                        let selected_group_keys = (0..config.groups)
+                            .map(|group| {
+                                if code7_oracle_binary_groups.contains(&group) {
+                                    format!(
+                                        "oracle_{}_code{}_else_majority{}",
+                                        filter,
+                                        args.address_code7_oracle_binary_code,
+                                        group_majority[group]
+                                    )
+                                } else {
+                                    "oracle".to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_probe(
+                                &format!(
+                                    "oracle_binary_{}_code{}_groups_{:?}_oracle_rest",
+                                    filter,
+                                    args.address_code7_oracle_binary_code,
+                                    code7_oracle_binary_groups
+                                ),
+                                &selected_group_keys,
+                                prompt_report,
+                            );
+                    }
                 }
 
                 if args.address_group_importance {
@@ -1515,6 +2325,104 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                     }
                 }
 
+                if args.address_ffn_first_feature_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for FFN-first feature group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let ffn_first_models = address_ffn_first_feature_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                        format!(
+                            "missing FFN-first feature group probe model for L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for FFN-first feature group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let ffn_first_features_by_position = capture_ffn_first_feature_keys(
+                        &mut weights,
+                        &token_ids,
+                        &index,
+                        head.layer,
+                        args.address_ffn_first_feature_top_k,
+                    )?;
+                    for probe_model in ffn_first_models {
+                        let selected_group_keys = probe_model.selected_group_keys.clone();
+                        for (probe_name, use_oracle_rest) in [
+                            (
+                                format!(
+                                    "{}_groups_{:?}_oracle_rest",
+                                    probe_model.name, ffn_first_feature_groups
+                                ),
+                                true,
+                            ),
+                            (
+                                format!(
+                                    "{}_groups_{:?}_majority_rest",
+                                    probe_model.name, ffn_first_feature_groups
+                                ),
+                                false,
+                            ),
+                        ] {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let mut codes = if use_oracle_rest {
+                                        oracle_codes.clone()
+                                    } else {
+                                        group_majority.clone()
+                                    };
+                                    let ffn_first_features = ffn_first_features_by_position
+                                        .get(pos)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]);
+                                    let key = ffn_first_feature_key(
+                                        &probe_model.name,
+                                        &token_ids,
+                                        stratum,
+                                        pos,
+                                        ffn_first_features,
+                                    );
+                                    let probe_codes = probe_model.predict_codes_from_key(&key);
+                                    for &group in &ffn_first_feature_groups {
+                                        codes[group] = probe_codes[group];
+                                    }
+                                    codes
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_name,
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
+                        }
+                    }
+                }
+
                 if args.address_attention_relation_group_probe {
                     let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
                         format!(
@@ -1648,6 +2556,118 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                                 format!(
                                     "{}_groups_{:?}_majority_rest",
                                     cluster_model.name, attention_cluster_groups
+                                ),
+                                false,
+                            ),
+                        ] {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let base_codes = if use_oracle_rest {
+                                        oracle_codes.as_slice()
+                                    } else {
+                                        group_majority.as_slice()
+                                    };
+                                    let attention_weights =
+                                        attention_rows.get(pos).map(Vec::as_slice).unwrap_or(&[]);
+                                    cluster_model.predict_selected_groups(
+                                        &token_ids,
+                                        stratum,
+                                        pos,
+                                        attention_weights,
+                                        base_codes,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_name,
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
+                        }
+                    }
+                }
+
+                if args.address_reduced_qk_cluster_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for reduced-QK cluster group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let cluster_models = address_reduced_qk_cluster_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                            format!(
+                                "missing reduced-QK cluster group probe model for L{} H{} {:?}",
+                                head.layer, head.head, config
+                            )
+                        })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for reduced-QK cluster group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let mut rows_by_rank: HashMap<Option<usize>, Vec<Vec<f32>>> = HashMap::new();
+                    for cluster_model in cluster_models {
+                        if !reduced_qk_cluster_probe_names.is_empty()
+                            && !reduced_qk_cluster_probe_names.contains(&cluster_model.name)
+                        {
+                            continue;
+                        }
+                        if !rows_by_rank.contains_key(&cluster_model.qk_rank) {
+                            let rows = if let Some(qk_rank) = cluster_model.qk_rank {
+                                capture_reduced_qk_attention_rows(
+                                    &mut weights,
+                                    &token_ids,
+                                    &index,
+                                    *head,
+                                    qk_rank,
+                                )?
+                            } else {
+                                capture_attention_relation_rows(
+                                    &mut weights,
+                                    &token_ids,
+                                    &index,
+                                    *head,
+                                )?
+                            };
+                            rows_by_rank.insert(cluster_model.qk_rank, rows);
+                        }
+                        let attention_rows = rows_by_rank
+                            .get(&cluster_model.qk_rank)
+                            .expect("reduced-QK rows were just inserted");
+                        let selected_group_keys = cluster_model.selected_group_keys.clone();
+                        for (probe_name, use_oracle_rest) in [
+                            (
+                                format!(
+                                    "{}_groups_{:?}_oracle_rest",
+                                    cluster_model.name, reduced_qk_cluster_groups
+                                ),
+                                true,
+                            ),
+                            (
+                                format!(
+                                    "{}_groups_{:?}_majority_rest",
+                                    cluster_model.name, reduced_qk_cluster_groups
                                 ),
                                 false,
                             ),
@@ -1845,6 +2865,55 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_code_substitution_group_probe: args.address_code_substitution_group_probe,
+        address_code_substitution_groups: if args.address_code_substitution_group_probe {
+            code_substitution_groups
+        } else {
+            Vec::new()
+        },
+        address_code_substitution_from_codes: if args.address_code_substitution_group_probe {
+            code_substitution_from_codes
+        } else {
+            Vec::new()
+        },
+        address_code_substitution_to_codes: if args.address_code_substitution_group_probe {
+            code_substitution_to_specs
+                .into_iter()
+                .map(|spec| match spec {
+                    CodeSubstitutionToSpec::Majority => "majority".to_string(),
+                    CodeSubstitutionToSpec::Code(code) => code.to_string(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        address_code7_bos_rule_group_probe: args.address_code7_bos_rule_group_probe,
+        address_code7_bos_rule_groups: if args.address_code7_bos_rule_group_probe {
+            code7_bos_rule_groups
+        } else {
+            Vec::new()
+        },
+        address_code7_bos_rule_code: if args.address_code7_bos_rule_group_probe {
+            args.address_code7_bos_rule_code
+        } else {
+            0
+        },
+        address_code7_oracle_binary_group_probe: args.address_code7_oracle_binary_group_probe,
+        address_code7_oracle_binary_groups: if args.address_code7_oracle_binary_group_probe {
+            code7_oracle_binary_groups
+        } else {
+            Vec::new()
+        },
+        address_code7_oracle_binary_code: if args.address_code7_oracle_binary_group_probe {
+            args.address_code7_oracle_binary_code
+        } else {
+            0
+        },
+        address_code7_oracle_binary_filters: if args.address_code7_oracle_binary_group_probe {
+            code7_oracle_binary_filters
+        } else {
+            Vec::new()
+        },
         address_corruption_sweep: args.address_corruption_sweep,
         address_group_importance: args.address_group_importance,
         address_lsh_group_probe: args.address_lsh_group_probe,
@@ -1875,6 +2944,41 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_gamma_random_ranks: if args.address_gamma_projected_group_probe {
+            gamma_random_ranks
+        } else {
+            Vec::new()
+        },
+        address_gamma_random_seeds: if args.address_gamma_projected_group_probe {
+            gamma_random_seeds
+        } else {
+            Vec::new()
+        },
+        address_gamma_learned_ranks: if args.address_gamma_projected_group_probe {
+            gamma_learned_ranks
+        } else {
+            Vec::new()
+        },
+        address_gamma_learned_epochs: if args.address_gamma_projected_group_probe {
+            args.address_gamma_learned_epochs
+        } else {
+            0
+        },
+        address_gamma_learned_lr: if args.address_gamma_projected_group_probe {
+            args.address_gamma_learned_lr
+        } else {
+            0.0
+        },
+        address_gamma_learned_l2: if args.address_gamma_projected_group_probe {
+            args.address_gamma_learned_l2
+        } else {
+            0.0
+        },
+        address_gamma_learned_pca_iters: if args.address_gamma_projected_group_probe {
+            args.address_gamma_learned_pca_iters
+        } else {
+            0
+        },
         address_code_stability: args.address_code_stability,
         address_code_stability_groups: if args.address_code_stability {
             code_stability_groups
@@ -1888,6 +2992,13 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             Vec::new()
         },
         address_prev_ffn_feature_top_k: args.address_prev_ffn_feature_top_k,
+        address_ffn_first_feature_group_probe: args.address_ffn_first_feature_group_probe,
+        address_ffn_first_feature_groups: if args.address_ffn_first_feature_group_probe {
+            ffn_first_feature_groups
+        } else {
+            Vec::new()
+        },
+        address_ffn_first_feature_top_k: args.address_ffn_first_feature_top_k,
         address_attention_relation_group_probe: args.address_attention_relation_group_probe,
         address_attention_relation_groups: if args.address_attention_relation_group_probe {
             attention_relation_groups
@@ -1910,6 +3021,27 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_reduced_qk_cluster_group_probe: args.address_reduced_qk_cluster_group_probe,
+        address_reduced_qk_cluster_groups: if args.address_reduced_qk_cluster_group_probe {
+            reduced_qk_cluster_groups
+        } else {
+            Vec::new()
+        },
+        address_reduced_qk_ranks: if args.address_reduced_qk_cluster_group_probe {
+            reduced_qk_ranks
+        } else {
+            Vec::new()
+        },
+        address_reduced_qk_cluster_ks: if args.address_reduced_qk_cluster_group_probe {
+            reduced_qk_cluster_ks
+        } else {
+            Vec::new()
+        },
+        address_reduced_qk_cluster_probe_names: if args.address_reduced_qk_cluster_group_probe {
+            reduced_qk_cluster_probe_names
+        } else {
+            Vec::new()
+        },
         stratum_conditioned_pq_groups,
         selected_heads,
         heads: head_reports,
@@ -1929,4 +3061,53 @@ fn parse_string_list(spec: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn oracle_mode_d_address_report(
+    label: &str,
+    stratum: &str,
+    positions: usize,
+    groups: usize,
+    kl: f64,
+    top1_agree: bool,
+    baseline_top1_in_predicted_top5: bool,
+) -> AddressProbePromptReport {
+    AddressProbePromptReport {
+        id: label.to_string(),
+        stratum: stratum.to_string(),
+        kl,
+        positions,
+        groups_correct: positions * groups,
+        groups_total: positions * groups,
+        exact_address_match: true,
+        top1_agree,
+        baseline_top1_in_predicted_top5,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodeSubstitutionToSpec {
+    Majority,
+    Code(usize),
+}
+
+fn parse_code_substitution_to_specs(
+    spec: &str,
+) -> Result<Vec<CodeSubstitutionToSpec>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    for part in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if part.eq_ignore_ascii_case("majority") {
+            out.push(CodeSubstitutionToSpec::Majority);
+        } else {
+            out.push(CodeSubstitutionToSpec::Code(
+                part.parse::<usize>()
+                    .map_err(|err| format!("invalid code substitution target {part:?}: {err}"))?,
+            ));
+        }
+    }
+    Ok(out)
 }

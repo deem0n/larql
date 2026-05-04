@@ -139,9 +139,10 @@ pub fn preset_parts(preset: &str) -> Result<BTreeSet<Part>, String> {
         "browse" => &[Embed, Gate, DownMeta, Tokenizer, Labels, Readme],
         "router" => &[Router, Tokenizer, Manifest, Labels, Readme],
         "expert-server" | "expert_server" | "moe-server" => {
-            // Embed + Norms required: load_single_vindex unconditionally opens
-            // embeddings.bin and norms.bin even for expert-only servers.
-            &[Embed, Norms, ExpertLayers, Tokenizer, Manifest]
+            // Embed + Norms + Ffn required: load_single_vindex opens embeddings.bin
+            // and norms.bin unconditionally; get_or_load_weights (called by the expert
+            // endpoint) needs interleaved_q4k.bin for architecture params + dense FFN.
+            &[Embed, Norms, Ffn, ExpertLayers, Tokenizer, Manifest]
         }
         "all" => &[
             Embed,

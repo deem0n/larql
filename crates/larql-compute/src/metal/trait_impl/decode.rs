@@ -290,10 +290,25 @@ impl DecodeBackend for MetalBackend {
     fn reset_kv_cache(&self) {
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if let Some(ref mut kv) = *cache_guard {
-            // Reset sequence position only — keep the GPU buffers
-            // (avoids re-allocating ~1 GB on every new prompt).
             for layer in &mut kv.layers {
                 layer.current_len = 0;
+            }
+        }
+    }
+
+    fn kv_cache_len(&self) -> usize {
+        self.kv_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|kv| kv.current_len())
+            .unwrap_or(0)
+    }
+
+    fn truncate_kv_cache(&self, len: usize) {
+        if let Some(ref mut kv) = *self.kv_cache.lock().unwrap() {
+            for layer in &mut kv.layers {
+                layer.current_len = len;
             }
         }
     }

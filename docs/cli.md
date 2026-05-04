@@ -84,8 +84,10 @@ larql run <MODEL> [PROMPT] [OPTIONS]
 | `<MODEL>` | Vindex dir, `hf://owner/name`, `owner/name`, or cache shorthand | — |
 | `[PROMPT]` | Prompt text; omit to enter chat mode | — |
 | `-n, --top <N>` | Number of predictions to show | 10 |
-| `--ffn <URL>` | Route FFN to a remote `larql-server` (`http://host:port`). Attention stays local, each layer's FFN call lands on the server. | — |
+| `--ffn <URL>` | Route FFN to a remote server. Single URL: all layers go there. Shard map `"0-14=URL1,15-29=URL2"`: each layer range routes to its shard. Attention stays local. | — |
 | `--ffn-timeout-secs <N>` | HTTP timeout for `--ffn` | 60 |
+| `--moe-shards <SPEC>` | MoE expert dispatch: `"0-63=URL1,64-127=URL2"`. Client runs the router locally; expert calls fan out to the shard owning each expert ID. CPU-only servers work. | — |
+| `--moe-units-manifest <PATH>` | Fine-grained per-(layer,expert) shard map from a JSON file. Mutually exclusive with `--moe-shards`. | — |
 | `-v, --verbose` | Verbose load / timing output | false |
 
 Examples:
@@ -209,6 +211,17 @@ larql serve --dir <DIR> [OPTIONS]
 | `--trust-forwarded-for` | Use the first `X-Forwarded-For` IP for rate limiting. Enable only behind a trusted proxy. | false |
 | `--max-concurrent <N>` | Max concurrent requests | 100 |
 | `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results (0 = disabled) | 0 |
+| `--layers <START-END>` | Only load and serve layers in this range (e.g. `0-14`). Pages outside the range are never faulted in; RSS scales with shard size. | — |
+| `--experts <START-END>` | Only serve expert IDs in this range (e.g. `0-63`). MoE shard filter. Mutually exclusive with `--units`. | — |
+| `--units <PATH>` | Fine-grained per-(layer,expert) ownership manifest (JSON). Mutually exclusive with `--experts`. | — |
+| `--moe-shards <SPEC>` | Server-side MoE expert dispatch: `"0-63=URL1,64-127=URL2"`. When set, the `walk-ffn` handler fans out MoE expert calls to remote shard servers. Combine with `--layers` for 2D layer × expert sharding. | — |
+| `--moe-units-manifest <PATH>` | Fine-grained per-(layer,expert) server-side shard map. Mutually exclusive with `--moe-shards`. | — |
+| `--join <ADDRS>` | Join one or more router grids (comma-separated gRPC addresses, e.g. `grpc://router:50052`). Self-assembling grid. Requires `--public-url`. | — |
+| `--public-url <URL>` | Public HTTP URL for this server (used with `--join`). | — |
+| `--grid-key <SECRET>` | Shared secret for grid auth (also `LARQL_GRID_KEY` env var). | — |
+| `--max-gate-cache-layers <N>` | LRU cap on decoded f16 gate layers (0 = unlimited). | 0 |
+| `--release-mmap-after-request` | `madvise(DONTNEED)` on all mmaps post-request. Linux: strict. Darwin: advisory. | false |
+| `--embed-only` | Load only embeddings + lm_head (embed-server mode, ADR-0008). | false |
 | `--grpc-port <PORT>` | Enable gRPC server on this port | — |
 | `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
 | `--tls-key <PATH>` | TLS private key for HTTPS | — |
@@ -1117,21 +1130,26 @@ rewrite — no re-extract.
 |---|---|---|
 | `<SRC>` | Source vindex: directory, `hf://owner/name`, cache shorthand | — |
 | `-o, --output <DST>` | Destination directory. Must not exist unless `--force`. | — |
-| `--preset <NAME>` | `client`, `attn`, `embed`, `server`, `browse`, `router`, `all` | — |
-| `--parts <list>` | Explicit parts (embed, norms, attn, gate, down_meta, ffn, lm_head, router, tokenizer, manifest, labels, readme). `index.json` is always copied. | — |
+| `--preset <NAME>` | `client`, `attn`, `embed`, `server`, `browse`, `router`, `expert-server`, `all` | — |
+| `--parts <list>` | Explicit parts (embed, norms, attn, gate, down_meta, ffn, expert_layers, lm_head, router, tokenizer, manifest, labels, readme). `index.json` is always copied. | — |
 | `--force` | Overwrite `<DST>` if it exists | false |
 | `--dry-run` | Preview what would be copied | false |
 
 **Preset sizes (Gemma 3 4B Q4_K measured; 31B figures scaled):**
 
-| Preset | Topology | 4B | 31B Q4K | Pairs with |
-|---|---|---|---|---|
-| `client` | 2-tier | 3.0 GB | 7.4 GB | `larql run --ffn URL` |
-| `attn` | 3-tier | 310 MB | 4.8 GB | `larql run --embed URL --ffn URL` (ADR-0008) |
-| `embed` | 3-tier | 1.28 GB | 2.6 GB | `larql serve --embed-only` (ADR-0008) |
-| `server` | either | 1.8 GB | 27 GB | `larql serve --ffn-only` |
-| `browse` | — | 1.3 GB | 16 GB | DESCRIBE/WALK only |
-| full | — | 1.3 GB | 32 GB | everything |
+| Preset | Topology | 4B | 31B Q4K | 26B MoE | Pairs with |
+|---|---|---|---|---|---|
+| `client` | 2-tier | 3.0 GB | 7.4 GB | 2.1 GB | `larql run --ffn URL` |
+| `attn` | 3-tier | 310 MB | 4.8 GB | — | `larql run --embed URL --ffn URL` (ADR-0008) |
+| `embed` | 3-tier | 1.28 GB | 2.6 GB | — | `larql serve --embed-only` (ADR-0008) |
+| `server` | either | 1.8 GB | 27 GB | — | `larql serve --ffn-only` |
+| `browse` | — | 1.3 GB | 16 GB | — | DESCRIBE/WALK only |
+| `expert-server` | MoE | — | — | 14.1 GB | `larql serve --experts START-END` |
+| `full` | — | 1.3 GB | 32 GB | 16 GB | everything |
+
+`expert-server` includes embed, norms, dense FFN (`interleaved_q4k.bin`),
+and the per-layer expert weights (`layers/`). Everything `larql serve` needs
+to boot and serve `POST /v1/expert/batch` calls on a CPU-only machine.
 
 Use `attn` + `embed` when laptop RAM matters and you can run an embed
 server alongside the FFN server. `attn` alone is 10× smaller than
@@ -1181,6 +1199,7 @@ internally.
 | `--all-slices` | Full + every default sibling (`-client`, `-attn`, `-embed`, `-server`, `-browse`). Missing siblings warn, don't fail. | false |
 | `--collection <SLUG\|URL>` | Pull every dataset in an HF collection. | — |
 | `--sibling-template <T>` | Must match `publish --slice-repo-template`. | `{repo}-{preset}` |
+| `--output <PATH>` | Download to this path instead of the default local cache. Idempotent: skips if `index.json` already present. Use in container startup scripts. | cache |
 
 After a plain `pull <repo>`, `larql` HEAD-probes for standard siblings
 and prints an "also available" hint if any exist — so the sliced layout

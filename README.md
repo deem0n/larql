@@ -120,8 +120,76 @@ larql run gemma4-31b.client.vindex --ffn http://server.local:8080 \
 ```
 
 Other presets: `browse` (DESCRIBE/WALK only, no forward pass), `router`
-(MoE router only, ADR-0003), `all` (full clone). See `larql slice --help`
+(MoE router weights only), `expert-server` (MoE expert weights for remote
+CPU serving — see below), `all` (full clone). See `larql slice --help`
 for the explicit part list.
+
+### MoE expert sharding — experts on CPU-only remote machines
+
+For Mixture-of-Experts models (Gemma 4 26B A4B, Mixtral, etc.), the expert
+bank can be served from **CPU-only machines with no GPU and no VRAM**. The
+laptop runs attention and the router (hot path); the expert servers hold the
+dormant majority as memory-mapped data.
+
+```bash
+# Carve the client slice (attn + embed + router — 2.1 GB for 26B A4B Q4_K)
+larql slice gemma4-26b-a4b.vindex --preset expert-server \
+  -o gemma4-26b-a4b.expert-server.vindex
+
+# Two expert servers — experts 0-63 on one machine, 64-127 on another
+larql serve gemma4-26b-a4b.vindex --port 8081 --experts 0-63
+larql serve gemma4-26b-a4b.vindex --port 8082 --experts 64-127
+
+# Client dispatches expert calls directly
+larql run gemma4-26b-a4b.vindex \
+  --moe-shards "0-63=http://expert-a:8081,64-127=http://expert-b:8082" \
+  "The capital of France is"
+```
+
+The `expert-server` preset includes everything the server needs to boot and
+serve `POST /v1/expert/batch` calls: embeddings, norms, the interleaved Q4K
+dense FFN, the per-layer expert weights (`layers/`), tokenizer, and manifest.
+
+**Single server** (simplest — one machine holds all experts):
+
+```bash
+larql serve gemma4-26b-a4b.vindex --port 8080
+larql run  gemma4-26b-a4b.vindex --moe-shards "0-127=http://server:8080" "..."
+```
+
+**2D layer × expert grid.** Layer shards can themselves fan out to expert
+servers, so both axes scale independently:
+
+```bash
+# Layer shard — runs attention for layers 0-14, delegates experts to CPU tier
+larql serve gemma4-26b-a4b.vindex --port 8091 --layers 0-14 \
+  --moe-shards "0-63=http://expert-a:8081,64-127=http://expert-b:8082"
+
+# larql-router routes by layer range; client just sends --ffn to the router
+larql-router --port 9090 \
+  --shards "0-14=http://layer-a:8091,15-29=http://layer-b:8092"
+
+larql run gemma4-26b-a4b.vindex --ffn http://router:9090 "..."
+```
+
+**Deploy expert servers to fly.io** (CPU-only, no GPU, tested):
+
+```bash
+# Publish the expert-server slice to HuggingFace first
+larql publish gemma4-26b-a4b.expert-server.vindex \
+  --repo myorg/gemma-4-26b-a4b-vindex-expert-server --slices none
+
+# Then deploy — start.sh auto-downloads the vindex on first boot
+fly deploy --app larql-expert-server --config deploy/fly/fly.toml --remote-only
+```
+
+See [`deploy/fly/`](deploy/fly/) for the Dockerfile, `fly.toml`, and startup
+script. First boot downloads the vindex from HuggingFace to the persistent
+volume (~2 min on fly's network); subsequent restarts are instant.
+
+Live demo: `https://larql-expert-server.fly.dev` serves
+`hf://chrishayuk/gemma-4-26b-a4b-it-vindex-expert-server` — a real CPU-only
+expert server on fly.io that you can point `--moe-shards` at.
 
 **3-tier topology (ADR-0008).** When laptop RAM matters, split the
 embedding table out to its own server:
@@ -449,7 +517,7 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 
 | Operation | Latency | tok/s |
 |---|---|---|
-| **GPU Q4K decode (Metal, 34L, KV cache)** | **11.9ms** | **84** |
+| **GPU Q4K decode (Metal, 34L, KV cache)** | **12.0ms** | **83.2** |
 | Walk prediction (CPU, no attention) | 33ms | 30 |
 | INFER walk (CPU, with attention, mmap FFN) | 517ms | 1.9 |
 | INFER dense (CPU, all matmul) | 535ms | 1.9 |
@@ -479,10 +547,21 @@ Walk is **faster than dense** (517ms vs 535ms). GPU Q4K decode is **23× faster*
 
 | Topology | tok/s | Notes |
 |---|---|---|
-| **Local Metal MoE** | **19.4** | Post 2026-05-02 dispatch fix; was 5.1 (bug-locked). Output coherent multilingual. |
+| **Local Metal MoE** | **18.9** | Measured 2026-05-04; MoE experts on CPU NEON. |
 | 1-shard CPU/grid (loopback) | 18.3 | NEON Q4_K matvec on shard server, gRPC fan-in |
 | 2-shard CPU/grid (loopback) | 17.3 | Parallel collect + parallel fire (`std::thread::scope` + `rayon::par_iter`) |
 | SKIP_MOE ceiling | 56.8 | Attention + dense FFN only; theoretical max |
+
+### Dense remote-FFN (Gemma 4 31B Q4K, M3 Max, localhost)
+
+| Topology | tok/s | Notes |
+|---|---|---|
+| **Remote-FFN batch, Metal GPU server** | **6.5** | `larql bench --ffn URL --ffn-dispatch batch`; `--features metal-experts` on server. 153ms/tok: 92ms attn local + 60ms FFN remote. |
+| Remote-FFN batch, CPU server | 1.6 | Same path, server uses CPU NEON instead of Metal. |
+| Remote-FFN streaming (60 sequential HTTP) | 0.6 | Q8K wire format via `/v1/walk-ffn-q8k`, NEON down projection. |
+| Local Metal | blocked | Heterogeneous attention (L5/L11/…/L59 head_dim=512 vs sliding head_dim=256) — A1-A3 roadmap. Est. ~12-15 tok/s after fix. |
+
+**Metal GPU FFN server** (`larql serve --ffn-only --features metal-experts`): pre-loads Q4K weight bytes into Metal buffers at startup via zero-copy mmap; dispatches `q4k_ffn_gate_up_8sg` + `geglu_gelu_tanh` + `q4k_matvec` per Q8K batch request — same shaders as local decode. **Build separation required**: `larql-cli` must be built WITHOUT `--features metal-experts` (adding it causes a 10.7 vs 18.9 tok/s regression on Gemma 4 26B-A4B due to Metal pipeline init overhead in the standard decode path). Only the server binary uses that flag.
 
 The grid path is the load-bearing primitive for the **"split large models in grids"** axis — Kimi K2.6 / DeepSeek V4-class models (1T params, ~600 GB Q4_K) only fit on a multi-shard deployment. See [`crates/larql-server/ROADMAP.md` §G-SCALE](crates/larql-server/ROADMAP.md) for the path forward.
 

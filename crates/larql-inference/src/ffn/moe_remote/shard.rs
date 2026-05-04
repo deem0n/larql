@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use super::config::ShardConfig;
 use super::error::RemoteMoeError;
+use super::multi_layer_wire::{
+    decode_multi_layer_response, encode_multi_layer_request, encode_multi_layer_request_q8k,
+    MultiLayerResult, MultiLayerTask, MultiLayerTaskQ8K, MULTI_LAYER_BATCH_CONTENT_TYPE,
+    MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
+};
 use super::router::{rms_norm, MoeRouterWeights};
 use super::stream::{InflightMoe, ShardStream};
 use super::wire::{
@@ -82,8 +87,13 @@ impl Shard {
                 path,
                 stream: std::sync::Mutex::new(Some(stream)),
             })
-        } else if config.url.starts_with("grpc://") {
-            let grpc_endpoint = config.url.replacen("grpc://", "http://", 1);
+        } else if config.url.starts_with("grpc://") || config.url.starts_with("grpcs://") {
+            let use_tls = config.url.starts_with("grpcs://");
+            let grpc_endpoint = if use_tls {
+                config.url.replacen("grpcs://", "https://", 1)
+            } else {
+                config.url.replacen("grpc://", "http://", 1)
+            };
             let rt = std::sync::Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
@@ -91,14 +101,27 @@ impl Shard {
                     .build()
                     .map_err(|e| RemoteMoeError::Client(e.to_string()))?,
             );
-            let client = rt
-                .block_on(larql_router_protocol::ExpertServiceClient::connect(
+            let client = if use_tls {
+                let endpoint = tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                    .map_err(|e| RemoteMoeError::Client(e.to_string()))?
+                    .tls_config(tonic::transport::ClientTlsConfig::new().with_webpki_roots())
+                    .map_err(|e| RemoteMoeError::Client(e.to_string()))?;
+                let channel =
+                    rt.block_on(endpoint.connect())
+                        .map_err(|e| RemoteMoeError::Unreachable {
+                            url: grpc_endpoint,
+                            cause: e.to_string(),
+                        })?;
+                larql_router_protocol::ExpertServiceClient::new(channel)
+            } else {
+                rt.block_on(larql_router_protocol::ExpertServiceClient::connect(
                     grpc_endpoint.clone(),
                 ))
                 .map_err(|e| RemoteMoeError::Unreachable {
                     url: grpc_endpoint,
                     cause: e.to_string(),
-                })?;
+                })?
+            };
             ShardTransport::Grpc(std::sync::Arc::new(GrpcState {
                 runtime: rt,
                 client,
@@ -106,6 +129,7 @@ impl Shard {
         } else {
             let http = reqwest::blocking::Client::builder()
                 .timeout(config.timeout)
+                .pool_max_idle_per_host(64)
                 .build()
                 .map_err(|e| RemoteMoeError::Client(e.to_string()))?;
             // Health check on HTTP shards only (gRPC connect already verifies).
@@ -151,6 +175,12 @@ impl Shard {
             return units.contains(&(layer, expert_id));
         }
         expert_id >= self.config.start && expert_id <= self.config.end
+    }
+
+    /// True if this shard uses gRPC transport (not HTTP or UDS).
+    /// Used by `backend.rs` to decide whether to use the multi-layer fast path.
+    pub(super) fn is_grpc(&self) -> bool {
+        matches!(self.transport, ShardTransport::Grpc(_))
     }
 
     /// Open a bidirectional gRPC stream for one decode step.
@@ -547,6 +577,111 @@ impl Shard {
                 }
                 out
             }
+        }
+    }
+
+    /// Send all layers' routing decisions in one request, receive all h2 values.
+    ///
+    /// HTTP and UDS only.  The sequential server-side loop eliminates rayon
+    /// oversubscription; each task gets the full thread pool.
+    pub(super) fn call_multi_layer_batch(
+        &self,
+        tasks: &[MultiLayerTask],
+    ) -> Result<Vec<MultiLayerResult>, RemoteMoeError> {
+        let body = encode_multi_layer_request(tasks);
+        match &self.transport {
+            ShardTransport::Http(client) => {
+                let url = format!("{}/v1/experts/multi-layer-batch", self.config.url);
+                let resp = client
+                    .post(&url)
+                    .header("Content-Type", MULTI_LAYER_BATCH_CONTENT_TYPE)
+                    .header("Accept", MULTI_LAYER_BATCH_CONTENT_TYPE)
+                    .body(body)
+                    .send()
+                    .map_err(|e| RemoteMoeError::Unreachable {
+                        url: url.clone(),
+                        cause: e.to_string(),
+                    })?;
+                if !resp.status().is_success() {
+                    return Err(RemoteMoeError::ServerError {
+                        status: resp.status().as_u16(),
+                        body: resp.text().unwrap_or_default(),
+                    });
+                }
+                let bytes = resp
+                    .bytes()
+                    .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                decode_multi_layer_response(&bytes).ok_or_else(|| {
+                    RemoteMoeError::BadResponse("multi-layer-batch response truncated".into())
+                })
+            }
+            ShardTransport::Uds(uds) => {
+                let resp_bytes = uds_call(
+                    uds,
+                    "/v1/experts/multi-layer-batch",
+                    MULTI_LAYER_BATCH_CONTENT_TYPE,
+                    &body,
+                )?;
+                decode_multi_layer_response(&resp_bytes).ok_or_else(|| {
+                    RemoteMoeError::BadResponse("UDS multi-layer-batch response truncated".into())
+                })
+            }
+            ShardTransport::Grpc(_) => Err(RemoteMoeError::Client(
+                "call_multi_layer_batch unavailable for gRPC shards".into(),
+            )),
+        }
+    }
+
+    /// Q8K-prenormed variant: client sends pre-quantised h_norm instead of
+    /// the raw residual.  4× smaller upload; server skips pre_experts_norm
+    /// + Q8K quantisation and calls the matvec directly.
+    pub(super) fn call_multi_layer_batch_q8k(
+        &self,
+        tasks: &[MultiLayerTaskQ8K],
+    ) -> Result<Vec<MultiLayerResult>, RemoteMoeError> {
+        let body = encode_multi_layer_request_q8k(tasks);
+        match &self.transport {
+            ShardTransport::Http(client) => {
+                let url = format!("{}/v1/experts/multi-layer-batch-q8k", self.config.url);
+                let resp = client
+                    .post(&url)
+                    .header("Content-Type", MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE)
+                    .header("Accept", MULTI_LAYER_BATCH_CONTENT_TYPE)
+                    .body(body)
+                    .send()
+                    .map_err(|e| RemoteMoeError::Unreachable {
+                        url: url.clone(),
+                        cause: e.to_string(),
+                    })?;
+                if !resp.status().is_success() {
+                    return Err(RemoteMoeError::ServerError {
+                        status: resp.status().as_u16(),
+                        body: resp.text().unwrap_or_default(),
+                    });
+                }
+                let bytes = resp
+                    .bytes()
+                    .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                decode_multi_layer_response(&bytes).ok_or_else(|| {
+                    RemoteMoeError::BadResponse("multi-layer-batch-q8k response truncated".into())
+                })
+            }
+            ShardTransport::Uds(uds) => {
+                let resp_bytes = uds_call(
+                    uds,
+                    "/v1/experts/multi-layer-batch-q8k",
+                    MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
+                    &body,
+                )?;
+                decode_multi_layer_response(&resp_bytes).ok_or_else(|| {
+                    RemoteMoeError::BadResponse(
+                        "UDS multi-layer-batch-q8k response truncated".into(),
+                    )
+                })
+            }
+            ShardTransport::Grpc(_) => Err(RemoteMoeError::Client(
+                "call_multi_layer_batch_q8k unavailable for gRPC shards".into(),
+            )),
         }
     }
 }

@@ -14,6 +14,8 @@
 //!
 //! Carved out of `ffn_store.rs` in the 2026-04-25 modularity pass.
 
+use std::sync::Arc;
+
 use crate::index::core::VectorIndex;
 
 impl VectorIndex {
@@ -199,5 +201,65 @@ impl VectorIndex {
             out[i] += alpha * arc[row_start + i];
         }
         true
+    }
+
+    /// Lock-free dequant cache for the parallel-batch server path.
+    ///
+    /// On the first call for a given `(layer, component)` this dequantises
+    /// the Q4K data and stores an `Arc<Vec<f32>>` in a per-slot `OnceLock`.
+    /// Every subsequent call is a single atomic load + `Arc::clone` —
+    /// no mutex, no LRU, no contention between concurrent rayon workers.
+    ///
+    /// The data layout matches `q4k_ffn_layer` exactly (component=2/down is
+    /// transposed to feature-major so callers can do `activation.dot(&view)`
+    /// directly without an extra `.t()`).
+    ///
+    /// Returns `None` only when the vindex has no Q4K interleaved data or
+    /// the layer index is out of range.  A `None` stored by `get_or_init`
+    /// is permanent for this instance; callers must fall back to fresh
+    /// dequant in that case.
+    pub fn q4k_ffn_layer_once(
+        &self,
+        layer: usize,
+        component: usize,
+    ) -> Option<Arc<Vec<f32>>> {
+        if component > 2 {
+            return None;
+        }
+        let once = self.ffn.q4k_ffn_once.get(layer)?.get(component)?;
+
+        let result = once.get_or_init(|| {
+            let slices = self.interleaved_q4k_layer_data(layer)?;
+            let (bytes, format) = slices[component];
+            let intermediate = self.num_features(layer);
+            if intermediate == 0 {
+                return None;
+            }
+            let hidden = self.hidden_size;
+            let n = intermediate * hidden;
+            let padded = n.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+                * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+            let info = crate::quant::registry::lookup(format)?;
+            let decoded = (info.dequantize)(bytes, padded).ok()?;
+
+            let final_data: Vec<f32> = if component == 2 {
+                // Transpose on-disk [hidden, intermediate] → feature-major
+                // [intermediate, hidden] so callers can use activation.dot(&view)
+                // directly (matches layout produced by q4k_ffn_layer).
+                let mut t = vec![0.0f32; n];
+                for h in 0..hidden {
+                    let src_row = &decoded[h * intermediate..(h + 1) * intermediate];
+                    for (i, &v) in src_row.iter().enumerate() {
+                        t[i * hidden + h] = v;
+                    }
+                }
+                t
+            } else {
+                decoded.into_iter().take(n).collect()
+            };
+            Some(std::sync::Arc::new(final_data))
+        });
+
+        result.clone()
     }
 }

@@ -203,6 +203,11 @@ pub fn load_single_vindex(
         // attention + interleaved-FFN slices the inference path needs.
         // Mirrors `larql_inference::open_inference_vindex` — without
         // these the Q4K decode panics with "attn Q4K slices missing".
+        //
+        // `--ffn-only` skips attention weights (no infer path) but MUST
+        // still mmap interleaved_q4k so per-layer walk-ffn requests can
+        // call `q4k_ffn_forward_layer`.
+        let need_ffn_mmap = (!opts.no_infer && !opts.ffn_only && has_weights) || opts.ffn_only;
         if !opts.no_infer && !opts.ffn_only && has_weights {
             if path.join(LM_HEAD_BIN).is_file() {
                 let _ = index.load_lm_head(&path);
@@ -221,9 +226,13 @@ pub fn load_single_vindex(
                     warn!("  Attn Q8: failed to load ({e}) — generation may not work");
                 }
             }
+        }
+        if need_ffn_mmap {
             if path.join(INTERLEAVED_Q4K_BIN).is_file() {
                 if let Err(e) = index.load_interleaved_q4k(&path) {
                     warn!("  Interleaved Q4K: failed to load ({e})");
+                } else if opts.ffn_only {
+                    info!("  Interleaved Q4K: loaded (ffn-service)");
                 }
             } else if path.join(INTERLEAVED_Q4_BIN).is_file() {
                 if let Err(e) = index.load_interleaved_q4(&path) {
@@ -333,6 +342,8 @@ pub fn load_single_vindex(
         metal_backend: std::sync::OnceLock::new(),
         #[cfg(feature = "metal-experts")]
         moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+        #[cfg(feature = "metal-experts")]
+        metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     })
 }
 

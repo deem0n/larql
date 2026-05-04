@@ -3,7 +3,9 @@
 //! norm → Q/K/V projection → bias → V-norm → QK-norm → RoPE → GQA → O projection → residual.
 //! Supports KV sharing (reuse K/V from a source layer).
 
-use super::gqa::{gqa_attention_with_all_weights, gqa_attention_with_weights};
+use super::gqa::{
+    gqa_attention_with_all_weights, gqa_attention_with_weights, gqa_reduced_qk_all_weights,
+};
 use super::rope::apply_rope_partial;
 use super::{AttentionAllWeights, AttentionWeights, SharedKV};
 use ndarray::{s, Array2};
@@ -46,6 +48,7 @@ pub fn run_attention_block_with_kv_out(
         None,
         None,
         false,
+        None,
     )?;
     Some((h_post, attn_proj, attn_w, k, v))
 }
@@ -70,6 +73,7 @@ pub fn run_attention_block_shared(
         None,
         None,
         false,
+        None,
     )?;
     Some((h_post, attn_proj, attn_w))
 }
@@ -83,7 +87,7 @@ pub fn run_attention_block_with_pre_o(
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
     let (h_post, _, _, _, _, pre_o, _) = run_attention_block_core(
-        weights, h, layer, false, None, None, None, None, None, false,
+        weights, h, layer, false, None, None, None, None, None, false, None,
     )?;
     Some((h_post, pre_o))
 }
@@ -100,7 +104,7 @@ pub fn run_attention_block_shared_with_pre_o(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
     let (h_post, _, _, _, _, pre_o, _) = run_attention_block_core(
-        weights, h, layer, false, shared_kv, None, None, None, None, false,
+        weights, h, layer, false, shared_kv, None, None, None, None, false, None,
     )?;
     Some((h_post, pre_o))
 }
@@ -118,7 +122,36 @@ pub fn run_attention_block_with_pre_o_and_all_attention_weights(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Array2<f32>, AttentionAllWeights)> {
     let (h_post, _, _, _, _, pre_o, all_weights) = run_attention_block_core(
-        weights, h, layer, false, shared_kv, None, None, None, None, true,
+        weights, h, layer, false, shared_kv, None, None, None, None, true, None,
+    )?;
+    Some((h_post, pre_o, all_weights?))
+}
+
+/// Run attention with optional shared K/V and return the pre-O output plus
+/// all-position attention distributions computed from a reduced QK dot product.
+///
+/// The real attention output remains full-rank. Only the diagnostic attention
+/// weights use `qk_rank`, so this can test reduced address computation without
+/// changing the model forward path.
+pub fn run_attention_block_with_pre_o_and_reduced_qk_attention_weights(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    shared_kv: Option<&SharedKV>,
+    qk_rank: usize,
+) -> Option<(Array2<f32>, Array2<f32>, AttentionAllWeights)> {
+    let (h_post, _, _, _, _, pre_o, all_weights) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        false,
+        shared_kv,
+        None,
+        None,
+        None,
+        None,
+        false,
+        Some(qk_rank),
     )?;
     Some((h_post, pre_o, all_weights?))
 }
@@ -145,6 +178,7 @@ pub fn run_attention_block_zero_pre_o_heads(
         None,
         None,
         false,
+        None,
     )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
@@ -176,6 +210,7 @@ pub fn run_attention_block_replace_pre_o_head(
         None,
         None,
         false,
+        None,
     )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
@@ -208,6 +243,7 @@ pub fn run_attention_block_subtract_pre_o_heads(
         Some(heads),
         None,
         false,
+        None,
     )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
@@ -243,6 +279,7 @@ pub fn run_attention_block_replace_head_residual_delta(
         None,
         Some((head, replacement_delta)),
         false,
+        None,
     )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
@@ -266,6 +303,7 @@ fn run_attention_block_core(
     subtract_pre_o_heads: Option<&[usize]>,
     replace_head_residual_delta: Option<(usize, &Array2<f32>)>,
     capture_all_attention: bool,
+    reduced_qk_rank: Option<usize>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -414,7 +452,12 @@ fn run_attention_block_core(
 
     // GQA attention
     let softcap = arch.attn_logit_softcapping();
-    let (mut attn_out, attn_weights, all_attn_weights) = if capture_all_attention {
+    let reduced_qk_weights = reduced_qk_rank.map(|rank| {
+        gqa_reduced_qk_all_weights(
+            &q_rope, &k_rope, num_q, head_dim, reps, scale, seq_len, softcap, rank,
+        )
+    });
+    let (mut attn_out, attn_weights, full_all_attn_weights) = if capture_all_attention {
         let (out, all_weights) = gqa_attention_with_all_weights(
             &q_rope, &k_rope, &v_final, num_q, head_dim, reps, scale, seq_len, softcap,
         );
@@ -434,6 +477,7 @@ fn run_attention_block_core(
         );
         (out, weights, None)
     };
+    let all_attn_weights = reduced_qk_weights.or(full_all_attn_weights);
     if let Some(heads) = zero_pre_o_heads {
         for &head in heads {
             if head >= num_q {

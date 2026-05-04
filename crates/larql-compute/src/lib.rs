@@ -91,9 +91,16 @@ pub mod prelude {
     };
 }
 pub use cpu::ops::linalg::{cholesky, cholesky_inverse, cholesky_solve, ridge_decomposition_solve};
+pub use cpu::ops::moe::{quantize_x_to_q8k, Q8KActivation};
 pub use cpu::ops::vector::{cosine, dot, norm};
 pub use cpu::CpuBackend;
 
+/// Read and clear the per-stage timings stored after the most recent
+/// Metal decode step. Returns `None` when `LARQL_PROFILE_SPLIT` is unset
+/// or no step has run yet. Used by the generate loop to accumulate
+/// gate+up / act+down averages into `StageTimings`.
+#[cfg(feature = "metal")]
+pub use metal::take_last_split_timings as metal_take_last_split_timings;
 #[cfg(feature = "metal")]
 pub use metal::{MetalBackend, MoeScratch};
 

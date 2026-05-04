@@ -100,6 +100,8 @@ pub(super) fn generate_via_cpu_q4k(
         stage_timings: StageTimings {
             embed_ms_total: 0.0,
             gpu_ms_total: t_gpu,
+            gate_up_ms_total: 0.0,
+            down_ms_total: 0.0,
             norm_ms_total: 0.0,
             lm_head_ms_total: 0.0,
             detok_ms_total: 0.0,

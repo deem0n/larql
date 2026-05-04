@@ -8,12 +8,22 @@ use std::ffi::c_void;
 
 use crate::metal::buffers::BufferCache;
 
+pub const SHORT_ATTENTION_SPAN: u32 = 1024;
+
 fn shape_pairs_have_mismatch(existing: &[(usize, usize)], expected: &[(usize, usize)]) -> bool {
     existing.iter().zip(expected.iter()).any(
         |(&(actual_num_kv, actual_head_dim), &(expected_num_kv, expected_head_dim))| {
             actual_num_kv != expected_num_kv || actual_head_dim != expected_head_dim
         },
     )
+}
+
+pub fn attention_span(t: u32, window_size: u32) -> u32 {
+    if window_size > 0 && t > window_size {
+        window_size
+    } else {
+        t
+    }
 }
 
 /// KV cache for one layer — pre-allocated Metal buffers.
@@ -153,6 +163,7 @@ pub fn encode_kv_attend(
     enc: &ComputeCommandEncoderRef,
     cache: &LayerKVCache,
     attend_pipeline: &ComputePipelineState,
+    attend_long_pipeline: Option<&ComputePipelineState>,
     q: &Buffer,
     out: &Buffer,
     num_q_heads: usize,
@@ -163,8 +174,14 @@ pub fn encode_kv_attend(
     let hd = cache.head_dim as u32;
     let num_q_val = num_q_heads as u32;
     let num_kv = cache.num_kv_heads as u32;
+    let span = attention_span(t_val, window_size);
+    let pipeline = if span > SHORT_ATTENTION_SPAN {
+        attend_long_pipeline.unwrap_or(attend_pipeline)
+    } else {
+        attend_pipeline
+    };
 
-    enc.set_compute_pipeline_state(attend_pipeline);
+    enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(q), 0);
     enc.set_buffer(1, Some(&cache.k_cache), 0);
     enc.set_buffer(2, Some(&cache.v_cache), 0);
@@ -208,7 +225,17 @@ pub fn append_and_attend(
     // Attend in its own encoder (reads from cache written by append)
     {
         let enc = cmd.new_compute_command_encoder();
-        encode_kv_attend(enc, cache, attend_pipeline, q, out, num_q_heads, scale, 0);
+        encode_kv_attend(
+            enc,
+            cache,
+            attend_pipeline,
+            None,
+            q,
+            out,
+            num_q_heads,
+            scale,
+            0,
+        );
         enc.end_encoding();
     }
 

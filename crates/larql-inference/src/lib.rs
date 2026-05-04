@@ -158,7 +158,10 @@ pub use layer_graph::{
     generate_streaming,
     generate_with_sampling,
     // Expert grid generation
-    grid::{generate_with_remote_moe, generate_with_remote_moe_batch, GridGenerateResult},
+    grid::{
+        generate_with_remote_ffn, generate_with_remote_ffn_batch, generate_with_remote_moe,
+        generate_with_remote_moe_batch, GridGenerateResult,
+    },
     hybrid::predict_hybrid,
     predict_honest,
     predict_pipeline,

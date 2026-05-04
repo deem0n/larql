@@ -643,6 +643,8 @@ where
     let profile_split = std::env::var("LARQL_PROFILE_SPLIT").is_ok();
     let mut t_embed = 0.0f64;
     let mut t_gpu = 0.0f64;
+    let mut t_gate_up = 0.0f64;
+    let mut t_down = 0.0f64;
     let mut t_norm = 0.0f64;
     let mut t_lmhead = 0.0f64;
     let mut t_detok = 0.0f64;
@@ -840,6 +842,13 @@ where
                 }
                 t_embed += embed_ms;
                 t_gpu += gpu_ms;
+                #[cfg(feature = "metal")]
+                if profile_split {
+                    if let Some(pt) = larql_compute::metal_take_last_split_timings() {
+                        t_gate_up += pt.gate_up_ms;
+                        t_down += pt.down_ms;
+                    }
+                }
                 t_norm += norm_ms;
                 t_lmhead += lmhead_ms;
                 t_detok += detok_ms;
@@ -893,6 +902,8 @@ where
         stage_timings: StageTimings {
             embed_ms_total: t_embed,
             gpu_ms_total: t_gpu,
+            gate_up_ms_total: t_gate_up,
+            down_ms_total: t_down,
             norm_ms_total: t_norm,
             lm_head_ms_total: t_lmhead,
             detok_ms_total: t_detok,

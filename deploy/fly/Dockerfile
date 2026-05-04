@@ -8,7 +8,7 @@ COPY crates/ crates/
 
 # Build larql-server only (larql-cli has unguarded Metal references; not needed on the server)
 RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler cmake g++ libopenblas-dev && \
-    cargo build --release -p larql-server && \
+    RUSTFLAGS="-C target-feature=+avx2,+fma" cargo build --release -p larql-server && \
     strip target/release/larql-server
 
 FROM ubuntu:24.04

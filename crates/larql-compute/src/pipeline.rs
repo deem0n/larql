@@ -244,6 +244,12 @@ pub struct FullPipelineLayer<'a> {
     /// None for all dense models.
     pub moe: Option<MoeLayerWeights<'a>>,
 
+    /// When true, the local FFN (gate/up/down) is skipped and the FFN
+    /// contribution is provided externally via `moe_fn`. Used by
+    /// `generate_with_remote_ffn` where ALL FFN goes to a remote server.
+    /// Default: false.
+    pub ffn_is_remote: bool,
+
     /// When true, a final RMS norm is applied to the combined (dense + expert)
     /// output before the residual add. Gemma 4 26B A4B: true. Other models:
     /// false (use `layer_scalar` instead).
@@ -331,6 +337,7 @@ impl Default for FullPipelineLayer<'_> {
             moe: None,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            ffn_is_remote: false,
         }
     }
 }

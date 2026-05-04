@@ -106,19 +106,29 @@ impl MetalBackend {
             std::env::var("LARQL_FUSED_QK_NORM_ROPE").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
         );
-        let use_fused_kv_aa = !matches!(
-            std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
+        let pos = kv_cache.layers[layer_idx].current_len as u32;
+        let t_val = pos + 1;
+        let attn_span = ops::kv_cache::attention_span(t_val, window_size);
+
+        // kv_append_attend_fused uses a fixed tg_scores[SHORT_ATTENTION_SPAN]
+        // threadgroup array. Spans beyond that overflow it — global-attention
+        // layers (window_size=0) grow unboundedly and must fall back to
+        // encode_kv_attend, which auto-selects kv_attention_long past the threshold.
+        let use_fused_kv_aa = attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
+            && !matches!(
+                std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            );
         let use_fused_post_attn = !matches!(
             std::env::var("LARQL_FUSED_POST_ATTN_NORM").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
         );
 
-        let pos = kv_cache.layers[layer_idx].current_len as u32;
         // Path 1: full attention fusion. Skips both qk_norm_rope dispatch AND
         // kv_append_attend_fused dispatch — handles them in `attn_fused`.
         let did_fused_attn = use_fused_attn
+            && layer_head_dim <= 256
+            && attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
             && layer.q_norm_weight.is_some()
             && layer.k_norm_weight.is_some()
             && !layer.has_v_norm;
@@ -317,6 +327,7 @@ impl MetalBackend {
                 enc,
                 &kv_cache.layers[layer_idx],
                 &self.kv_attend_pipeline,
+                Some(&self.kv_attend_long_pipeline),
                 bufs.q_out,
                 bufs.attn_out_buf,
                 layer_num_q_heads,

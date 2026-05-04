@@ -55,6 +55,10 @@ pub struct WarmupResponse {
     pub weights_load_ms: u64,
     pub layers_prefetched: usize,
     pub prefetch_ms: u64,
+    /// Number of (layer, expert) pairs whose pages were read into the page cache.
+    /// Zero for non-MoE models or when `skip_weights = true`.
+    pub experts_prefetched: usize,
+    pub expert_prefetch_ms: u64,
     pub hnsw_built: bool,
     pub hnsw_warmup_ms: u64,
     pub total_ms: u64,
@@ -85,6 +89,14 @@ pub fn warmup_model(model: &LoadedModel, req: &WarmupRequest) -> WarmupResponse 
             }
         }
     }
+
+    // Expert page prefetch is intentionally omitted for MoE shards:
+    // total model data (experts + weights + dense FFN + embeddings) exceeds
+    // 16 GB on performance-8x machines, so any bulk prefetch causes eviction
+    // of other critical pages and degrades steady-state throughput. Demand
+    // paging via MADV_RANDOM (set at mmap time) is the right policy here.
+    // Upgrade to performance-16x (32 GB) to eliminate cold-fault spikes.
+    let (experts_prefetched, expert_prefetch_ms) = (0usize, 0u64);
 
     // ── 2. Per-layer Q4K mmap prefetch (madvise WILLNEED) ──
     // Uses the existing `prefetch_interleaved_q4k_layer` accessor —
@@ -135,6 +147,8 @@ pub fn warmup_model(model: &LoadedModel, req: &WarmupRequest) -> WarmupResponse 
         weights_load_ms,
         layers_prefetched: prefetched,
         prefetch_ms,
+        experts_prefetched,
+        expert_prefetch_ms,
         hnsw_built,
         hnsw_warmup_ms,
         total_ms: total_t.elapsed().as_millis() as u64,

@@ -30,6 +30,7 @@ mod direct_ops;
 pub mod f32_ops;
 pub mod kernel; // KernelHandle: pipeline + dispatch geometry, bundled
 mod moe_dispatch;
+pub use decode::profile::take_last_split_timings;
 pub use moe_dispatch::MoeScratch;
 pub mod ops; // modular: ops/mod.rs → one file per operation
 mod pipeline;
@@ -84,6 +85,7 @@ pub struct MetalBackend {
     pub geglu_gelu_tanh_pipeline: ComputePipelineState,
     q8_quant_pipeline: ComputePipelineState,
     pub kv_attend_pipeline: ComputePipelineState,
+    pub kv_attend_long_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
     /// Fused KV-append + KV-attention. Each Q-head TG cooperatively
     /// writes its kv_head's new K/V row to cache at position `pos`,
@@ -500,6 +502,8 @@ impl MetalBackend {
         // KV cache attention
         let kv_attend_pipeline =
             get_shader_pipeline::<shaders::kv_attention::AttendKernel>(&device, &library)?;
+        let kv_attend_long_pipeline =
+            get_shader_pipeline::<shaders::kv_attention::AttendLongKernel>(&device, &library)?;
         let kv_append_pipeline =
             get_shader_pipeline::<shaders::kv_attention::AppendKernel>(&device, &library)?;
         let kv_append_attend_fused_pipeline =
@@ -518,6 +522,7 @@ impl MetalBackend {
             geglu_gelu_tanh_pipeline,
             q8_quant_pipeline,
             kv_attend_pipeline,
+            kv_attend_long_pipeline,
             kv_append_pipeline,
             kv_append_attend_fused_pipeline,
             attn_fused_pipeline,
