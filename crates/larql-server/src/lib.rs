@@ -18,6 +18,7 @@ pub mod grpc;
 pub mod grpc_expert;
 pub mod http;
 pub mod metrics;
+pub mod openapi;
 pub mod ratelimit;
 pub mod routes;
 pub mod session;
