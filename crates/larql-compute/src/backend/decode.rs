@@ -37,6 +37,53 @@ pub trait DecodeBackend {
         None
     }
 
+    /// Like `full_pipeline_q4` but replaces one attention head's residual
+    /// contribution at `target_layer` with `replacement_delta`.
+    ///
+    /// This is the Metal-accelerated path for Mode D head injection used by
+    /// the AHORD CEGIS loop. Default delegates to `full_pipeline_q4` (no
+    /// intervention — callers must fall back to the CPU path if this returns
+    /// `None`).
+    #[allow(clippy::too_many_arguments)]
+    fn full_pipeline_q4_with_head_replacement(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        use_qk_norm: bool,
+        softcap: f32,
+        target_layer: usize,
+        target_head: usize,
+        replacement_delta: &[f32],
+    ) -> Option<Vec<f32>> {
+        // Default: fall back to full pipeline without intervention.
+        // Metal backend overrides this with the intervention-aware path.
+        let _ = (target_layer, target_head, replacement_delta);
+        self.full_pipeline_q4(
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            use_qk_norm,
+            softcap,
+        )
+    }
+
     /// Multi-layer Q4 FFN in one submission: gate → up → GEGLU → down.
     fn multi_layer_q4_ffn(
         &self,

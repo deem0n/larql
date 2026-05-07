@@ -77,6 +77,90 @@ impl DecodeBackend for MetalBackend {
             use_qk_norm,
             softcap,
             None, // moe_fn: no MoE callback for full_pipeline_q4
+            None, // intervention: no head replacement
+        ))
+    }
+
+    fn full_pipeline_q4_with_head_replacement(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        use_qk_norm: bool,
+        softcap: f32,
+        target_layer: usize,
+        target_head: usize,
+        replacement_delta: &[f32],
+    ) -> Option<Vec<f32>> {
+        use ops::full_pipeline::{dispatch_full_pipeline, PipelineIntervention};
+        let geglu = if layers
+            .first()
+            .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
+        {
+            &self.geglu_gelu_tanh_pipeline
+        } else {
+            &self.geglu_pipeline
+        };
+        let intervention = PipelineIntervention {
+            target_layer,
+            target_head,
+            head_dim,
+            num_q_heads,
+            replacement_delta,
+        };
+        Some(dispatch_full_pipeline(
+            &self.queue,
+            &self.bufs,
+            &self.q4,
+            geglu,
+            &self.geglu_gelu_tanh_pipeline,
+            &self.silu_pipeline,
+            &self.gelu_tanh_pipeline,
+            &self.q8_quant_pipeline,
+            Some(&self.fused_attn_pipeline),
+            &self.q8_matvec_pipeline.state,
+            &self.q8_qkv_proj_pipeline.state,
+            &self.q4k_matvec_pipeline,
+            Some(&self.q4k_matmul_pipeline),
+            &self.q6k_matvec_pipeline,
+            &self.rms_norm_pipeline,
+            &self.residual_add_pipeline,
+            &self.rms_norm_q8_pipeline,
+            &self.residual_norm_q8_pipeline,
+            Some(&self.q4k_qkv_proj_pipeline.state),
+            Some(&self.q4kf_qkv_proj_pipeline.state),
+            Some(&self.q4kf_proj_pipeline.state),
+            None,
+            Some(&self.qk_norm_pipeline),
+            Some(&self.scale_vector_pipeline),
+            Some(&self.q4k_geglu_silu_down_pipeline),
+            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.q6k_geglu_silu_down_pipeline),
+            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+            None, // no KV cache for prefill
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            use_qk_norm,
+            softcap,
+            None, // no MoE
+            Some(&intervention),
         ))
     }
 
@@ -172,6 +256,7 @@ impl DecodeBackend for MetalBackend {
                     use_qk_norm,
                     softcap,
                     $moe_fn,
+                    None, // intervention: no head replacement in prefill path
                 )
             };
         }

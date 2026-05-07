@@ -62,7 +62,7 @@ pub mod sharded;
 
 pub use codec::RemoteLatencyStats;
 pub(crate) use codec::{decode_binary_batch, decode_binary_single, encode_binary_request};
-pub use http::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend};
+pub use http::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend, WirePreference};
 pub use q8k_wire::{
     decode_q8k_batch_request, decode_q8k_batch_response, encode_q8k_batch_request,
     encode_q8k_batch_response, Q8KRequestEntry, Q8K_BATCH_CT,

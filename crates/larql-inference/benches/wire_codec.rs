@@ -17,9 +17,9 @@ use larql_inference::ffn::remote::codec::{
 
 // Hidden sizes from real models (architecture-agnostic labelling).
 const HIDDEN_SIZES: &[(usize, &str)] = &[
-    (2560, "h2560"),  // typical 4B dense
-    (4096, "h4096"),  // typical 8B dense / MoE shared
-    (5120, "h5120"),  // typical 26B MoE
+    (2560, "h2560"), // typical 4B dense
+    (4096, "h4096"), // typical 8B dense / MoE shared
+    (5120, "h5120"), // typical 26B MoE
 ];
 const SEQ_LENS: &[(usize, &str)] = &[(1, "seq1"), (32, "seq32"), (256, "seq256")];
 

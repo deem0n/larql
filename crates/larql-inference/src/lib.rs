@@ -136,7 +136,7 @@ pub use ffn::graph_backend::{GateIndex, IndexBuildCallbacks, SilentIndexCallback
 pub use ffn::{
     BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
-    ShardConfig, SparseFfn, WeightFfn,
+    ShardConfig, SparseFfn, WeightFfn, WirePreference,
 };
 pub use forward::{
     apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,

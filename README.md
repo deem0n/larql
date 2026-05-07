@@ -98,6 +98,21 @@ larql convert gguf-to-vindex model.gguf -o model.vindex
 larql serve gemma3-4b.vindex --port 8080
 ```
 
+Grid traffic uses **f16 wire format** by default (50% bandwidth vs f32). Opt out with `LARQL_F16_WIRE_DISABLE=1`. Enable i8 symmetric quantised residuals (75% bandwidth, opt-in) with `LARQL_I8_WIRE=1`. Wire format is negotiated per-request via `Accept`/`Content-Type` headers — non-grid clients receive f32 unchanged.
+
+**WebSocket streaming** on `WS /v1/stream`:
+```json
+// Token-by-token generation — send:
+{"type": "generate", "prompt": "The capital of France is", "max_tokens": 50}
+// Receive one frame per token:
+{"type": "token", "text": " Paris", "index": 0}
+// Final frame:
+{"type": "done", "tokens": 1, "latency_ms": 48.2}
+// Abort mid-generation:
+{"type": "cancel"}
+```
+SSE token streaming is also available on `POST /v1/chat/completions` with `"stream": true`.
+
 ### Run attention locally, FFN on another machine
 
 ```bash
@@ -552,6 +567,8 @@ Walk is **faster than dense** (517ms vs 535ms). GPU Q4K decode is **23× faster*
 | 2-shard CPU/grid (loopback) | 17.3 | Parallel collect + parallel fire (`std::thread::scope` + `rayon::par_iter`) |
 | SKIP_MOE ceiling | 56.8 | Attention + dense FFN only; theoretical max |
 
+**Wire format (2026-05-07)**: grid traffic uses f16 by default (50% bandwidth). Set `LARQL_I8_WIRE=1` for i8 symmetric quantisation (75% bandwidth, opt-in). Both are architecture-agnostic — `hidden_size` is read from vindex config at runtime. Per-layer latency is tracked via `HeartbeatMsg.layer_stats` (EMA + p99); the router uses it to route replicated layers to the lowest-latency server. Use `make bench-wire` to measure codec throughput and `make bench-routing` for routing hot-path.
+
 ### Dense remote-FFN (Gemma 4 31B Q4K, M3 Max, localhost)
 
 | Topology | tok/s | Notes |
@@ -695,6 +712,10 @@ The full surface is documented in `crates/larql-inference/ROADMAP.md` §
 | [docs/residual-trace.md](docs/residual-trace.md) | Residual stream trace — decomposition, storage, tiered context |
 | [docs/mech-interp.md](docs/mech-interp.md) | Mechanistic interp surface — hooks, lens, vocab proj, patching, KV surgery (Rust + Python) |
 | [docs/specs/trace-format-spec.md](docs/specs/trace-format-spec.md) | Trace file format specification (.bin, .bndx, .ctxt) |
+| [docs/adr/0009-wire-format-evolution.md](docs/adr/0009-wire-format-evolution.md) | Wire format: f16 default, i8 opt-in, Accept/Content-Type negotiation |
+| [docs/adr/0010-quic-grid-transport.md](docs/adr/0010-quic-grid-transport.md) | QUIC transport for grid (planned) |
+| [docs/adr/0011-grid-self-balancing.md](docs/adr/0011-grid-self-balancing.md) | Grid Mode B + dynamic rebalancing (planned) |
+| [docs/adr/0012-grid-benchmarking.md](docs/adr/0012-grid-benchmarking.md) | Grid benchmarking infrastructure — criterion + CLI + CI gate |
 
 ## Platform Support
 
@@ -762,6 +783,9 @@ cargo bench -p larql-vindex --bench memit_solve          # ridge decomposition t
 cargo bench -p larql-vindex --bench extract_throughput   # streaming extract: f32 vs Q4K write-path
 cargo bench -p larql-vindex --bench q4k_vs_f32           # per-layer attn retrieval: f32 memcpy vs Q4K dequant
 cargo bench -p larql-compute --bench matmul              # CPU/Metal matmul backends
+cargo bench -p larql-inference --bench wire_codec        # f32/f16/i8 encode+decode throughput (MB/s)
+cargo bench -p larql-router --bench routing              # route/heartbeat/rebuild hot-path (ns/op)
+make bench-all                                           # all of the above in one shot
 ```
 
 The `compile_demo` example proves the full flow on a real Gemma 4B

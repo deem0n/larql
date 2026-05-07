@@ -1,6 +1,6 @@
 # ADR-0012 — Grid Benchmarking Infrastructure
 
-**Status:** Accepted — not yet implemented  
+**Status:** Accepted — **GT9 implemented 2026-05-07** (wire_codec.rs + routing.rs); GT8/GT10 planned  
 **Depends on:** ADR-0009 (wire format), ADR-0011 (self-balancing)
 
 ---

@@ -2,7 +2,7 @@
 
 ---
 
-## Current state (2026-05-06)
+## Current state (2026-05-07)
 
 Mode A (self-assembling grid via announce + heartbeat) is implemented and
 live-validated on a 2-shard grid running Gemma 4 26B-A4B at 19.7 tok/s
@@ -16,21 +16,22 @@ are hardcoded.
 
 - `GridService.Join` bidirectional gRPC stream.
 - `AnnounceMsg` → `AckMsg` registration flow (Mode A).
-- `HeartbeatMsg` → `update_heartbeat()` → least-loaded replica routing.
+- `HeartbeatMsg.layer_stats` (`LayerLatency[]`) — per-layer EMA + p99 routing (GT3 ✅).
+- `HeartbeatMsg` → `update_heartbeat()` → per-layer latency routing; falls back to `requests_in_flight`.
 - `DroppingMsg` → deregistration on graceful shutdown.
 - Static `--shards` mode with layer-range routing and per-shard parallel fan-out.
 - Grid + static fallback via `AppState::resolve_all()`.
-- `GET /grid-status` (served by `StatusResponse` proto).
+- `GET /grid-status` (served by `StatusResponse` with `layer_stats` per server).
 - Auth: optional shared `--grid-key` Bearer token in gRPC metadata.
+- Library crate (`larql_router::grid`) for tests and benchmarks.
+- Criterion benchmarks: `routing.rs` (route, route_all, heartbeat, rebuild) (GT9 ✅).
 
 ### What is not yet implemented
 
-- Mode B (server advertises capacity → router assigns shard).
-- `AssignMsg` / `UnassignMsg` — defined in proto, never sent.
-- Per-layer latency in heartbeats — `HeartbeatMsg` has only global metrics.
-- Dynamic rebalancing.
-- QUIC transport.
-- Criterion benchmarks for the routing hot path.
+- Mode B (server advertises capacity → router assigns shard) — GT5.
+- `AssignMsg` / `UnassignMsg` — defined in proto, router never sends — GT5/GT6.
+- Dynamic rebalancing — GT6.
+- QUIC transport — GT7.
 
 ---
 
@@ -50,33 +51,19 @@ Per-call transport RTT (loopback):
 
 ## P1 — Active work (ordered by dependency)
 
-### GT3 — Per-layer latency in HeartbeatMsg
+### GT3 — Per-layer latency in HeartbeatMsg ✅ shipped 2026-05-07
 
 **Spec**: ADR-0011 §HeartbeatMsg Extension.
 
-Extend `grid.proto`:
-```protobuf
-message LayerLatency {
-  uint32 layer  = 1;
-  float  avg_ms = 2;  // EMA α=0.1, updated per request in walk_ffn handler
-  float  p99_ms = 3;  // ring-buffer p99 over last 100 requests
-}
-message HeartbeatMsg {
-  float  cpu_pct            = 1;  // unchanged
-  uint64 ram_used           = 2;  // unchanged
-  uint32 requests_in_flight = 3;  // unchanged
-  repeated LayerLatency layer_stats = 4;  // NEW
-}
-```
+**What shipped:**
+- `grid.proto`: `LayerLatency { layer, avg_ms, p99_ms }` message; `HeartbeatMsg.layer_stats = 4`; `ServerInfo.layer_stats = 11`.
+- `ServerEntry.layer_latencies: HashMap<u32, (f32, f32)>` (avg_ms, p99_ms).
+- `update_heartbeat()` now accepts `Vec<LayerLatency>` and stores them.
+- `route()` prefers server with lowest `layer_latencies[layer].avg_ms` when data exists; falls back to `requests_in_flight` otherwise.
+- `status_response()` populates `ServerInfo.layer_stats` sorted by layer.
+- New tests: `route_prefers_lower_layer_latency_over_inflight`, `heartbeat_stores_layer_latencies`, `status_response_includes_layer_stats`.
 
-Router changes in `grid.rs`:
-- `ServerEntry`: add `layer_latencies: HashMap<u32, LayerLatencyStats>`.
-- `update_heartbeat()`: update per-layer latency from heartbeat.
-- `route()`: when multiple replicas cover the same layer, prefer the server
-  with lowest `layer_latencies[layer].avg_ms` instead of `requests_in_flight`.
-- `status_response()`: include per-layer stats in `ServerInfo`.
-
-**Acceptance**: `/grid-status` includes `layer_latency_ms` per layer per server.
+**Acceptance**: ✅ `/grid-status` `StatusResponse.servers[*].layer_stats` populated after first heartbeat with layer data.
 
 ---
 
@@ -177,9 +164,16 @@ the stream as a tonic `Streaming<ServerMessage>`.
 
 ---
 
-### GT9 — Criterion routing benchmarks
+### GT9 — Criterion routing benchmarks ✅ shipped 2026-05-07
 
 **Spec**: ADR-0012 §Layer 2.
+
+**What shipped:**
+- `crates/larql-router/benches/routing.rs`: `bench_route_single_layer`, `bench_route_all`, `bench_heartbeat_update`, `bench_rebuild_route_table` at 1/10/100 servers × 30/62 layers. No hardcoded model names.
+- `src/lib.rs` added to expose `pub mod grid` — required for benches to link against.
+- `Cargo.toml`: `criterion = "0.5"`, `[[bench]] name = "routing" harness = false`.
+- Makefile target: `make bench-routing`.
+- `make bench-all` runs `quant_matvec` + `wire_codec` + `routing`.
 
 New file: `crates/larql-router/benches/routing.rs`
 

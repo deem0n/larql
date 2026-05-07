@@ -52,6 +52,16 @@ struct Metric {
     kl_p99_nats: f64,
     kl_max_nats: f64,
     n_positions: usize,
+    kl_reverse_mean_nats: f64,
+    kl_reverse_p50_nats: f64,
+    kl_reverse_p95_nats: f64,
+    kl_reverse_p99_nats: f64,
+    kl_reverse_max_nats: f64,
+    kl_symmetric_mean_nats: f64,
+    kl_symmetric_p50_nats: f64,
+    kl_symmetric_p95_nats: f64,
+    kl_symmetric_max_nats: f64,
+    kl_symmetric_p99_nats: f64,
     sampling_mode: String,
     position_stride: usize,
     n_windows_evaluated: usize,
@@ -300,6 +310,8 @@ fn evaluate_job(
     let offsets = WindowOffsets::from_store(&store);
     let selected: HashSet<usize> = job.boundary_indices.iter().copied().collect();
     let mut values = Vec::new();
+    let mut reverse_values = Vec::new();
+    let mut symmetric_values = Vec::new();
     let mut windows_evaluated = 0usize;
 
     if let Some(path) = &args.positions_file {
@@ -324,7 +336,13 @@ fn evaluate_job(
             let reference_logits = logits_from_boundary(weights, &prefix, source_boundary, crystal);
             let reconstructed_logits =
                 logits_from_boundary(weights, &prefix, reconstructed_boundary, crystal);
-            values.push(kl_logits(&reference_logits, &reconstructed_logits));
+            push_kl_metrics(
+                &reference_logits,
+                &reconstructed_logits,
+                &mut values,
+                &mut reverse_values,
+                &mut symmetric_values,
+            );
             matched_segments.insert(start_window);
             if plan.max_positions.is_some_and(|max| values.len() >= max) {
                 break;
@@ -371,7 +389,13 @@ fn evaluate_job(
                     logits_from_boundary(weights, prefix, source_boundary, crystal);
                 let reconstructed_logits =
                     logits_from_boundary(weights, prefix, reconstructed_boundary, crystal);
-                values.push(kl_logits(&reference_logits, &reconstructed_logits));
+                push_kl_metrics(
+                    &reference_logits,
+                    &reconstructed_logits,
+                    &mut values,
+                    &mut reverse_values,
+                    &mut symmetric_values,
+                );
             }
 
             if plan.max_positions.is_some_and(|max| values.len() >= max) {
@@ -388,19 +412,30 @@ fn evaluate_job(
     if values.is_empty() {
         return Err(format!("{} produced no KL positions", job.config_id).into());
     }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let primary = stats(values);
+    let reverse = stats(reverse_values);
+    let symmetric = stats(symmetric_values);
     Ok(Metric {
         config_id: job.config_id.clone(),
         status: "complete",
         kl_direction: KL_DIRECTION,
         metric_source: "apollo_boundary_replay",
-        kl_mean_nats: mean,
-        kl_p50_nats: percentile_sorted(&values, 50.0),
-        kl_p95_nats: percentile_sorted(&values, 95.0),
-        kl_p99_nats: percentile_sorted(&values, 99.0),
-        kl_max_nats: *values.last().unwrap(),
-        n_positions: values.len(),
+        kl_mean_nats: primary.mean,
+        kl_p50_nats: primary.p50,
+        kl_p95_nats: primary.p95,
+        kl_p99_nats: primary.p99,
+        kl_max_nats: primary.max,
+        n_positions: primary.n,
+        kl_reverse_mean_nats: reverse.mean,
+        kl_reverse_p50_nats: reverse.p50,
+        kl_reverse_p95_nats: reverse.p95,
+        kl_reverse_p99_nats: reverse.p99,
+        kl_reverse_max_nats: reverse.max,
+        kl_symmetric_mean_nats: symmetric.mean,
+        kl_symmetric_p50_nats: symmetric.p50,
+        kl_symmetric_p95_nats: symmetric.p95,
+        kl_symmetric_p99_nats: symmetric.p99,
+        kl_symmetric_max_nats: symmetric.max,
         sampling_mode: if args.positions_file.is_some() {
             format!("matched_positions:{}", plan.mode)
         } else {
@@ -409,6 +444,29 @@ fn evaluate_job(
         position_stride: plan.position_stride,
         n_windows_evaluated: windows_evaluated,
     })
+}
+
+#[derive(Debug)]
+struct Stats {
+    mean: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    n: usize,
+}
+
+fn stats(mut values: Vec<f64>) -> Stats {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    Stats {
+        mean,
+        p50: percentile_sorted(&values, 50.0),
+        p95: percentile_sorted(&values, 95.0),
+        p99: percentile_sorted(&values, 99.0),
+        max: *values.last().unwrap(),
+        n: values.len(),
+    }
 }
 
 fn eval_plan(job: &Job, args: &Args) -> EvalPlan {
@@ -562,6 +620,20 @@ fn load_payload_boundaries(path: &Path) -> Result<PayloadBoundaries, Box<dyn std
         rows,
         hidden,
     })
+}
+
+fn push_kl_metrics(
+    reference: &[f32],
+    reconstructed: &[f32],
+    primary_values: &mut Vec<f64>,
+    reverse_values: &mut Vec<f64>,
+    symmetric_values: &mut Vec<f64>,
+) {
+    let primary = kl_logits(reference, reconstructed);
+    let reverse = kl_logits(reconstructed, reference);
+    primary_values.push(primary);
+    reverse_values.push(reverse);
+    symmetric_values.push(0.5 * (primary + reverse));
 }
 
 fn kl_logits(reference: &[f32], reconstructed: &[f32]) -> f64 {

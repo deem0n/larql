@@ -21,16 +21,20 @@ This file tracks the demo narrative, the critical path, and cross-crate sequenci
 
 ---
 
-## Current state (2026-05-02)
+## Current state (2026-05-07)
 
-- **2,000+ tests passing** across the workspace, 0 build warnings.
+- **~950 tests passing** across the workspace (server 216 lib + 725 integration, router 10+23), 0 build errors.
 - **Primary CLI verbs** in place: `run`, `chat`, `pull`, `list`, `show`, `rm`, `link`, `serve`, `bench`.
 - **Gemma 3 4B Metal**: **83–84 tok/s** (Ollama steady: 98.5–99.7). **Gap: 1.18×** (was 1.30× before the 2026-05-02 dispatch-geometry fix).
 - **Gemma 4 26B A4B Metal**: **19.4 tok/s** (was 5.1 — bug-locked under the same dispatch-geometry mismatch; correct multilingual output now).
-- **Grid (CPU MoE on remote shards)**: 18.3 tok/s 1-shard / 17.3 tok/s 2-shard local-loopback, both with parallel collect (`std::thread::scope`) and parallel fire (`rayon::par_iter`). Multi-host LAN/cross-region scaling unblocked by F-COLLECT in `crates/larql-server/ROADMAP.md`.
+- **Grid (CPU MoE on remote shards)**: 18.3 tok/s 1-shard / 17.3 tok/s 2-shard local-loopback. Multi-host LAN/cross-region scaling unblocked.
 - **Remote FFN (dense)**: `larql run --ffn URL` + `larql serve --ffn-only` wired end-to-end.
 - **gRPC grid**: 2-shard self-assembling grid live-validated on 26B A4B.
 - **4 KV-cache engines**: MarkovRS (287×), UnlimitedContext (254×), TurboQuant (4×), Apollo (20,000×) — all at ~95 tok/s on Gemma 3 4B Metal.
+- **Wire format negotiation** (2026-05-07): f16 is now the default for all grid traffic (50% bandwidth reduction). i8 symmetric quantised residuals available opt-in (`LARQL_I8_WIRE=1`, 75% reduction). Content-type negotiation via `Accept` header; f32 fallback for non-grid clients.
+- **Per-layer latency routing** (2026-05-07): `HeartbeatMsg.layer_stats` carries EMA avg_ms + p99_ms per layer; router routes to the server with lowest per-layer latency (falls back to requests_in_flight when no data yet).
+- **WebSocket token streaming** (2026-05-07): `WS /v1/stream` now supports `{"type":"generate","prompt":"...","max_tokens":N}` command with per-token frames and cancel support. SSE streaming on `/v1/chat/completions` was already fully wired.
+- **Criterion benchmarks** (2026-05-07): `make bench-wire` (wire codec encode/decode MB/s) and `make bench-routing` (route/heartbeat/rebuild ns/op). `larql-router` now has a library crate (`larql_router::grid`) for test/bench use.
 
 ---
 
@@ -139,19 +143,19 @@ ADR-0012 (benchmarking).
 
 | # | Item | Crates | Status |
 |---|------|--------|--------|
-| GT1 | f16 wire default for all grid traffic; `LARQL_F16_WIRE=0` opt-out; architecture-agnostic validation per model family | larql-server + larql-inference | planned |
-| GT2 | i8 symmetric quantised residuals on wire; `LARQL_I8_WIRE=1` opt-in; per-position scale | larql-server + larql-inference | planned |
-| GT3 | `LayerLatency` in `HeartbeatMsg` (proto + EMA tracker in server + per-layer routing in router) | larql-router-protocol + larql-server + larql-router | planned |
-| GT4 | WebSocket token streaming: complete Q1.10 state machine + SSE encoder for N0.1 chat completions | larql-server | planned |
+| GT1 | f16 wire default for all grid traffic; `LARQL_F16_WIRE_DISABLE` opt-out; Accept header negotiation | larql-server + larql-inference | **shipped 2026-05-07** |
+| GT2 | i8 symmetric quantised residuals on wire; `LARQL_I8_WIRE=1` opt-in; per-position scale | larql-server + larql-inference | **shipped 2026-05-07** |
+| GT3 | `LayerLatency` in `HeartbeatMsg` (proto + EMA tracker in server + per-layer routing in router) | larql-router-protocol + larql-server + larql-router | **shipped 2026-05-07** |
+| GT4 | WebSocket token streaming (`generate` cmd + cancel); SSE for `/v1/chat/completions` confirmed wired | larql-server | **shipped 2026-05-07** |
 | GT5 | Mode B gap-fill: `AvailableMsg → AssignMsg → download → ReadyMsg`; new `shard_loader.rs` | larql-router + larql-server | planned |
 | GT6 | Dynamic rebalancing: `UnassignMsg` drain protocol + `rebalancer.rs` background task | larql-router + larql-server | planned |
 | GT7 | QUIC transport for grid (`quinn` feature-gated); 0-RTT reconnect; per-stream independence for expert fan-out | larql-router + larql-server | planned |
 | GT8 | `larql bench --bench-grid / --wire / --transport / --concurrent / --output json`; arch-agnostic from vindex config | larql-cli | planned |
-| GT9 | Criterion micro-benchmarks: wire codec (MB/s) + router hot-path (ns/op) | larql-inference + larql-router | planned |
+| GT9 | Criterion micro-benchmarks: `wire_codec.rs` (encode/decode MB/s) + `routing.rs` (route/heartbeat/rebuild ns/op) | larql-inference + larql-router | **shipped 2026-05-07** |
 | GT10 | CI regression gate: `scripts/bench-grid-regress.sh` + `bench/baselines/` committed JSONs | scripts/ | planned |
 
 **Implementation order** (each step is a shippable increment):
-GT3 → GT1 → GT2 → GT4 → GT9 → GT5 → GT6 → GT8 → GT10 → GT7
+~~GT3~~ → ~~GT1~~ → ~~GT2~~ → ~~GT4~~ → ~~GT9~~ → GT5 → GT6 → GT8 → GT10 → GT7
 
 ---
 

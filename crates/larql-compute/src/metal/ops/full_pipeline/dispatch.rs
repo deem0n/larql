@@ -95,6 +95,28 @@ pub fn encode_residual_add(
 ///   Q8_0 takes Q8 input via fused norm+Q8 shader)
 ///
 /// QK-norm ordering: when `use_qk_norm` is true and `qk_norm_pipeline` is
+/// Residual-delta intervention for a specific head at a specific layer.
+///
+/// When passed to `dispatch_full_pipeline`, the dispatch:
+///   1. After fused attention at `target_layer`: CPU-zeros head `target_head`'s
+///      slice in `attn_outs[target_layer]` (shared memory write, no GPU copy).
+///   2. After the post-attention residual add: CPU-adds `replacement_delta` to
+///      `h_post_attns[target_layer]`, then re-runs just the pre-FFN norm.
+///
+/// This replaces the head's actual W_O contribution with `replacement_delta`
+/// in the residual stream, which is the Mode D injection operation.
+/// On Apple Silicon with unified memory, the CPU reads/writes to shared Metal
+/// buffers are zero-copy; each intervention adds one command-buffer commit+wait
+/// per intervention point.
+pub struct PipelineIntervention<'a> {
+    pub target_layer: usize,
+    pub target_head: usize,
+    pub head_dim: usize,
+    pub num_q_heads: usize,
+    /// Replacement residual delta, shape `[seq_len × hidden_size]`.
+    pub replacement_delta: &'a [f32],
+}
+
 /// supplied, QK-norm is applied **before** RoPE (matching `decode_token` and
 /// the Gemma 3/4 reference implementations). `fused_attention` is then called
 /// with `use_qk_norm = 0` to avoid a second normalisation.
@@ -161,6 +183,7 @@ pub fn dispatch_full_pipeline(
     // fires so the closure can apply it correctly after combining dense + MoE.
     // Pass `None` for models without MoE — behaviour is identical to the prior API.
     mut moe_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>,
+    intervention: Option<&PipelineIntervention<'_>>,
 ) -> Vec<f32> {
     let num_layers = layers.len();
 
@@ -404,6 +427,32 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
+        // ── Intervention hook A: zero target head in attn_outs[l] ──
+        //
+        // Must run AFTER attention, BEFORE O-projection. Commit the current
+        // command buffer to ensure attention results are visible, then zero
+        // head H's slice in attn_outs[l] from CPU (shared memory on Apple
+        // Silicon — no copy). This makes the O-projection exclude head H's
+        // contribution from o_outs[l].
+        if let Some(iv) = intervention {
+            if l == iv.target_layer {
+                cmd.commit();
+                cmd.wait_until_completed();
+                // attn_outs[l] layout: [seq_len × (num_q_heads × head_dim)] f32
+                let q_dim = iv.num_q_heads * iv.head_dim;
+                let attn_ptr = attn_outs[l].contents() as *mut f32;
+                for pos in 0..seq_len {
+                    let head_start = pos * q_dim + iv.target_head * iv.head_dim;
+                    unsafe {
+                        std::ptr::write_bytes(attn_ptr.add(head_start), 0u8, iv.head_dim);
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                attn_outs[l].did_modify_range(metal::NSRange::new(0, attn_outs[l].length()));
+                cmd = queue.new_command_buffer().to_owned();
+            }
+        }
+
         // ── 5. O projection. Per position, coalesced into a single
         // encoder so we pay one encoder-create + end_encoding for the
         // whole stage. (Tried wiring `q4k_matmul` here for seq_len>1
@@ -488,6 +537,57 @@ pub fn dispatch_full_pipeline(
                 (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64,
             );
             enc.end_encoding();
+        }
+
+        // ── Intervention hook B: add replacement_delta to h_post_attns[l] ──
+        //
+        // h_post_attns[l] = h + o_without_head_H  (head H was zeroed in hook A)
+        // After adding replacement_delta: h_post_attns[l] = h + o_no_H + delta
+        // Then re-run the pre-FFN norm per position (ffn_norm_outs[l] was
+        // computed from the stale h_post_attn before delta was added).
+        if let Some(iv) = intervention {
+            if l == iv.target_layer {
+                cmd.commit();
+                cmd.wait_until_completed();
+                // CPU-add replacement_delta to h_post_attns[l] via shared memory.
+                debug_assert_eq!(
+                    iv.replacement_delta.len(),
+                    seq_len * hidden,
+                    "PipelineIntervention replacement_delta length mismatch"
+                );
+                let h_ptr = h_post_attns[l].contents() as *mut f32;
+                for i in 0..(seq_len * hidden) {
+                    unsafe {
+                        *h_ptr.add(i) += iv.replacement_delta[i];
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                h_post_attns[l].did_modify_range(metal::NSRange::new(0, h_post_attns[l].length()));
+                // Re-run the pre-FFN RMS norm per position on the corrected h_post_attn.
+                // Uses the same norm weight (pre_ffn_weight_buf) and pipeline as step 6.
+                cmd = queue.new_command_buffer().to_owned();
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    let hidden_u32 = hidden as u32;
+                    let tg_threads = 256.min(hidden as u64);
+                    let h_stride_bytes = (hidden * 4) as u64;
+                    for pos in 0..seq_len {
+                        let h_off = pos as u64 * h_stride_bytes;
+                        enc.set_compute_pipeline_state(rms_norm_pipeline);
+                        enc.set_buffer(0, Some(&h_post_attns[l]), h_off);
+                        enc.set_buffer(1, Some(pre_ffn_weight_buf), 0);
+                        enc.set_buffer(2, Some(&ffn_norm_outs[l]), h_off);
+                        enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const c_void);
+                        enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
+                        enc.set_bytes(5, 4, &norm_offset as *const f32 as *const c_void);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(1, 1, 1),
+                            MTLSize::new(tg_threads, 1, 1),
+                        );
+                    }
+                    enc.end_encoding();
+                }
+            }
         }
 
         // ── 7-9. FFN: gate+up → activation → down. Format-aware per position. ──

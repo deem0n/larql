@@ -1,6 +1,37 @@
 # Roadmap — larql-server / larql-router
 
-## Current state (as of 2026-05-01)
+## Current state (as of 2026-05-07)
+
+### 2026-05-07 — Wire format evolution + WebSocket streaming + Criterion benchmarks
+
+GT1–GT4 and GT9 shipped. See `G-TRANSPORT` and `G-BENCH` sections below for full details.
+
+**GT1 (f16 wire default)**: `application/x-larql-ffn-f16` content-type; Accept header
+negotiation; `encode_binary_output_f16` in server; `decode_binary_single/batch_f16`
+in client. Client sends `Accept: i8, f16, f32`; server honours f16 by default
+(`LARQL_F16_WIRE_DISABLE` opt-out). 50% bandwidth reduction on all grid paths.
+
+**GT2 (i8 residuals)**: `application/x-larql-ffn-i8`; per-position symmetric
+quantisation (scale = max(|x|)/127, zero_point = 0); `encode_binary_output_i8` +
+`decode_binary_single/batch_i8`. Opt-in via `LARQL_I8_WIRE=1`. 75% bandwidth reduction.
+
+**GT3 (per-layer latency)**: `LayerLatency { layer, avg_ms, p99_ms }` added to
+`HeartbeatMsg.layer_stats` and `ServerInfo.layer_stats` in grid.proto. Server collects
+EMA + p99 ring-buffer per layer in `metrics::LayerLatencyTracker`; heartbeat sends
+snapshot every 10s. Router stores per-layer latency in `ServerEntry.layer_latencies`
+and prefers lowest `avg_ms` for the requested layer when routing replicas.
+
+**GT4 (WebSocket generate)**: `WS /v1/stream` now supports `{"type":"generate",
+"prompt":"...","max_tokens":N}` command. Streams `{"type":"token","text":"...","index":N}`
+frames per token; emits `{"type":"done","tokens":N,"latency_ms":M}`. Client can send
+`{"type":"cancel"}` to abort. Uses same `generate_streaming` engine as SSE chat completions.
+SSE streaming on `POST /v1/chat/completions` (N0.1 slice 3) confirmed already wired.
+
+**GT9 (Criterion benchmarks)**: `larql-inference/benches/wire_codec.rs` (encode/decode
+throughput at h2560/h4096/h5120, seq1/32/256). `larql-router/benches/routing.rs`
+(route/route_all/update_heartbeat/rebuild at 1/10/100 servers). `larql-router` now
+has a `lib.rs` exposing `grid` for tests/benches. Makefile targets: `bench-wire`,
+`bench-routing`, `bench-grid`, `bench-all`.
 
 ### 2026-05-01 — HTTP CPU-path optimisation session
 
@@ -568,7 +599,9 @@ config at runtime.
 
 #### GT1 — f16 wire default
 
-**Status**: Not started.
+**Status**: ✅ **Shipped 2026-05-07.**
+
+Added `FFN_F16_CT = "application/x-larql-ffn-f16"` in `wire.rs`; `encode_binary_output_f16` in `walk_ffn.rs`; `preferred_response_ct` selects f16 when client sends `Accept: application/x-larql-ffn-f16`. Client (`ffn/remote/http.rs`) sends `Accept: i8, f16, f32` on every grid request. `LARQL_F16_WIRE_DISABLE` opt-out. `half = "2"` added to both crates.
 
 **Spec**: ADR-0009 §Decision, §Wire Layout (f16).
 
@@ -592,7 +625,9 @@ tok/s difference and identical top-5 tokens. Wire bytes column shows 50% reducti
 
 #### GT2 — i8 quantised residuals (opt-in)
 
-**Status**: Not started.
+**Status**: ✅ **Shipped 2026-05-07.**
+
+Added `FFN_I8_CT`; `encode_binary_output_i8` (per-position symmetric scale, zero_point=0) in `walk_ffn.rs`; `decode_binary_single/batch_i8` in `codec.rs`. Client advertises i8 in Accept header; server honours when `LARQL_I8_WIRE=1`. `preferred_response_ct` checks i8 before f16.
 
 **Spec**: ADR-0009 §Wire Layout (i8), §Negotiation Protocol.
 
@@ -611,7 +646,9 @@ Wire: `[scale f32 LE][zero_point f32 LE][data i8[] × hidden_size]` per position
 
 #### GT3 — Per-layer latency in HeartbeatMsg
 
-**Status**: Not started.
+**Status**: ✅ **Shipped 2026-05-07.**
+
+`LayerLatency { layer, avg_ms, p99_ms }` added to grid.proto (`HeartbeatMsg.layer_stats` + `ServerInfo.layer_stats`). New `metrics::LayerLatencyTracker` (EMA α=0.1, p99 ring-buffer per layer, thread-safe Mutex). `LoadedModel.layer_latency_tracker` populated at construction; `walk_ffn.rs` records timing per layer after each FFN forward. `announce.rs` heartbeat sender calls `tracker.snapshot()`. Router `grid.rs` stores `layer_latencies: HashMap<u32, (avg_ms, p99_ms)>` in `ServerEntry`; `route()` prefers lowest `avg_ms` for the requested layer.
 
 **Spec**: ADR-0011 §HeartbeatMsg Extension.
 
@@ -649,10 +686,12 @@ latency in each heartbeat. Router `/grid-status` response includes
 
 #### GT4 — WebSocket token streaming (Q1.10 completion + N0.1 SSE)
 
-**Status**: Not started. Supersedes Q1.10 deferral.
+**Status**: ✅ **Shipped 2026-05-07.**
 
-`routes/stream.rs` has a working WebSocket handler for `describe` and `infer`
-commands but lacks a streaming token generation path. This is the missing
+`handle_stream_generate` added to `routes/stream.rs`: accepts `{"type":"generate","prompt":"...","max_tokens":N}` WebSocket message, calls `generate_streaming` in a `spawn_blocking` task, streams `{"type":"token","text":"...","index":N}` per token, emits `{"type":"done","tokens":N,"latency_ms":M}` on completion. Client cancel supported via `{"type":"cancel"}` frame. SSE on `/v1/chat/completions` (`stream:true`) was confirmed already fully wired (N0.1 slice 3 complete).
+
+`routes/stream.rs` previously had a working WebSocket handler for `describe` and `infer`
+commands but lacked a streaming token generation path. This is the missing
 piece for N0.1 slice 3 (SSE on `POST /v1/chat/completions`).
 
 - Complete `handle_stream_infer` in `routes/stream.rs`:
@@ -794,7 +833,9 @@ is within 2% of `wire_bytes_per_tok(f32) / 2`.
 
 #### GT9 — Criterion micro-benchmarks
 
-**Status**: Not started.
+**Status**: ✅ **Shipped 2026-05-07.**
+
+`larql-inference/benches/wire_codec.rs` (encode f32 request, decode f32/f16 response, 30-layer batch) and `larql-router/benches/routing.rs` (route single layer, route_all 30/62 layers, update_heartbeat, rebuild_route_table) — both parameterised over server counts and hidden sizes with no hardcoded model names. `larql-router` gained `src/lib.rs` re-exporting `pub mod grid`. Makefile: `bench-wire`, `bench-routing`, `bench-grid`, `bench-all`.
 
 **Spec**: ADR-0012 §Layer 2.
 

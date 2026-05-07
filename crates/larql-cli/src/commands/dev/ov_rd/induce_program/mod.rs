@@ -245,9 +245,15 @@ fn build_guarded_program(
             .collect();
         if non_guarded.is_empty() {
             vec![]
-        } else {
+        } else if non_guarded.len() == 1 {
             vec![ProgramRule::Map {
                 source: non_guarded[0],
+                target: sink,
+            }]
+        } else {
+            // Use fixed_point: false to avoid chaining when the sink is in the source set.
+            vec![ProgramRule::MapSet {
+                source: non_guarded,
                 target: sink,
             }]
         }

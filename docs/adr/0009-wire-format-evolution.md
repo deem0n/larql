@@ -1,6 +1,6 @@
 # ADR-0009 — Wire Format Evolution: f16 Default + i8 Quantised Residuals
 
-**Status:** Accepted — not yet implemented  
+**Status:** Accepted — **implemented 2026-05-07** (GT1 f16 + GT2 i8)  
 **Depends on:** ADR-0006 (Q4_K Remote FFN), ADR-0003 (FFN Router)  
 **Closes:** ADR-0006 Open Question 3 ("Wire format")
 

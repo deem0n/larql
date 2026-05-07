@@ -5,6 +5,8 @@
 //! as [`WalkFfn`](crate::vindex::WalkFfn).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ndarray::Array2;
@@ -26,6 +28,56 @@ const HIDDEN_SIZE_KEY: &str = "hidden_size";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
+/// Wire format preference for a `RemoteWalkBackend` connection.
+///
+/// Controls the `Accept` header sent on every request. The server honours
+/// the best format it supports; if the requested format is unavailable it
+/// falls back to f32.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WirePreference {
+    /// Offer all formats; server picks the best (default — f16 on GT1+ servers).
+    #[default]
+    BestAvailable,
+    /// Force f32 (`application/x-larql-ffn`).
+    F32,
+    /// Force f16 (`application/x-larql-ffn-f16`).
+    F16,
+    /// Force i8 symmetric (`application/x-larql-ffn-i8`).
+    I8,
+}
+
+impl WirePreference {
+    /// Construct an `Accept` header value for this preference.
+    pub fn accept_header(self) -> String {
+        match self {
+            Self::BestAvailable => format!("{I8_CT}, {F16_CT}, {BINARY_CT}"),
+            Self::F32 => BINARY_CT.to_owned(),
+            Self::F16 => format!("{F16_CT}, {BINARY_CT}"),
+            Self::I8 => format!("{I8_CT}, {F16_CT}, {BINARY_CT}"),
+        }
+    }
+
+    /// Parse from a short string (`"f32"`, `"f16"`, `"i8"`).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "f32" => Some(Self::F32),
+            "f16" => Some(Self::F16),
+            "i8" => Some(Self::I8),
+            _ => None,
+        }
+    }
+
+    /// Short label for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BestAvailable => "best",
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::I8 => "i8",
+        }
+    }
+}
+
 /// Client config for talking to a remote FFN server.
 #[derive(Clone, Debug)]
 pub struct RemoteFfnConfig {
@@ -34,6 +86,8 @@ pub struct RemoteFfnConfig {
     pub base_url: String,
     /// Per-request timeout. Applied to both connect and read.
     pub timeout: Duration,
+    /// Wire format preference. Controls the `Accept` header.
+    pub wire: WirePreference,
 }
 
 impl RemoteFfnConfig {
@@ -41,11 +95,17 @@ impl RemoteFfnConfig {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             timeout: Duration::from_secs(60),
+            wire: WirePreference::BestAvailable,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_wire(mut self, wire: WirePreference) -> Self {
+        self.wire = wire;
         self
     }
 }
@@ -60,6 +120,10 @@ pub struct RemoteWalkBackend {
     config: RemoteFfnConfig,
     client: reqwest::blocking::Client,
     hidden_size: usize,
+    /// Cumulative bytes sent (request bodies) across all calls.
+    wire_bytes_sent: Arc<AtomicU64>,
+    /// Cumulative bytes received (response bodies) across all calls.
+    wire_bytes_recv: Arc<AtomicU64>,
 }
 
 impl RemoteWalkBackend {
@@ -97,7 +161,25 @@ impl RemoteWalkBackend {
             config,
             client,
             hidden_size,
+            wire_bytes_sent: Arc::new(AtomicU64::new(0)),
+            wire_bytes_recv: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Reset wire byte counters. Call between bench runs to isolate measurements.
+    pub fn reset_wire_counters(&self) {
+        self.wire_bytes_sent.store(0, Ordering::Relaxed);
+        self.wire_bytes_recv.store(0, Ordering::Relaxed);
+    }
+
+    /// Total bytes sent since construction or last `reset_wire_counters`.
+    pub fn wire_bytes_sent(&self) -> u64 {
+        self.wire_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes received since construction or last `reset_wire_counters`.
+    pub fn wire_bytes_recv(&self) -> u64 {
+        self.wire_bytes_recv.load(Ordering::Relaxed)
     }
 
     /// Hidden size advertised by the remote server.
@@ -119,10 +201,10 @@ impl RemoteWalkBackend {
     ) -> Result<Vec<f32>, RemoteFfnError> {
         let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
         let body = encode_binary_request(Some(layer), None, residual_flat, seq_len, true, 8092);
+        self.wire_bytes_sent
+            .fetch_add(body.len() as u64, Ordering::Relaxed);
 
-        // Advertise both f16 and i8 (server picks best it supports).
-        // Accept priority: i8 (smallest) > f16 (half) > f32 (fallback).
-        let accept = format!("{I8_CT}, {F16_CT}, {BINARY_CT}");
+        let accept = self.config.wire.accept_header();
         let resp = self
             .client
             .post(&url)
@@ -151,6 +233,8 @@ impl RemoteWalkBackend {
         let resp_bytes = resp
             .bytes()
             .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
+        self.wire_bytes_recv
+            .fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
 
         let output = if ct.starts_with(I8_CT) {
             let (_, floats) = decode_binary_single_i8(&resp_bytes, self.hidden_size)
@@ -195,8 +279,10 @@ impl RemoteWalkBackend {
     ) -> Result<HashMap<usize, Vec<f32>>, RemoteFfnError> {
         let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
         let body = encode_binary_request(None, Some(layers), residual_flat, seq_len, true, 8092);
+        self.wire_bytes_sent
+            .fetch_add(body.len() as u64, Ordering::Relaxed);
 
-        let accept = format!("{I8_CT}, {F16_CT}, {BINARY_CT}");
+        let accept = self.config.wire.accept_header();
         let resp = self
             .client
             .post(&url)
@@ -225,6 +311,8 @@ impl RemoteWalkBackend {
         let resp_bytes = resp
             .bytes()
             .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
+        self.wire_bytes_recv
+            .fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
 
         if ct.starts_with(I8_CT) {
             decode_binary_batch_i8(&resp_bytes, self.hidden_size)

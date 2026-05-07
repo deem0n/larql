@@ -35,6 +35,19 @@ pub struct ServerEntry {
     pub layer_latencies: HashMap<u32, (f32, f32)>, // (avg_ms, p99_ms)
 }
 
+// ── Mode B: available server entry ───────────────────────────────────────────
+
+/// A server in Mode B idle state — it has capacity but no shard loaded yet.
+pub struct AvailableEntry {
+    pub server_id: String,
+    /// Channel to send `RouterMessage` (including `AssignMsg`) to this server.
+    pub sender: mpsc::Sender<Result<RouterMessage, tonic::Status>>,
+    pub ram_bytes: u64,
+    pub disk_bytes: u64,
+    pub store_path: String,
+    pub joined_at: std::time::Instant,
+}
+
 // ── Grid state ────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -44,6 +57,9 @@ pub struct GridState {
     route_table: HashMap<(String, u32), Vec<String>>,
     // Pre-built: layer → server_ids for model_id=None (single-model) queries.
     any_model_table: HashMap<u32, Vec<String>>,
+    /// Mode B: servers that advertised capacity and are waiting for assignment.
+    /// Key = server_id.
+    available_servers: HashMap<String, AvailableEntry>,
 }
 
 impl GridState {
@@ -181,6 +197,116 @@ impl GridState {
                 "Grid coverage updated"
             );
         }
+    }
+
+    /// Register a Mode B available server. Returns the server_id.
+    pub fn register_available(
+        &mut self,
+        server_id: String,
+        sender: mpsc::Sender<Result<RouterMessage, tonic::Status>>,
+        ram_bytes: u64,
+        disk_bytes: u64,
+        store_path: String,
+    ) {
+        tracing::info!(
+            server_id = %server_id,
+            ram_gb = ram_bytes / (1024 * 1024 * 1024),
+            "Grid: Mode B server available"
+        );
+        self.available_servers.insert(
+            server_id.clone(),
+            AvailableEntry {
+                server_id,
+                sender,
+                ram_bytes,
+                disk_bytes,
+                store_path,
+                joined_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Remove a server from the available pool.
+    pub fn deregister_available(&mut self, server_id: &str) {
+        self.available_servers.remove(server_id);
+    }
+
+    /// Find the first available server that has at least `min_ram_bytes` of
+    /// RAM, send it an `AssignMsg`, and move it out of the available pool.
+    ///
+    /// Returns `true` if an assignment was sent.
+    pub fn try_assign_gap(
+        &mut self,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+        origin_url: &str,
+        shard_hash: &str,
+        min_ram_bytes: u64,
+    ) -> bool {
+        // Find a suitable available server.
+        let server_id = self
+            .available_servers
+            .iter()
+            .find(|(_, e)| e.ram_bytes >= min_ram_bytes)
+            .map(|(id, _)| id.clone());
+
+        let Some(server_id) = server_id else {
+            return false;
+        };
+
+        let entry = self.available_servers.remove(&server_id).unwrap();
+        let msg = RouterMessage {
+            payload: Some(RouterPayload::Assign(larql_router_protocol::AssignMsg {
+                model_id: model_id.to_owned(),
+                layer_start,
+                layer_end,
+                origin_url: origin_url.to_owned(),
+                shard_hash: shard_hash.to_owned(),
+            })),
+        };
+        if entry.sender.try_send(Ok(msg)).is_ok() {
+            tracing::info!(
+                server_id = %server_id,
+                model_id = %model_id,
+                layers = %format!("{layer_start}-{layer_end}"),
+                "Grid: Mode B assignment sent"
+            );
+            true
+        } else {
+            tracing::warn!(server_id = %server_id, "Grid: Mode B assignment send failed (peer disconnected)");
+            false
+        }
+    }
+
+    /// Return a list of (model_id, layer_start, layer_end) ranges that have no
+    /// server covering them, based on the current route table.
+    ///
+    /// Gaps are only detectable if the router knows the total layer count for
+    /// each model. Since the router doesn't store that, we instead return every
+    /// layer range between consecutive covered shards.
+    pub fn coverage_gaps(&self) -> Vec<(String, u32, u32)> {
+        let mut by_model: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        for entry in self.servers.values() {
+            by_model
+                .entry(entry.model_id.clone())
+                .or_default()
+                .push((entry.layer_start, entry.layer_end));
+        }
+        let mut gaps = Vec::new();
+        for (model_id, mut ranges) in by_model {
+            ranges.sort_by_key(|(s, _)| *s);
+            let mut prev_end: Option<u32> = None;
+            for (start, end) in ranges {
+                if let Some(pe) = prev_end {
+                    if start > pe + 1 {
+                        gaps.push((model_id.clone(), pe + 1, start - 1));
+                    }
+                }
+                prev_end = Some(end);
+            }
+        }
+        gaps
     }
 
     /// All distinct `listen_url` values across all registered servers.

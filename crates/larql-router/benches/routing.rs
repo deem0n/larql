@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use larql_router_protocol::LayerLatency;
 use larql_router::grid::{GridState, ServerEntry};
+use larql_router_protocol::LayerLatency;
 
 const SERVER_COUNTS: &[(usize, &str)] = &[(1, "1srv"), (10, "10srv"), (100, "100srv")];
 const LAYER_COUNTS: &[(usize, &str)] = &[(30, "30layers"), (62, "62layers")];
@@ -49,13 +49,9 @@ fn bench_route_single_layer(c: &mut Criterion) {
     let mut group = c.benchmark_group("routing/route_single_layer");
     for &(n_servers, slabel) in SERVER_COUNTS {
         let state = build_state(n_servers, 30);
-        group.bench_with_input(
-            BenchmarkId::new(slabel, n_servers),
-            &n_servers,
-            |b, _| {
-                b.iter(|| state.route(Some("bench-model"), 15));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new(slabel, n_servers), &n_servers, |b, _| {
+            b.iter(|| state.route(Some("bench-model"), 15));
+        });
     }
     group.finish();
 }
@@ -88,7 +84,11 @@ fn bench_heartbeat_update(c: &mut Criterion) {
         let mut state = build_state(n_servers, 30);
         let server_ids: Vec<String> = (0..n_servers).map(|i| format!("srv-{i}")).collect();
         let layer_stats: Vec<LayerLatency> = (0..30u32)
-            .map(|l| LayerLatency { layer: l, avg_ms: 2.0, p99_ms: 5.0 })
+            .map(|l| LayerLatency {
+                layer: l,
+                avg_ms: 2.0,
+                p99_ms: 5.0,
+            })
             .collect();
         group.bench_with_input(
             BenchmarkId::new(slabel, n_servers),

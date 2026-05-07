@@ -132,6 +132,7 @@ impl MetalBackend {
             false,
             0.0,
             None, // no MoE callback (legacy benchmark path, no MoE layers)
+            None, // no intervention (legacy benchmark path)
         )
     }
 

@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-wire bench-routing bench-grid bench-all bench-save bench-check coverage coverage-summary larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
 
 # Build
 build:
@@ -55,6 +55,25 @@ larql-models-coverage-summary:
 
 larql-models-ci: larql-models-fmt-check larql-models-lint larql-models-test larql-models-bench-test
 
+# larql-boundary — confidence-gated BOUNDARY ref codec
+larql-boundary-test:
+	cargo test -p larql-boundary
+
+larql-boundary-fmt-check:
+	cargo fmt -p larql-boundary -- --check
+
+larql-boundary-lint:
+	cargo clippy -p larql-boundary --all-targets -- -D warnings
+
+larql-boundary-bench-test:
+	cargo test -p larql-boundary --benches
+
+larql-boundary-examples:
+	cargo run -p larql-boundary --example encode_decode
+	cargo run -p larql-boundary --example gate_decision
+
+larql-boundary-ci: larql-boundary-fmt-check larql-boundary-lint larql-boundary-test larql-boundary-bench-test larql-boundary-examples
+
 # Check (compile without building)
 check:
 	cargo check --workspace
@@ -84,38 +103,6 @@ clean:
 # default noise threshold. Plug `bench-check` into CI to catch the next
 # 4× throughput cliff (the kind the q4_matvec_v4 row-drop bug caused) at
 # PR time, not at goldens-fail time weeks later.
-bench:
-	cargo bench -p larql-compute --bench quant_matvec --features metal
-
-bench-wire:
-	cargo bench -p larql-inference --bench wire_codec
-
-bench-routing:
-	cargo bench -p larql-router --bench routing
-
-bench-grid:
-	./scripts/bench-grid-regress.sh $(MODEL)
-
-bench-all: bench bench-wire bench-routing
-
-bench-save:
-	bash scripts/bench-regress.sh save
-
-bench-check:
-	bash scripts/bench-regress.sh check
-
-# Demos
-demos:
-	cargo run --release -p larql-models --example architecture_demo
-	cargo run --release -p larql-core --example graph_demo
-	cargo run --release -p larql-core --example edge_demo
-	cargo run --release -p larql-core --example serialization_demo
-	cargo run --release -p larql-core --example algorithm_demo
-
-demos-inference:
-	cargo run --release -p larql-inference --example inference_demo
-
-# Benchmarks
 bench: bench-core
 
 bench-core:
@@ -123,6 +110,24 @@ bench-core:
 
 bench-inference:
 	cargo run --release -p larql-inference --example bench_inference
+
+# Compute kernel criterion bench (quant_matvec — Metal GPU).
+bench-compute:
+	cargo bench -p larql-compute --bench quant_matvec --features metal
+
+# Wire codec criterion bench (encode/decode f32/f16/i8 throughput).
+bench-wire:
+	cargo bench -p larql-inference --bench wire_codec
+
+# Router routing hot-path criterion bench (route/heartbeat/rebuild ns/op).
+bench-routing:
+	cargo bench -p larql-router --bench routing
+
+# Grid end-to-end regression gate (requires LARQL_BENCH_FFN_URL env var).
+bench-grid:
+	./scripts/bench-grid-regress.sh $(MODEL)
+
+bench-all: bench-core bench-inference bench-compute bench-wire bench-routing
 
 # Vindex micro-benches — synthetic, fast, safe under load.
 bench-vindex:
@@ -139,7 +144,11 @@ bench-vindex-scaling:
 	fi
 	cargo bench -p larql-vindex --bench vindex_scaling
 
-bench-all: bench-core bench-inference bench-vindex
+bench-save:
+	bash scripts/bench-regress.sh save
+
+bench-check:
+	bash scripts/bench-regress.sh check
 
 # Coverage — uses cargo-llvm-cov (install with `cargo install cargo-llvm-cov`).
 # Writes an HTML report to coverage/ that can be opened in a browser.

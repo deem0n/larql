@@ -66,6 +66,10 @@ pub fn enabled() -> bool {
     std::env::var("LARQL_MOE_BYTES").is_ok() || std::env::var("LARQL_MOE_TIMING").is_ok()
 }
 
+pub fn shard_timing_enabled() -> bool {
+    std::env::var("LARQL_MOE_SHARD_TIMING").is_ok()
+}
+
 pub fn snapshot() -> TransportSnapshot {
     let by_shard = state().lock().map(|g| g.clone()).unwrap_or_default();
     TransportSnapshot { by_shard }

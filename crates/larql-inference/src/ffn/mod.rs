@@ -48,6 +48,7 @@ pub trait FfnBackend {
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
 pub use remote::{
     LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
+    WirePreference,
 };
 pub use sparse::SparseFfn;
 pub use sparse_compute::{
