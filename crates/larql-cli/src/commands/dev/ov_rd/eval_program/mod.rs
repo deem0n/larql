@@ -117,6 +117,20 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
     let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
     let tokenizer = load_vindex_tokenizer(&args.index)?;
 
+    // Optionally initialize a Metal backend for GPU-accelerated evaluation.
+    let metal_backend: Option<Box<dyn larql_compute::ComputeBackend + Send + Sync>> =
+        if args.metal {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                match larql_compute::metal::MetalBackend::new() {
+                    Some(b) => { eprintln!("Metal backend: active"); Some(Box::new(b)) }
+                    None => { eprintln!("Metal backend: unavailable"); None }
+                }
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            { eprintln!("Metal backend: not compiled in"); None }
+        } else { None };
+
     let mut all_records = load_prompts(&args.prompts, None)?;
     if args.max_per_stratum > 0 {
         all_records = limit_prompts_per_stratum(all_records, args.max_per_stratum);
@@ -335,16 +349,42 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
             })
             .collect();
 
-        // Pass 5: program-mapped Mode D injection.
-        let program_h = forward_q4k_predicted_address_mode_d_head(
-            &mut weights,
-            &token_ids,
-            &index,
-            head,
-            mode_d_table,
-            &remapped_codes,
-            stratum,
-        )?;
+        // Pass 5: program-mapped Mode D injection (Metal or CPU).
+        let program_h = if let Some(ref backend) = metal_backend {
+            // Metal: build flat replacement_delta, run GPU pass.
+            let mut delta_flat =
+                Vec::with_capacity(token_ids.len() * weights.hidden_size);
+            for (pos, codes) in remapped_codes.iter().enumerate() {
+                let d = mode_d_table.delta_for_position_codes_with_stratum(
+                    pos, codes, stratum,
+                );
+                delta_flat.extend_from_slice(&d);
+            }
+            let replacement_delta =
+                ndarray::Array2::from_shape_vec((token_ids.len(), weights.hidden_size), delta_flat)
+                    .map_err(|e| format!("delta shape: {e}"))?;
+            larql_inference::vindex::predict_q4k_metal_with_replaced_head_residual_delta(
+                &weights,
+                &token_ids,
+                &index,
+                backend.as_ref(),
+                head.layer,
+                head.head,
+                &replacement_delta,
+            )
+            .ok_or_else(|| Box::<dyn std::error::Error>::from("Metal head replacement returned None"))?
+        } else {
+            // CPU fallback.
+            forward_q4k_predicted_address_mode_d_head(
+                &mut weights,
+                &token_ids,
+                &index,
+                head,
+                mode_d_table,
+                &remapped_codes,
+                stratum,
+            )?
+        };
         let program_logits = final_logits(&weights, &program_h);
         let program_logp = log_softmax(&program_logits);
         let program_top1 = argmax(&program_logits);

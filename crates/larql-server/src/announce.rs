@@ -49,7 +49,19 @@ pub struct AnnounceConfig {
     pub latency_tracker: Arc<LayerLatencyTracker>,
 }
 
-// ── Public entry point ─────────────────────────────────────────────────────────
+// ── Mode B config ──────────────────────────────────────────────────────────────
+
+/// Config for Mode B announce: server has capacity but no shard loaded.
+pub struct AvailableConfig {
+    pub join_url: String,
+    pub listen_url: String,
+    pub ram_bytes: u64,
+    pub disk_bytes: u64,
+    pub store_path: String,
+    pub grid_key: Option<String>,
+}
+
+// ── Public entry points ────────────────────────────────────────────────────────
 
 /// Spawn a background task that keeps the grid connection alive.
 /// Returns immediately; the task runs for the process lifetime.
@@ -71,6 +83,38 @@ pub fn run_announce(config: AnnounceConfig) {
                 Err(e) => {
                     warn!(
                         "Grid stream error: {e} — retrying in {}s",
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a Mode B background task: advertise available capacity, wait for
+/// `AssignMsg`, download the assigned shard, send `ReadyMsg`, then
+/// re-enter Mode A serving loop.
+///
+/// Returns immediately; the task runs for the process lifetime.
+pub fn run_announce_available(config: AvailableConfig) {
+    tokio::spawn(async move {
+        let mut backoff = RECONNECT_INITIAL_BACKOFF;
+        loop {
+            info!(
+                join_url = %config.join_url,
+                ram_gb = config.ram_bytes / (1024 * 1024 * 1024),
+                "Connecting to router grid (Mode B — available)..."
+            );
+            match try_once_available(&config).await {
+                Ok(()) => {
+                    info!("Mode B stream closed cleanly — reconnecting");
+                    backoff = RECONNECT_INITIAL_BACKOFF;
+                }
+                Err(e) => {
+                    warn!(
+                        "Mode B stream error: {e} — retrying in {}s",
                         backoff.as_secs()
                     );
                     tokio::time::sleep(backoff).await;
@@ -220,6 +264,118 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
     }
 
     hb_handle.abort();
+    Ok(())
+}
+
+// ── Mode B connection lifecycle ────────────────────────────────────────────────
+
+async fn try_once_available(
+    cfg: &AvailableConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use larql_router_protocol::{AvailableMsg, ReadyMsg};
+
+    let channel = tonic::transport::Channel::from_shared(cfg.join_url.clone())?
+        .connect()
+        .await?;
+
+    let bearer = grid_bearer_value(cfg.grid_key.as_deref())?;
+    let mut client =
+        GridServiceClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+            if let Some(val) = &bearer {
+                req.metadata_mut().insert("authorization", val.clone());
+            }
+            Ok(req)
+        });
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<ServerMessage>(32);
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let response = client.join(outbound).await?;
+    let mut inbound = response.into_inner();
+
+    // Send AvailableMsg — advertise capacity.
+    tx.send(ServerMessage {
+        payload: Some(ServerPayload::Available(AvailableMsg {
+            ram_bytes: cfg.ram_bytes,
+            disk_bytes: cfg.disk_bytes,
+            store_path: cfg.store_path.clone(),
+        })),
+    })
+    .await?;
+
+    info!(
+        join_url = %cfg.join_url,
+        ram_gb = cfg.ram_bytes / (1024 * 1024 * 1024),
+        "Mode B: sent AvailableMsg — waiting for assignment…"
+    );
+
+    // Wait for AssignMsg from router.
+    while let Some(msg) = inbound.next().await {
+        match msg {
+            Err(e) => return Err(e.into()),
+            Ok(rm) => match rm.payload {
+                Some(RouterPayload::Assign(assign)) => {
+                    info!(
+                        model_id = %assign.model_id,
+                        layers = %format!("{}-{}", assign.layer_start, assign.layer_end),
+                        origin_url = %assign.origin_url,
+                        "Mode B: received AssignMsg — downloading shard…"
+                    );
+
+                    // Download the assigned shard.
+                    match crate::shard_loader::download_and_load_shard(
+                        &assign.origin_url,
+                        &cfg.store_path,
+                        &assign.shard_hash,
+                        &assign.model_id,
+                        assign.layer_start,
+                        assign.layer_end,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            // Send ReadyMsg — shard is loaded and serving.
+                            let _ = tx
+                                .send(ServerMessage {
+                                    payload: Some(ServerPayload::Ready(ReadyMsg {
+                                        model_id: assign.model_id.clone(),
+                                        layer_start: assign.layer_start,
+                                        layer_end: assign.layer_end,
+                                        listen_url: cfg.listen_url.clone(),
+                                    })),
+                                })
+                                .await;
+                            info!(
+                                model_id = %assign.model_id,
+                                "Mode B: shard ready — sent ReadyMsg"
+                            );
+                        }
+                        Err(e) => {
+                            use larql_router_protocol::RefuseMsg;
+                            warn!("Mode B: shard download failed: {e} — sending RefuseMsg");
+                            let _ = tx
+                                .send(ServerMessage {
+                                    payload: Some(ServerPayload::Refuse(RefuseMsg {
+                                        model_id: assign.model_id,
+                                        layer_start: assign.layer_start,
+                                        layer_end: assign.layer_end,
+                                        reason: "download_failed".into(),
+                                    })),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                Some(RouterPayload::Ack(ack)) => {
+                    info!(server_id = %ack.server_id, "Mode B: registered as serving");
+                    break;
+                }
+                Some(RouterPayload::Reject(r)) => {
+                    return Err(format!("Mode B rejected: {}", r.reason).into());
+                }
+                _ => {}
+            },
+        }
+    }
     Ok(())
 }
 

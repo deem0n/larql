@@ -35,6 +35,26 @@ pub const DEFAULT_DESCRIBE_CACHE_TTL_SECS: u64 = 0;
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 
+/// Parse a human-readable RAM size string into bytes.
+/// Supports: "24GB", "16384MB", "4096KB", raw decimal bytes.
+pub fn parse_ram_bytes(s: &str) -> Result<u64, BoxError> {
+    let s = s.trim();
+    let (num_str, mult) = if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB").or_else(|| s.strip_suffix("mb")) {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
+        (n, 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("--available-ram: invalid number '{num_str}'"))?;
+    Ok(n * mult)
+}
+
 pub fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
     let parts: Vec<&str> = s.splitn(2, '-').collect();
     if parts.len() != 2 {
@@ -593,6 +613,19 @@ pub struct Cli {
     #[arg(long, env = "LARQL_GRID_KEY")]
     pub grid_key: Option<String>,
 
+    /// Mode B: advertise available RAM to the router (no vindex preloaded).
+    /// The router will assign a shard via AssignMsg.
+    /// Example: "24GB" or "16384MB" or raw bytes "17179869184".
+    /// Requires --join and --vindex-store.
+    #[arg(long, value_name = "SIZE")]
+    pub available_ram: Option<String>,
+
+    /// Mode B: directory where assigned shards will be downloaded.
+    /// The router assigns a shard; this server downloads it here.
+    /// Example: "/mnt/shards/"
+    #[arg(long, value_name = "PATH")]
+    pub vindex_store: Option<String>,
+
     /// Server-side MoE expert shard map: `"START-END=URL,START-END=URL,..."`
     /// The walk-ffn handler dispatches MoE expert calls to these remote servers.
     /// Combine with --layers for full 2D (layer × expert) sharding.
@@ -950,6 +983,31 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         if join_urls.len() > 1 {
             info!("Joining {} routers (stateless fan-out)", join_urls.len());
         }
+        // Mode B: --available-ram without a loaded model → advertise capacity.
+        if let Some(ref ram_str) = cli.available_ram {
+            match parse_ram_bytes(ram_str) {
+                Ok(ram_bytes) => {
+                    let store_path = cli
+                        .vindex_store
+                        .clone()
+                        .unwrap_or_else(|| "/tmp/larql-shards".to_string());
+                    for join_url in &join_urls {
+                        announce::run_announce_available(announce::AvailableConfig {
+                            join_url: join_url.clone(),
+                            listen_url: listen_url.clone(),
+                            ram_bytes,
+                            disk_bytes: 0, // TODO: query disk
+                            store_path: store_path.clone(),
+                            grid_key: cli.grid_key.clone(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("--available-ram parse error: {e} — falling through to Mode A");
+                }
+            }
+        }
+
         for m in &models {
             let (layer_start, layer_end) = match layer_range {
                 Some((s, e)) => (s as u32, (e - 1) as u32),

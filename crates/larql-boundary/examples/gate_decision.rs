@@ -4,7 +4,6 @@
 //!   cargo run -p larql-boundary --example gate_decision
 
 use larql_boundary::{
-    frame::BoundaryAgreement,
     gate::{BoundaryDecision, BoundaryGateConfig},
     metadata::{compute, BoundaryMetadata},
 };

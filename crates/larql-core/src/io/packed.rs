@@ -36,14 +36,15 @@ impl StringTable {
         }
     }
 
-    fn intern(&mut self, s: &str) -> u32 {
+    fn intern(&mut self, s: &str) -> Result<u32, GraphError> {
         if let Some(&idx) = self.index.get(s) {
-            return idx;
+            return Ok(idx);
         }
-        let idx = self.strings.len() as u32;
+        let idx = u32::try_from(self.strings.len())
+            .map_err(|_| GraphError::Deserialize("string table exceeds u32 index space".into()))?;
         self.index.insert(s.to_string(), idx);
         self.strings.push(s.to_string());
-        idx
+        Ok(idx)
     }
 
     fn resolve(&self, idx: u32) -> Option<&str> {
@@ -53,7 +54,13 @@ impl StringTable {
     fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         for s in &self.strings {
             let bytes = s.as_bytes();
-            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "string table entry exceeds u32 length",
+                )
+            })?;
+            w.write_all(&len.to_le_bytes())?;
             w.write_all(bytes)?;
         }
         Ok(())
@@ -169,21 +176,29 @@ pub fn to_packed_bytes(graph: &Graph) -> Result<Vec<u8>, GraphError> {
 
     let mut records: Vec<EdgeRecord> = Vec::with_capacity(edges.len());
     for edge in edges {
-        let subj = strings.intern(&edge.subject);
-        let rel = strings.intern(&edge.relation);
-        let obj = strings.intern(&edge.object);
+        let subj = strings.intern(&edge.subject)?;
+        let rel = strings.intern(&edge.relation)?;
+        let obj = strings.intern(&edge.object)?;
 
         let meta_blob = edge
             .metadata
             .as_ref()
-            .map(|m| serde_json::to_vec(m).unwrap_or_default());
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| GraphError::Deserialize(format!("metadata serialization failed: {e}")))?;
 
-        let inj_blob = edge.injection.map(|(layer, score)| {
-            let mut buf = Vec::with_capacity(12);
-            buf.extend_from_slice(&(layer as u32).to_le_bytes());
-            buf.extend_from_slice(&(score as f32).to_le_bytes());
-            buf
-        });
+        let inj_blob = edge
+            .injection
+            .map(|(layer, score)| -> Result<Vec<u8>, GraphError> {
+                let layer = u32::try_from(layer).map_err(|_| {
+                    GraphError::Deserialize(format!("injection layer {layer} exceeds u32 range"))
+                })?;
+                let mut buf = Vec::with_capacity(12);
+                buf.extend_from_slice(&layer.to_le_bytes());
+                buf.extend_from_slice(&(score as f32).to_le_bytes());
+                Ok(buf)
+            })
+            .transpose()?;
 
         records.push(EdgeRecord {
             subj,
@@ -204,14 +219,21 @@ pub fn to_packed_bytes(graph: &Graph) -> Result<Vec<u8>, GraphError> {
         let has_meta = rec.meta_blob.is_some();
         let has_inj = rec.inj_blob.is_some();
         if has_meta || has_inj {
-            let offset = meta_section.len() as u32;
+            let offset = u32::try_from(meta_section.len()).map_err(|_| {
+                GraphError::Deserialize("metadata section offset exceeds u32 range".into())
+            })?;
             if let Some(ref blob) = rec.meta_blob {
                 meta_section.extend_from_slice(blob);
             }
             if let Some(ref blob) = rec.inj_blob {
                 meta_section.extend_from_slice(blob);
             }
-            let len = meta_section.len() as u32 - offset;
+            let end = u32::try_from(meta_section.len()).map_err(|_| {
+                GraphError::Deserialize("metadata section length exceeds u32 range".into())
+            })?;
+            let len = end.checked_sub(offset).ok_or_else(|| {
+                GraphError::Deserialize("metadata section length underflow".into())
+            })?;
             meta_offsets.push((offset, len));
         } else {
             meta_offsets.push((0, 0));

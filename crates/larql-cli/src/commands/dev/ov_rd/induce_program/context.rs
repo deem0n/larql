@@ -1,6 +1,9 @@
 use super::super::pq::ModeDTable;
 use super::super::types::{HeadId, PqConfig};
 
+/// Boxed Metal compute backend — `None` when Metal is not available or not requested.
+pub type MetalBackendOpt = Option<Box<dyn larql_compute::ComputeBackend + Send + Sync>>;
+
 /// Per-eval-prompt captured data. Built once from the fitted codebook;
 /// reused across every proposal evaluation without re-running oracle PQ.
 pub struct PromptCapture {
@@ -24,6 +27,8 @@ pub struct FitContext {
     pub mode_d_table: ModeDTable,
     pub captures: Vec<PromptCapture>,
     pub codebook_fingerprint: Option<String>,
+    /// Metal backend for GPU-accelerated forward passes. `None` uses CPU.
+    pub metal: MetalBackendOpt,
 }
 
 impl FitContext {

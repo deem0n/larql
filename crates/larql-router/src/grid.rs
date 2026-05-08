@@ -474,6 +474,7 @@ impl GridService for GridServiceImpl {
         let sid = server_id.clone();
         tokio::spawn(async move {
             let mut registered_model: Option<(String, u32, u32)> = None; // (model_id, start, end)
+            let mut is_available = false; // true while in Mode B available pool
 
             while let Some(msg) = inbound.next().await {
                 match msg {
@@ -538,19 +539,82 @@ impl GridService for GridServiceImpl {
                             registered_model = None;
                         }
 
-                        ServerPayload::Available(_) => {
-                            // Phase 2: Mode B assignment
-                            tracing::info!(server_id = %sid, "Server is available (Mode B — not yet implemented)");
-                            let reject = RouterMessage {
-                                payload: Some(RouterPayload::Reject(RejectMsg {
-                                    reason: "available mode not yet implemented".into(),
-                                })),
-                            };
-                            let _ = tx.send(Ok(reject)).await;
+                        ServerPayload::Available(av) => {
+                            // Mode B: server advertises capacity.
+                            // Register it, then check for coverage gaps to fill.
+                            state.write().await.register_available(
+                                sid.clone(),
+                                tx.clone(),
+                                av.ram_bytes,
+                                av.disk_bytes,
+                                av.store_path.clone(),
+                            );
+                            is_available = true;
+                            tracing::info!(
+                                server_id = %sid,
+                                ram_gb = av.ram_bytes / (1024 * 1024 * 1024),
+                                "Grid: Mode B server registered; checking gaps…"
+                            );
+                            // Attempt to fill an existing coverage gap.
+                            let gaps = state.read().await.coverage_gaps();
+                            for (model_id, layer_start, layer_end) in gaps {
+                                let assigned = state.write().await.try_assign_gap(
+                                    &model_id,
+                                    layer_start,
+                                    layer_end,
+                                    "http://origin-placeholder:8090", // filled by config in GT5b
+                                    "0000000000000000",
+                                    av.ram_bytes,
+                                );
+                                if assigned {
+                                    break; // one gap per available server
+                                }
+                            }
                         }
 
-                        ServerPayload::Ready(_) | ServerPayload::Refuse(_) => {
-                            tracing::debug!(server_id = %sid, "Ignored message (not in assignment flow)");
+                        ServerPayload::Ready(r) => {
+                            // Mode B: server finished downloading + loading a shard.
+                            // Register it as a serving shard and send Ack.
+                            let entry = ServerEntry {
+                                server_id: sid.clone(),
+                                listen_url: r.listen_url.clone(),
+                                model_id: r.model_id.clone(),
+                                layer_start: r.layer_start,
+                                layer_end: r.layer_end,
+                                cpu_pct: 0.0,
+                                ram_used: 0,
+                                requests_in_flight: 0,
+                                last_seen: std::time::Instant::now(),
+                                layer_latencies: HashMap::new(),
+                            };
+                            state.write().await.register(entry);
+                            registered_model =
+                                Some((r.model_id.clone(), r.layer_start, r.layer_end));
+                            is_available = false;
+                            tracing::info!(
+                                server_id = %sid,
+                                model_id = %r.model_id,
+                                layers = %format!("{}-{}", r.layer_start, r.layer_end),
+                                "Grid: Mode B server ready — now serving"
+                            );
+                            let ack = RouterMessage {
+                                payload: Some(RouterPayload::Ack(AckMsg {
+                                    server_id: sid.clone(),
+                                })),
+                            };
+                            if tx.send(Ok(ack)).await.is_err() {
+                                break;
+                            }
+                        }
+
+                        ServerPayload::Refuse(r) => {
+                            // Mode B: server refused the assignment. Re-add to available pool.
+                            tracing::warn!(
+                                server_id = %sid,
+                                reason = %r.reason,
+                                "Grid: Mode B server refused assignment — re-queuing"
+                            );
+                            // The tx clone is lost here; server must reconnect. Just log.
                         }
                     },
                 }
@@ -559,6 +623,9 @@ impl GridService for GridServiceImpl {
             // Stream closed — clean up
             if registered_model.is_some() {
                 state.write().await.deregister(&sid);
+            }
+            if is_available {
+                state.write().await.deregister_available(&sid);
             }
             tracing::info!(server_id = %sid, "Connection closed");
         });

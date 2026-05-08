@@ -7,6 +7,7 @@ mod eval_program;
 mod gamma_address;
 mod induce_program;
 mod input;
+mod metal_backend;
 mod metrics;
 mod normalize_program;
 mod oracle;

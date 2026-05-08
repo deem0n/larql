@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
 
 # Build
 build:
@@ -32,6 +32,50 @@ test-models:
 	cargo test -p larql-inference --test test_llm_dispatch -- --ignored --nocapture
 	cargo test -p larql-inference --test test_constrained_dispatch -- --ignored --nocapture
 	cargo test -p larql-inference --test test_trie_dispatch -- --ignored --nocapture
+
+# larql-core — graph engine, algorithms, extraction helpers, serialization
+larql-core-test:
+	cargo test -p larql-core
+
+larql-core-feature-test:
+	cargo test -p larql-core --no-default-features
+	cargo test -p larql-core --no-default-features --features msgpack
+
+larql-core-fmt-check:
+	cargo fmt -p larql-core -- --check
+
+larql-core-lint:
+	cargo clippy -p larql-core --all-targets -- -D warnings
+
+larql-core-bench-test:
+	cargo test -p larql-core --benches
+
+larql-core-bench:
+	cargo bench -p larql-core --bench graph
+
+larql-core-examples:
+	cargo run -p larql-core --example edge_demo
+	cargo run -p larql-core --example graph_demo
+	cargo run -p larql-core --example algorithm_demo
+	cargo run -p larql-core --example filter_demo
+	cargo run -p larql-core --example serialization_demo
+
+larql-core-coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-core --summary-only
+
+larql-core-coverage-html:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; exit 1; \
+	fi
+	cargo llvm-cov --package larql-core --html --output-dir coverage/larql-core
+	@echo "Report: coverage/larql-core/html/index.html"
+
+larql-core-ci: larql-core-fmt-check larql-core-lint larql-core-test larql-core-feature-test larql-core-bench-test larql-core-examples
 
 larql-models-test:
 	cargo test -p larql-models
@@ -71,6 +115,21 @@ larql-boundary-bench-test:
 larql-boundary-examples:
 	cargo run -p larql-boundary --example encode_decode
 	cargo run -p larql-boundary --example gate_decision
+
+larql-boundary-coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-boundary --summary-only
+
+larql-boundary-coverage-html:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; exit 1; \
+	fi
+	cargo llvm-cov --package larql-boundary --html --output-dir coverage/larql-boundary
+	@echo "Report: coverage/larql-boundary/html/index.html"
 
 larql-boundary-ci: larql-boundary-fmt-check larql-boundary-lint larql-boundary-test larql-boundary-bench-test larql-boundary-examples
 

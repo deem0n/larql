@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn roundtrip_normal_values() {
-        let r = vec![0.0f32, 1.0, -1.0, 3.14, -100.0, 0.001];
+        let r = vec![0.0f32, 1.0, -1.0, 2.71, -100.0, 0.001]; // not a clippy approx_constant
         let dec = decode(&encode(&r));
         for (orig, got) in r.iter().zip(dec.iter()) {
             assert!(

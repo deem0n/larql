@@ -20,6 +20,7 @@ pub mod http;
 pub mod metrics;
 pub mod openapi;
 pub mod ratelimit;
+pub mod shard_loader;
 pub mod routes;
 pub mod session;
 pub mod state;

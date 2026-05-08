@@ -8,21 +8,30 @@ use super::chain::chain_tokens;
 use super::provider::ModelProvider;
 use super::templates::TemplateRegistry;
 
+pub const DEFAULT_MAX_DEPTH: u32 = 3;
+pub const DEFAULT_MAX_ENTITIES: usize = 1000;
+pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.3;
+pub const DEFAULT_MAX_CHAIN_TOKENS: usize = 5;
+pub const METADATA_FORWARD_PASSES: &str = "forward_passes";
+pub const METADATA_MODEL: &str = "model";
+
 /// BFS extraction configuration.
 pub struct BfsConfig {
     pub max_depth: u32,
     pub max_entities: usize,
     pub min_confidence: f64,
     pub max_chain_tokens: usize,
+    pub should_follow_entity: fn(&str) -> bool,
 }
 
 impl Default for BfsConfig {
     fn default() -> Self {
         Self {
-            max_depth: 3,
-            max_entities: 1000,
-            min_confidence: 0.3,
-            max_chain_tokens: 5,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_entities: DEFAULT_MAX_ENTITIES,
+            min_confidence: DEFAULT_MIN_CONFIDENCE,
+            max_chain_tokens: DEFAULT_MAX_CHAIN_TOKENS,
+            should_follow_entity: default_should_follow_entity,
         }
     }
 }
@@ -76,8 +85,19 @@ pub fn extract_bfs(
                 1
             };
 
-            let result = match chain_tokens(provider, &prompt, max_tok, config.min_confidence, None)
-            {
+            let stop_tokens = if template.stop_tokens.is_empty() {
+                None
+            } else {
+                Some(template.stop_tokens.as_slice())
+            };
+
+            let result = match chain_tokens(
+                provider,
+                &prompt,
+                max_tok,
+                config.min_confidence,
+                stop_tokens,
+            ) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -89,10 +109,13 @@ pub fn extract_bfs(
                     .with_confidence(result.avg_probability())
                     .with_source(SourceType::Parametric)
                     .with_metadata(
-                        "forward_passes",
+                        METADATA_FORWARD_PASSES,
                         serde_json::Value::from(result.num_passes as u64),
                     )
-                    .with_metadata("model", serde_json::Value::from(provider.model_name()));
+                    .with_metadata(
+                        METADATA_MODEL,
+                        serde_json::Value::from(provider.model_name()),
+                    );
 
                 if !graph.exists(&entity, &template.relation, &result.answer) {
                     graph.add_edge(edge.clone());
@@ -102,7 +125,10 @@ pub fn extract_bfs(
 
                 // Queue valid entities for further exploration
                 let obj = result.answer.trim().to_string();
-                if !visited.contains(&obj) && depth < config.max_depth && is_valid_entity(&obj) {
+                if !visited.contains(&obj)
+                    && depth < config.max_depth
+                    && (config.should_follow_entity)(&obj)
+                {
                     queue.push_back((obj, depth + 1));
                 }
             }
@@ -127,8 +153,11 @@ pub struct BfsResult {
     pub queue_remaining: usize,
 }
 
-/// Should this string be followed in BFS? Proper nouns and numbers only.
-fn is_valid_entity(text: &str) -> bool {
+/// Default follow policy for BFS extraction.
+///
+/// This is configurable via `BfsConfig::should_follow_entity` because entity
+/// syntax is language/domain policy, not graph-engine logic.
+pub fn default_should_follow_entity(text: &str) -> bool {
     let clean = text.trim();
     if clean.is_empty() {
         return false;
@@ -159,13 +188,15 @@ mod tests {
 
     #[test]
     fn test_valid_entity() {
-        assert!(is_valid_entity("France"));
-        assert!(is_valid_entity("Paris"));
-        assert!(is_valid_entity("1756"));
-        assert!(is_valid_entity("New York"));
-        assert!(!is_valid_entity("the city"));
-        assert!(!is_valid_entity("a very long phrase that is not an entity"));
-        assert!(!is_valid_entity("lowercase"));
-        assert!(!is_valid_entity(""));
+        assert!(default_should_follow_entity("France"));
+        assert!(default_should_follow_entity("Paris"));
+        assert!(default_should_follow_entity("1756"));
+        assert!(default_should_follow_entity("New York"));
+        assert!(!default_should_follow_entity("the city"));
+        assert!(!default_should_follow_entity(
+            "a very long phrase that is not an entity"
+        ));
+        assert!(!default_should_follow_entity("lowercase"));
+        assert!(!default_should_follow_entity(""));
     }
 }

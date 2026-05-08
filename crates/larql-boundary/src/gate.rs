@@ -29,7 +29,7 @@
 //! `boundary_fragile` so callers can collect telemetry for Track A.
 //! Set `calibration_mode = false` only after Exp 44 ships fitted thresholds.
 
-use crate::frame::{BoundaryAgreement, BoundaryContract, FallbackPolicy};
+use crate::frame::{BoundaryContract, FallbackPolicy};
 use crate::metadata::BoundaryMetadata;
 
 /// Configuration for the per-boundary gate.
@@ -98,7 +98,9 @@ pub fn apply(metadata: &mut BoundaryMetadata, config: &BoundaryGateConfig) -> Bo
     }
 
     // Hard reject: codec moved the argmax, or sender didn't check.
-    if config.require_compressed_agreement && metadata.boundary_agreement.is_hard_reject() {
+    // Agree is the only non-reject state; Disagrees and NotChecked both fail.
+    let agreement_fails = !matches!(metadata.boundary_agreement, BoundaryAgreement::Agrees);
+    if config.require_compressed_agreement && agreement_fails {
         metadata.boundary_fragile = false;
         return to_fallback(config);
     }
@@ -131,6 +133,7 @@ fn to_fallback(config: &BoundaryGateConfig) -> BoundaryDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::BoundaryAgreement;
     use crate::metadata::BoundaryMetadata;
 
     fn meta(logit_margin: f32, top1_prob: f32, agreement: BoundaryAgreement) -> BoundaryMetadata {

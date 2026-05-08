@@ -13,7 +13,7 @@ use super::super::program::fingerprint::codebook_fingerprint;
 use super::super::static_replace::fit_static_means;
 use super::super::types::{HeadId, PqConfig};
 use super::args::InduceProgramArgs;
-use super::context::{FitContext, PromptCapture};
+use super::context::{FitContext, MetalBackendOpt, PromptCapture};
 
 pub fn build_fit_context(
     args: &InduceProgramArgs,
@@ -139,6 +139,15 @@ pub fn build_fit_context(
         });
     }
 
+    let metal: MetalBackendOpt = if args.metal {
+        init_metal_backend()
+    } else {
+        None
+    };
+    if metal.is_some() {
+        eprintln!("Metal backend: active");
+    }
+
     Ok(FitContext {
         head,
         group: args.group,
@@ -146,5 +155,27 @@ pub fn build_fit_context(
         mode_d_table,
         captures,
         codebook_fingerprint: fp,
+        metal,
     })
+}
+
+fn init_metal_backend() -> MetalBackendOpt {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        match larql_compute::metal::MetalBackend::new() {
+            Some(b) => {
+                eprintln!("Metal backend: initialized");
+                Some(Box::new(b))
+            }
+            None => {
+                eprintln!("Metal backend: unavailable (MetalBackend::new returned None)");
+                None
+            }
+        }
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        eprintln!("Metal backend: not compiled in (rebuild with --features metal on macOS)");
+        None
+    }
 }
