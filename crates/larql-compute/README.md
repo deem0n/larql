@@ -258,23 +258,31 @@ src/
 
 ## Tests
 
-**Coverage (2026-05-09)**: 418 `#[test]` markers, **58.45% line coverage**
+**Coverage (2026-05-09)**: 424 `#[test]` markers, **64.81% line coverage**
 on the Metal-feature build (`cargo llvm-cov --package larql-compute
---features metal`). Up from 56.03% earlier in the session — gains came
-from deleting 591 LoC of dead code in `metal/prefill.rs` (verified
-orphan: `dispatch_prefill` was `#[allow(dead_code)]` with zero callers,
-production prefill goes through `prefill_q4` → `dispatch_full_pipeline`)
-plus targeted tests on previously-zero-coverage helpers (`stages/qk_norm.rs`
-0% → 23%, `stages/layer_scalar.rs` 12% → 97%) plus 2 parity tests pinning
-the new `residual_norm_store` D-RMS-FUSE shader path.
+--features metal`). Up from **56.03%** at session start (+8.78 pp; 2,575
+newly-covered lines, 22.2% reduction in uncovered LoC). Three rounds of work:
+
+1. **Deleted 591 LoC of dead code** in `metal/prefill.rs` (verified
+   orphan: `dispatch_prefill` was `#[allow(dead_code)]` with zero callers,
+   production prefill routes through `prefill_q4` → `dispatch_full_pipeline`).
+2. **Targeted tests on small helpers**: `tg_width` math (`stages/qk_norm.rs`
+   0% → 23%), `scale_vector` dispatch (`stages/layer_scalar.rs` 12% → 97%),
+   `residual_norm_store` shader parity (D-RMS-FUSE).
+3. **Synthetic end-to-end decode tests** (`tests/test_metal_decode_synthetic.rs`):
+   Llama-style + Gemma-3-style + D-RMS-FUSE off-vs-on parity. Lifted
+   `metal/decode/mod.rs` 7% → 61%, `encode_attn.rs` 0% → 46%, `encode_post_ffn.rs`
+   0% → 83%, `encode_qkv.rs` 0% → 30%, `encode_ffn.rs` 0% → 23%.
 
 **Coverage policy** (`coverage-policy.json`) sets a 90%-per-file / 93.5%-
 total target. Current state is well below — the policy is documentation-
-as-aspiration, not a CI gate. The largest remaining gaps are
-`metal/trait_impl/decode.rs` (627 LoC at 21% — heavy MoE / split-profile
-branches) and `metal/stages/ffn.rs` (227 LoC at 44% — needs synthetic
-Q4_K weight setup to test more of the encode_gated branches). Tracked as
-follow-up.
+as-aspiration, not a CI gate today. Largest remaining gaps:
+- `metal/trait_impl/decode.rs` (627 LoC at 21%) — MoE / split-profile
+  trait method wrappers; 5-6 more focused tests would close this.
+- `metal/decode/encode_ffn.rs` (1008 LoC at 23%) — Q4_KF format paths,
+  fused-down opt-ins, MoE branches not exercised.
+- `metal/diag/*.rs` (~3000 LoC at 0%) — diagnostic / dev-only profiling
+  code; not load-bearing.
 
 ```bash
 # Fast inner loop: library/unit tests only, no integration-binary crawl.

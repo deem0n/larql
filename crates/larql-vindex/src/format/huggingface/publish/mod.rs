@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::error::VindexError;
 use crate::format::filenames::*;
 
-use protocol::{repo_type_plural, REPO_TYPE_DATASET, REPO_TYPE_MODEL};
+use protocol::{hf_base, repo_type_plural, REPO_TYPE_DATASET, REPO_TYPE_MODEL};
 use remote::{create_hf_repo, fetch_remote_lfs_oids};
 use upload::upload_file_to_hf;
 
@@ -58,20 +58,23 @@ impl PublishOptions {
     }
 }
 
-/// Returns the HF API base URL for a repo: `https://huggingface.co/api/{models|datasets}/{repo_id}`.
+/// Returns the HF API base URL for a repo:
+/// `{base}/api/{models|datasets}/{repo_id}`.
 #[allow(dead_code)]
 fn hf_api_url(repo_type: &str, repo_id: &str, path: &str) -> String {
+    let base = hf_base();
     let plural = repo_type_plural(repo_type);
-    format!("https://huggingface.co/api/{plural}/{repo_id}/{path}")
+    format!("{base}/api/{plural}/{repo_id}/{path}")
 }
 
 /// Returns the web / git base URL for a repo.
-/// Models: `https://huggingface.co/{repo_id}`, datasets: `https://huggingface.co/datasets/{repo_id}`.
+/// Models: `{base}/{repo_id}`, datasets: `{base}/datasets/{repo_id}`.
 pub(super) fn hf_repo_url(repo_type: &str, repo_id: &str) -> String {
+    let base = hf_base();
     if repo_type == REPO_TYPE_DATASET {
-        format!("https://huggingface.co/datasets/{repo_id}")
+        format!("{base}/datasets/{repo_id}")
     } else {
-        format!("https://huggingface.co/{repo_id}")
+        format!("{base}/{repo_id}")
     }
 }
 
@@ -241,50 +244,78 @@ pub(in crate::format::huggingface) fn get_hf_token() -> Result<String, VindexErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
+
+    /// Clear the test base-URL override so URL-builder tests see the
+    /// production default. Saved/restored around the assertion to
+    /// avoid leaking the change to other tests.
+    fn with_default_base<F: FnOnce()>(f: F) {
+        let prev = std::env::var(protocol::TEST_BASE_ENV).ok();
+        std::env::remove_var(protocol::TEST_BASE_ENV);
+        f();
+        if let Some(v) = prev {
+            std::env::set_var(protocol::TEST_BASE_ENV, v);
+        }
+    }
 
     // ─── URL builders ──────────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn hf_repo_url_model() {
-        assert_eq!(
-            hf_repo_url("model", "org/repo"),
-            "https://huggingface.co/org/repo"
-        );
+        with_default_base(|| {
+            assert_eq!(
+                hf_repo_url("model", "org/repo"),
+                "https://huggingface.co/org/repo"
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn hf_repo_url_dataset() {
-        assert_eq!(
-            hf_repo_url("dataset", "org/repo"),
-            "https://huggingface.co/datasets/org/repo"
-        );
+        with_default_base(|| {
+            assert_eq!(
+                hf_repo_url("dataset", "org/repo"),
+                "https://huggingface.co/datasets/org/repo"
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn hf_repo_url_unknown_type_falls_back_to_model() {
         // Unknown repo types should fall back to the model URL shape so a
         // typo doesn't silently route to a "datasets" 404.
-        assert_eq!(
-            hf_repo_url("space", "org/repo"),
-            "https://huggingface.co/org/repo"
-        );
+        with_default_base(|| {
+            assert_eq!(
+                hf_repo_url("space", "org/repo"),
+                "https://huggingface.co/org/repo"
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn hf_api_url_model() {
-        assert_eq!(
-            hf_api_url("model", "org/repo", "preupload/main"),
-            "https://huggingface.co/api/models/org/repo/preupload/main"
-        );
+        with_default_base(|| {
+            assert_eq!(
+                hf_api_url("model", "org/repo", "preupload/main"),
+                "https://huggingface.co/api/models/org/repo/preupload/main"
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn hf_api_url_dataset() {
-        assert_eq!(
-            hf_api_url("dataset", "org/repo", "tree/main"),
-            "https://huggingface.co/api/datasets/org/repo/tree/main"
-        );
+        with_default_base(|| {
+            assert_eq!(
+                hf_api_url("dataset", "org/repo", "tree/main"),
+                "https://huggingface.co/api/datasets/org/repo/tree/main"
+            );
+        });
     }
 
     // ─── PublishOptions ────────────────────────────────────────────

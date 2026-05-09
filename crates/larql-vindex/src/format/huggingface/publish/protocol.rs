@@ -8,6 +8,22 @@
 
 use std::time::Duration;
 
+// ── Base URL ──────────────────────────────────────────────────────────
+
+const HF_BASE_URL: &str = "https://huggingface.co";
+
+/// Test-only env var that overrides the HuggingFace base URL. Tests in
+/// this module spin up a `mockito` server and point `hf_base()` at it.
+/// Production callers never set this.
+pub(super) const TEST_BASE_ENV: &str = "LARQL_HF_TEST_BASE";
+
+/// Base URL for HuggingFace requests. Defaults to
+/// `https://huggingface.co`; can be overridden for tests via
+/// [`TEST_BASE_ENV`].
+pub(super) fn hf_base() -> String {
+    std::env::var(TEST_BASE_ENV).unwrap_or_else(|_| HF_BASE_URL.to_string())
+}
+
 // ── Repo type wire values ─────────────────────────────────────────────
 
 /// Value HF expects for `type` when creating a model repo.

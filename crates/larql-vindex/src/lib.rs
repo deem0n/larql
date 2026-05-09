@@ -35,6 +35,7 @@ pub mod format;
 pub mod index;
 pub mod patch;
 pub mod quant;
+pub mod trie;
 // Back-compat alias — the top-level lifecycle dir was renamed
 // `storage/` → `engine/` in the 2026-04-25 round-2 cleanup. The name
 // `storage` was confusing because `index/storage/` held the actual
@@ -102,6 +103,9 @@ pub use format::weights::{
 pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};
 pub use patch::knn_store::{KnnEntry, KnnStore};
 pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};
+
+// Trie probe (route classifier loaded from JSON)
+pub use trie::CascadeTrie;
 
 // Storage engine — `engine` (preferred); `storage` still available as alias.
 pub use engine::{

@@ -49,6 +49,12 @@ metal = ["larql-compute/metal"]
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
+# HTTP mocking for the publish trio (lfs / remote / upload).
+# `serial_test` because the tests set the LARQL_HF_TEST_BASE env var to
+# point at a per-test mockito server; env vars are process-global, so
+# parallel runs would race.
+mockito = "1.7"
+serial_test = "3.2"
 
 [[bench]]
 name = "vindex_ops"

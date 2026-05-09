@@ -27,7 +27,8 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use larql_compute::{
-    Activation, FfnType, FullPipelineLayer, NormType, QuantFormat, QuantWeight,
+    Activation, ComputeBackend, DecodeBackend, FfnType, FullPipelineLayer, NormType, QuantFormat,
+    QuantWeight,
 };
 
 /// Synthetic dims chosen to be Q4_K-compatible (multiples of 256) and
@@ -290,5 +291,409 @@ fn d_rms_fuse_phase1_produces_identical_output() {
          out_off[{max_idx}]={a} vs out_on[{max_idx}]={b}",
         a = out_off[max_idx],
         b = out_on[max_idx],
+    );
+}
+
+/// Gemma-3-style layer: `has_post_norms = true`, mixed Q4_K Q/K +
+/// Q6_K V, QK-norm enabled. Exercises the post-norms branches in
+/// `encode_attn.rs` (line 401's `if has_post_norms`) and the mixed-
+/// quant QKV path in `encode_qkv.rs` that the Llama-style smoke test
+/// above doesn't reach.
+#[test]
+fn decode_token_gemma3_style_post_norms_smoke() {
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
+
+    // Mixed-quant attention: Q/K are Q4_K, V is Q6_K (Gemma 3/4 ollama
+    // convention). FFN gate/up Q4_K, down Q6_K (also production
+    // convention).
+    let wq_data = quantize_q4_k(&synth_weight_f32(Q_DIM * HIDDEN, 1.1));
+    let wk_data = quantize_q4_k(&synth_weight_f32(KV_DIM * HIDDEN, 1.2));
+    let wv_data = quantize_q6_k(&synth_weight_f32(KV_DIM * HIDDEN, 1.3));
+    let wo_data = quantize_q4_k(&synth_weight_f32(HIDDEN * Q_DIM, 1.4));
+    let gate_data = quantize_q4_k(&synth_weight_f32(INTER * HIDDEN, 1.5));
+    let up_data = quantize_q4_k(&synth_weight_f32(INTER * HIDDEN, 1.6));
+    let down_data = quantize_q6_k(&synth_weight_f32(HIDDEN * INTER, 1.7));
+
+    // Per-head QK norm weights (head_dim).
+    let qk_norm_w: Vec<f32> = (0..HEAD_DIM).map(|i| 0.5 + (i as f32 * 0.01)).collect();
+    let norm_w: Vec<f32> = (0..HIDDEN).map(|i| 1.0 + (i as f32 * 0.0005)).collect();
+
+    // post_attn_norm + pre_ffn_norm + post_ffn_norm = the Gemma 3/4
+    // four-norm-per-layer pattern.
+    let layer = FullPipelineLayer {
+        wq: QuantWeight {
+            data: &wq_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wk: QuantWeight {
+            data: &wk_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wv: QuantWeight {
+            data: &wv_data,
+            scales: None,
+            format: QuantFormat::Q6_K,
+        },
+        wo: QuantWeight {
+            data: &wo_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        gate: QuantWeight {
+            data: &gate_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        up: QuantWeight {
+            data: &up_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        down: QuantWeight {
+            data: &down_data,
+            scales: None,
+            format: QuantFormat::Q6_K,
+        },
+        input_norm: &norm_w,
+        post_attn_norm: &norm_w,
+        pre_ffn_norm: Some(&norm_w),
+        post_ffn_norm: Some(&norm_w),
+        norm_offset: 1.0, // Gemma 2/3 HF baked-in offset
+        has_post_norms: true,
+        activation: Activation::GeluTanh,
+        qk_norm_offset: 1.0,
+        eps: 1e-6,
+        norm_type: NormType::RmsNorm,
+        ffn_type: FfnType::Gated,
+        attn_scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        rope_base: 10_000.0,
+        rotary_dim: 0,
+        sliding_window: 0,
+        has_v_norm: false,
+        layer_scalar: 0.0,
+        input_norm_bias: None,
+        post_attn_norm_bias: None,
+        q_norm_weight: Some(&qk_norm_w),
+        k_norm_weight: Some(&qk_norm_w),
+        ffn_up_bias: None,
+        ffn_down_bias: None,
+        moe: None,
+        ffn_is_remote: false,
+        moe_combined_output_norm: false,
+        moe_outer_post_norm: None,
+    };
+
+    let x = synth_input(HIDDEN, 1.9);
+    let mut kv = metal.create_kv_cache(1, 64, NUM_KV_HEADS, HEAD_DIM);
+
+    let result = larql_compute::metal::MetalBackend::decode_token(
+        &metal,
+        &mut kv,
+        &[layer],
+        &x,
+        HIDDEN,
+        INTER,
+        Q_DIM,
+        KV_DIM,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        10_000.0,
+    );
+
+    assert_eq!(result.len(), HIDDEN);
+    let nan = result.iter().filter(|v| v.is_nan()).count();
+    assert_eq!(nan, 0, "Gemma-3-style decode produced {nan} NaNs");
+    let inf = result.iter().filter(|v| v.is_infinite()).count();
+    assert_eq!(inf, 0, "Gemma-3-style decode produced {inf} infinities");
+    let max_abs = result.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    assert!(max_abs > 0.0, "Gemma-3-style output is all-zero");
+    assert!(
+        max_abs < 1e6,
+        "Gemma-3-style output magnitude {max_abs} unreasonable"
+    );
+}
+
+/// Multi-layer decode (3 layers) — exercises the layer-loop's
+/// state-propagation logic in `metal/decode/mod.rs`. Single-layer
+/// tests skip the inter-iteration `h_buf = new_h` swap and the
+/// per-layer scratch reuse paths.
+#[test]
+fn decode_token_multi_layer_synthetic_smoke() {
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k};
+
+    // Build 3 distinct layers with different seeds so the layer loop
+    // genuinely advances state.
+    let mut layers_data: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+        Vec::with_capacity(3);
+    for l in 0..3usize {
+        let s = l as f32 * 0.1;
+        layers_data.push((
+            quantize_q4_k(&synth_weight_f32(Q_DIM * HIDDEN, 0.10 + s)),
+            quantize_q4_k(&synth_weight_f32(KV_DIM * HIDDEN, 0.20 + s)),
+            quantize_q4_k(&synth_weight_f32(KV_DIM * HIDDEN, 0.30 + s)),
+            quantize_q4_k(&synth_weight_f32(HIDDEN * Q_DIM, 0.40 + s)),
+            quantize_q4_0(&synth_weight_f32(INTER * HIDDEN, 0.50 + s)),
+            quantize_q4_0(&synth_weight_f32(INTER * HIDDEN, 0.60 + s)),
+            quantize_q4_0(&synth_weight_f32(HIDDEN * INTER, 0.70 + s)),
+        ));
+    }
+    let norm_w: Vec<f32> = (0..HIDDEN).map(|i| 1.0 + (i as f32 * 0.001)).collect();
+
+    let layers: Vec<FullPipelineLayer<'_>> = layers_data
+        .iter()
+        .map(|(wq, wk, wv, wo, gate, up, down)| {
+            build_synth_layer(wq, wk, wv, wo, gate, up, down, &norm_w)
+        })
+        .collect();
+
+    let x = synth_input(HIDDEN, 0.95);
+    let mut kv = metal.create_kv_cache(layers.len(), 64, NUM_KV_HEADS, HEAD_DIM);
+
+    let result = larql_compute::metal::MetalBackend::decode_token(
+        &metal,
+        &mut kv,
+        &layers,
+        &x,
+        HIDDEN,
+        INTER,
+        Q_DIM,
+        KV_DIM,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        10_000.0,
+    );
+
+    assert_eq!(result.len(), HIDDEN);
+    assert_eq!(result.iter().filter(|v| v.is_nan()).count(), 0);
+    assert_eq!(result.iter().filter(|v| v.is_infinite()).count(), 0);
+    let max_abs = result.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    assert!(max_abs > 0.0, "multi-layer output is all-zero");
+}
+
+/// `LARQL_QKV_FUSED=1` opts into the `q4k_q6k_qkv_proj_normed` path
+/// (norm rolled into the matmul; defused as default 2026-05-09 per
+/// ADR-016). Exercises `encode_normed_q4k_q6k_qkv` which is otherwise
+/// unreached by the default tests.
+#[test]
+fn decode_token_qkv_fused_opt_in_smoke() {
+    use std::env;
+
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
+
+    let wq_data = quantize_q4_k(&synth_weight_f32(Q_DIM * HIDDEN, 2.1));
+    let wk_data = quantize_q4_k(&synth_weight_f32(KV_DIM * HIDDEN, 2.2));
+    let wv_data = quantize_q6_k(&synth_weight_f32(KV_DIM * HIDDEN, 2.3));
+    let wo_data = quantize_q4_k(&synth_weight_f32(HIDDEN * Q_DIM, 2.4));
+    let gate_data = quantize_q4_k(&synth_weight_f32(INTER * HIDDEN, 2.5));
+    let up_data = quantize_q4_k(&synth_weight_f32(INTER * HIDDEN, 2.6));
+    let down_data = quantize_q6_k(&synth_weight_f32(HIDDEN * INTER, 2.7));
+    let norm_w: Vec<f32> = (0..HIDDEN).map(|i| 1.0 + (i as f32 * 0.0009)).collect();
+
+    // Layer matches the dispatcher's mixed_q4k_q6k_v + RmsNorm + no-bias
+    // condition that gates the fused path. has_post_norms is false here
+    // (a non-Gemma layer that still hits the normed QKV opt-in).
+    let layer = FullPipelineLayer {
+        wq: QuantWeight {
+            data: &wq_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wk: QuantWeight {
+            data: &wk_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wv: QuantWeight {
+            data: &wv_data,
+            scales: None,
+            format: QuantFormat::Q6_K,
+        },
+        wo: QuantWeight {
+            data: &wo_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        gate: QuantWeight {
+            data: &gate_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        up: QuantWeight {
+            data: &up_data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        down: QuantWeight {
+            data: &down_data,
+            scales: None,
+            format: QuantFormat::Q6_K,
+        },
+        input_norm: &norm_w,
+        post_attn_norm: &norm_w,
+        pre_ffn_norm: None,
+        post_ffn_norm: None,
+        norm_offset: 0.0,
+        has_post_norms: false,
+        activation: Activation::Silu,
+        qk_norm_offset: 0.0,
+        eps: 1e-6,
+        norm_type: NormType::RmsNorm,
+        ffn_type: FfnType::Gated,
+        attn_scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        rope_base: 10_000.0,
+        rotary_dim: 0,
+        sliding_window: 0,
+        has_v_norm: false,
+        layer_scalar: 0.0,
+        input_norm_bias: None,
+        post_attn_norm_bias: None,
+        q_norm_weight: None,
+        k_norm_weight: None,
+        ffn_up_bias: None,
+        ffn_down_bias: None,
+        moe: None,
+        ffn_is_remote: false,
+        moe_combined_output_norm: false,
+        moe_outer_post_norm: None,
+    };
+
+    let x = synth_input(HIDDEN, 2.9);
+
+    env::set_var("LARQL_QKV_FUSED", "1");
+    let mut kv = metal.create_kv_cache(1, 64, NUM_KV_HEADS, HEAD_DIM);
+    let result = larql_compute::metal::MetalBackend::decode_token(
+        &metal,
+        &mut kv,
+        &[layer],
+        &x,
+        HIDDEN,
+        INTER,
+        Q_DIM,
+        KV_DIM,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        10_000.0,
+    );
+    env::remove_var("LARQL_QKV_FUSED");
+
+    assert_eq!(result.len(), HIDDEN);
+    assert_eq!(result.iter().filter(|v| v.is_nan()).count(), 0);
+    let max_abs = result.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    assert!(max_abs > 0.0, "QKV-fused-opt-in output is all-zero");
+}
+
+/// `prefill_q4` exercises a different code path than `decode_token`:
+/// `metal/ops/full_pipeline/{dispatch,stages,full_layer}.rs` instead of
+/// `metal/decode/*`. Multi-position seq_len=4 prefill on a synthetic
+/// Llama-style layer.
+#[test]
+fn prefill_q4_seq4_synthetic_smoke() {
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k};
+
+    let wq_data = quantize_q4_k(&synth_weight_f32(Q_DIM * HIDDEN, 3.1));
+    let wk_data = quantize_q4_k(&synth_weight_f32(KV_DIM * HIDDEN, 3.2));
+    let wv_data = quantize_q4_k(&synth_weight_f32(KV_DIM * HIDDEN, 3.3));
+    let wo_data = quantize_q4_k(&synth_weight_f32(HIDDEN * Q_DIM, 3.4));
+    let gate_data = quantize_q4_0(&synth_weight_f32(INTER * HIDDEN, 3.5));
+    let up_data = quantize_q4_0(&synth_weight_f32(INTER * HIDDEN, 3.6));
+    let down_data = quantize_q4_0(&synth_weight_f32(HIDDEN * INTER, 3.7));
+    let norm_w: Vec<f32> = (0..HIDDEN).map(|i| 1.0 + (i as f32 * 0.0008)).collect();
+
+    let layer = build_synth_layer(
+        &wq_data, &wk_data, &wv_data, &wo_data, &gate_data, &up_data, &down_data, &norm_w,
+    );
+
+    let seq_len = 4usize;
+    let x: Vec<f32> = (0..seq_len * HIDDEN)
+        .map(|i| ((i as f32 * 0.011 + 3.9).sin()) * 0.4)
+        .collect();
+
+    // prefill_q4 returns the final-position hidden state (size HIDDEN);
+    // KV cache is populated in place. None means the backend doesn't
+    // support this path — only Metal does.
+    let result = (&metal as &dyn ComputeBackend)
+        .as_any()
+        .downcast_ref::<larql_compute::metal::MetalBackend>()
+        .unwrap()
+        .prefill_q4(
+            &[layer],
+            &x,
+            HIDDEN,
+            INTER,
+            Q_DIM,
+            KV_DIM,
+            seq_len,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            10_000.0,
+            false, // use_qk_norm
+            0.0,   // softcap
+        );
+
+    let result = match result {
+        Some(r) => r,
+        None => {
+            eprintln!("skip: prefill_q4 returned None (synthetic layer not supported by this path)");
+            return;
+        }
+    };
+
+    // prefill_q4 returns seq_len × hidden (all positions, not just last).
+    assert_eq!(
+        result.len(),
+        seq_len * HIDDEN,
+        "prefill_q4 output length"
+    );
+    assert_eq!(result.iter().filter(|v| v.is_nan()).count(), 0);
+    assert_eq!(result.iter().filter(|v| v.is_infinite()).count(), 0);
+    let max_abs = result.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    assert!(max_abs > 0.0, "prefill_q4 output is all-zero");
+    assert!(
+        max_abs < 1e6,
+        "prefill_q4 output magnitude {max_abs} unreasonable"
     );
 }

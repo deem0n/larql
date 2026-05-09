@@ -89,7 +89,6 @@ pub mod residual;
 pub mod residual_diff;
 pub mod tokenizer;
 pub mod trace;
-pub mod trie;
 pub mod vindex;
 pub mod walker;
 

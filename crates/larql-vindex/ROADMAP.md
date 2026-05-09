@@ -2,7 +2,7 @@
 
 ## Current state (as of 2026-05-09)
 
-- **583 tests listed** on `larql-vindex` (`cargo test -p
+- **625 tests listed** on `larql-vindex` (`cargo test -p
   larql-vindex -- --list`). Crate-local checks are wired through
   `make larql-vindex-ci`: fmt, clippy `-D warnings`, tests, example
   compile checks, bench compile/tests, and coverage policy.
@@ -57,15 +57,14 @@
   larql-vindex-coverage-html` (cargo-llvm-cov) enforce both the
   aggregate line floor and `coverage-policy.json`.
 - **Coverage ratchet**: aggregate floor is 71% lines from the
-  2026-05-08 baseline of 71.56%; current measured **73.51% lines**
-  (72.55% branches, 73.79% functions) as of 2026-05-09 round-2.
-  Per-source-file default is 90%; files below that are explicit debt
-  baselines (48 entries) and should only move upward. The 2026-05-09
-  splits added 9 new debt baselines for the sibling files of the
-  publish/streaming/build decompositions; pure-function tests on the
-  publish trio (parse_lfs_batch_response, parse_preupload_response,
-  parse_lfs_oid_index, CountingReader) lifted three from 0% to
-  34-59%.
+  2026-05-08 baseline of 71.56%; current measured **76.46% lines**
+  as of 2026-05-09 round-3. Per-source-file default is 90%; files
+  below that are explicit debt baselines (47 entries) and should
+  only move upward. The 2026-05-09 publish-trio HTTP mocking lifted
+  `publish/{lfs,remote,upload}.rs` to 96-98% (from the earlier
+  pure-function-only floor of 34-59%). The phase-2 streaming
+  refactor added two new debt baselines (`streaming/context.rs`
+  88%, `streaming/stages.rs` 56%).
 - **Cross-platform CI**: `.github/workflows/larql-vindex.yml` runs
   format, check, examples, clippy, tests, and bench compile/tests on
   Linux, Windows, and macOS. Coverage policy runs on Ubuntu.
@@ -536,6 +535,9 @@ regression that's tracked but not blocking.
 | **resume.rs deleted** | `build_vindex_resume` (274 L) deleted: it read the legacy `down_meta.jsonl` format that nothing produces any more, and had zero callers. Re-export removed from `extract/mod.rs` and `lib.rs`; doc-comment in `extract/build/mod.rs` updated to point at the streaming-pipeline checkpoint mechanism instead. Drops one of the 4 zero-coverage debt entries automatically. |
 | **Pure-function coverage on publish trio** | Extracted `parse_lfs_batch_response`, `parse_preupload_response`, `parse_lfs_oid_index` from their HTTP-bound parents into pure helpers. Added 21 unit tests (9 lfs.rs, 7 upload.rs, 5 remote.rs) covering the JSON contract: malformed bodies, missing/empty arrays, per-object errors, optional-action absence, default fallbacks, malformed entries skipped. Lifted `lfs.rs` 0%→40.8%, `remote.rs` 0%→59.0%, `upload.rs` 0%→34.0%. The remaining HTTP-bound code paths (real `lfs_batch_upload`, `stream_put_with_progress`, `lfs_verify`, `commit_lfs_file`, `create_hf_repo`, `upload_regular`, the `fetch_remote_lfs_oids` HTTP boundary) need a mock HTTP harness — captured as a separate task. |
 | **Aggregate coverage** | **73.51% lines / 72.55% branches / 73.79% functions** (was 71.56% on 2026-05-08, **+1.95%**). Policy passes. |
+| **Phase 2 — StreamingContext refactor** | `streaming.rs` 832 → 4-file module: `mod.rs` 98 (orchestrator), `context.rs` 230 (struct + new + finalize), `stages.rs` 644 (impl methods for each stage), `tensor_io.rs` 143 (helpers from phase 1). Mirrors `extract::build::BuildContext`. Public API unchanged. Borrow-check note: had to inline `let prefixes: Vec<&str> = self.prefixes.iter().map(|s| s.as_str()).collect()` instead of a helper, so the compiler sees disjoint field borrows (`self.prefixes` immutable + `self.callbacks` mutable later in the loop). |
+| **Task #12 — HTTP-mock harness for publish trio** | Added `mockito = "1.7"` + `serial_test = "3.2"` as dev-deps. Introduced `protocol::hf_base()` helper that consults `LARQL_HF_TEST_BASE` env var (default `https://huggingface.co`) so per-test mockito servers can intercept all HF traffic. 32 new HTTP-mocked tests across the trio: `publish/lfs.rs` (15) covering `lfs_batch_upload`, `stream_put_with_progress`, `lfs_verify`, `commit_lfs_file`, full `upload_lfs` orchestrator (happy path / object-already-stored skip / no-verify); `publish/upload.rs` (9) covering `preupload_decide`, `upload_regular`, full `upload_file_to_hf` (regular dispatch / shouldIgnore short-circuit / unknown mode); `publish/remote.rs` (8) covering `fetch_remote_lfs_oids` (200 / 404 / non-array body / dataset path) + `create_hf_repo` (200 / 409 conflict / 500 error / repo-name extraction). Per-file coverage now: lfs.rs 97.8%, remote.rs 98.3%, upload.rs 96.1% — all exceed the 75-85% target. |
+| **Aggregate coverage (round-3)** | **76.46% lines** (was 73.51% in round-2, +2.95%; was 71.56% on 2026-05-08, +4.90% across the day). 625 tests total. Policy passes. |
 
 ### 2026-05-08 — vindex quality gate + coverage ratchet
 

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::error::VindexError;
 
-use super::protocol::{repo_type_plural, HTTP_STATUS_CONFLICT};
+use super::protocol::{hf_base, repo_type_plural, HTTP_STATUS_CONFLICT};
 
 /// List remote files and return `filename → lfs.oid` for every LFS-tracked
 /// file at the repo root. Files without an `lfs.oid` (git-tracked small
@@ -17,7 +17,8 @@ pub(super) fn fetch_remote_lfs_oids(
     repo_type: &str,
 ) -> Result<HashMap<String, String>, VindexError> {
     let plural = repo_type_plural(repo_type);
-    let url = format!("https://huggingface.co/api/{plural}/{repo_id}/tree/main?recursive=true");
+    let base = hf_base();
+    let url = format!("{base}/api/{plural}/{repo_id}/tree/main?recursive=true");
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get(&url)
@@ -72,8 +73,9 @@ pub(super) fn create_hf_repo(
     repo_type: &str,
 ) -> Result<(), VindexError> {
     let client = reqwest::blocking::Client::new();
+    let url = format!("{}/api/repos/create", hf_base());
     let resp = client
-        .post("https://huggingface.co/api/repos/create")
+        .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({
             "name": repo_id.split('/').next_back().unwrap_or(repo_id),
@@ -172,5 +174,193 @@ mod tests {
         let map = parse_lfs_oid_index(&body);
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("good.bin").map(|s| s.as_str()), Some("y"));
+    }
+
+    // ─── HTTP-mocked integration tests ─────────────────────────────
+    //
+    // These set `LARQL_HF_TEST_BASE` to a per-test mockito URL and
+    // serialize via `#[serial]` because env vars are process-global.
+
+    use crate::format::huggingface::publish::protocol::TEST_BASE_ENV;
+    use serial_test::serial;
+
+    /// RAII-style env-var override: sets the var, restores on drop.
+    struct EnvBaseGuard {
+        prev: Option<String>,
+    }
+    impl EnvBaseGuard {
+        fn new(value: &str) -> Self {
+            let prev = std::env::var(TEST_BASE_ENV).ok();
+            std::env::set_var(TEST_BASE_ENV, value);
+            Self { prev }
+        }
+    }
+    impl Drop for EnvBaseGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(TEST_BASE_ENV, v),
+                None => std::env::remove_var(TEST_BASE_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_remote_lfs_oids_parses_tree_response() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("GET", "/api/models/org/repo/tree/main?recursive=true")
+            .match_header("authorization", "Bearer t")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    {"type": "file", "path": "weights.bin",
+                     "lfs": {"oid": "abc"}},
+                    {"type": "file", "path": "index.json"}
+                ])
+                .to_string(),
+            )
+            .create();
+
+        let map = fetch_remote_lfs_oids("org/repo", "t", "model").unwrap();
+        mock.assert();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("weights.bin").map(|s| s.as_str()), Some("abc"));
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_remote_lfs_oids_dataset_uses_datasets_path_segment() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("GET", "/api/datasets/org/repo/tree/main?recursive=true")
+            .with_status(200)
+            .with_body("[]")
+            .create();
+
+        let map = fetch_remote_lfs_oids("org/repo", "t", "dataset").unwrap();
+        mock.assert();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_remote_lfs_oids_404_returns_empty_map() {
+        // Fresh repo: tree endpoint 404s before the first commit.
+        // Caller falls back to "upload everything", so this MUST NOT
+        // surface as an error.
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("GET", "/api/models/org/repo/tree/main?recursive=true")
+            .with_status(404)
+            .create();
+
+        let map = fetch_remote_lfs_oids("org/repo", "t", "model").unwrap();
+        mock.assert();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_remote_lfs_oids_non_array_body_yields_empty_map() {
+        // 200 OK with a JSON object (not array) body — defensive path
+        // already covered by the pure parser test, but exercise the
+        // full HTTP path here too.
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("GET", "/api/models/org/repo/tree/main?recursive=true")
+            .with_status(200)
+            .with_body(r#"{"error": "weird"}"#)
+            .create();
+
+        let map = fetch_remote_lfs_oids("org/repo", "t", "model").unwrap();
+        mock.assert();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn create_hf_repo_success() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/repos/create")
+            .match_header("authorization", "Bearer t")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"name": "repo", "type": "model"}),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .create();
+
+        create_hf_repo("org/repo", "t", "model").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn create_hf_repo_409_conflict_is_ok() {
+        // 409 Conflict means "already exists" — that's fine, the publish
+        // path proceeds to commit. Must NOT surface as an error.
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/repos/create")
+            .with_status(409)
+            .with_body("conflict")
+            .create();
+
+        create_hf_repo("org/repo", "t", "model").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn create_hf_repo_other_error_propagates() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/repos/create")
+            .with_status(500)
+            .with_body("boom")
+            .create();
+
+        let err = create_hf_repo("org/repo", "t", "model").expect_err("500 must error");
+        mock.assert();
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "{msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn create_hf_repo_uses_last_path_segment_as_name() {
+        // HF's repos/create body uses just the repo name (the part after
+        // the slash), not the full owner/repo. A repo_id without a slash
+        // should pass through verbatim.
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/repos/create")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"name": "loose-repo"}),
+            ))
+            .with_status(200)
+            .create();
+
+        create_hf_repo("loose-repo", "t", "model").unwrap();
+        mock.assert();
     }
 }

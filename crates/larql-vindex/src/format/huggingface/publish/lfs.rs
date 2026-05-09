@@ -10,8 +10,9 @@ use crate::error::VindexError;
 
 use super::hf_repo_url;
 use super::protocol::{
-    repo_type_plural, CONTENT_TYPE_LFS_JSON, CONTENT_TYPE_NDJSON, HASH_ALGO_SHA256, LFS_OP_UPLOAD,
-    LFS_OP_VERIFY, LFS_PUT_TIMEOUT, LFS_TRANSFER_BASIC, UPLOAD_PROGRESS_POLL_INTERVAL,
+    hf_base, repo_type_plural, CONTENT_TYPE_LFS_JSON, CONTENT_TYPE_NDJSON, HASH_ALGO_SHA256,
+    LFS_OP_UPLOAD, LFS_OP_VERIFY, LFS_PUT_TIMEOUT, LFS_TRANSFER_BASIC,
+    UPLOAD_PROGRESS_POLL_INTERVAL,
 };
 use super::PublishCallbacks;
 
@@ -277,7 +278,7 @@ fn commit_lfs_file(
     repo_type: &str,
 ) -> Result<(), VindexError> {
     let plural = repo_type_plural(repo_type);
-    let url = format!("https://huggingface.co/api/{plural}/{repo_id}/commit/main");
+    let url = format!("{}/api/{plural}/{repo_id}/commit/main", hf_base());
     let mut ndjson = String::new();
     ndjson.push_str(
         &serde_json::to_string(&serde_json::json!({
@@ -459,5 +460,439 @@ mod tests {
         });
         let parsed = parse_lfs_batch_response(&json).unwrap();
         assert!(parsed.upload.is_none());
+    }
+
+    // ─── HTTP-mocked integration tests ─────────────────────────────
+
+    use super::super::PublishCallbacks;
+    use crate::format::huggingface::publish::protocol::TEST_BASE_ENV;
+    use serial_test::serial;
+    use std::io::Write as _;
+
+    struct EnvBaseGuard {
+        prev: Option<String>,
+    }
+    impl EnvBaseGuard {
+        fn new(value: &str) -> Self {
+            let prev = std::env::var(TEST_BASE_ENV).ok();
+            std::env::set_var(TEST_BASE_ENV, value);
+            Self { prev }
+        }
+    }
+    impl Drop for EnvBaseGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(TEST_BASE_ENV, v),
+                None => std::env::remove_var(TEST_BASE_ENV),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingCallbacks {
+        progress_calls: Vec<(String, u64, u64)>,
+    }
+    impl PublishCallbacks for CapturingCallbacks {
+        fn on_file_progress(&mut self, filename: &str, bytes_sent: u64, total_bytes: u64) {
+            self.progress_calls
+                .push((filename.to_string(), bytes_sent, total_bytes));
+        }
+    }
+
+    fn write_temp_bytes(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        (dir, path)
+    }
+
+    // ── lfs_batch_upload ──
+
+    #[test]
+    #[serial]
+    fn lfs_batch_upload_returns_actions_from_server() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/org/repo.git/info/lfs/objects/batch")
+            .match_header("authorization", "Bearer t")
+            .match_header("accept", "application/vnd.git-lfs+json")
+            .match_header("content-type", "application/vnd.git-lfs+json")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "operation": "upload",
+                "transfers": ["basic"],
+                "hash_algo": "sha256",
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "objects": [{
+                        "actions": {
+                            "upload": {
+                                "href": "https://lfs.example/up",
+                                "header": {"X-Sig": "abc"}
+                            },
+                            "verify": {"href": "https://lfs.example/v", "header": {}}
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let resp = lfs_batch_upload("org/repo", "t", "deadbeef", 1024, "model").unwrap();
+        mock.assert();
+        let upload = resp.upload.expect("upload action present");
+        assert_eq!(upload.href, "https://lfs.example/up");
+        assert_eq!(upload.header.get("X-Sig").map(|s| s.as_str()), Some("abc"));
+        assert!(resp.verify.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn lfs_batch_upload_dataset_repo_path() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/datasets/org/repo.git/info/lfs/objects/batch")
+            .with_status(200)
+            .with_body(r#"{"objects":[{"actions":{}}]}"#)
+            .create();
+
+        let _ = lfs_batch_upload("org/repo", "t", "x", 1, "dataset").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn lfs_batch_upload_http_error_propagates() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/org/repo.git/info/lfs/objects/batch")
+            .with_status(500)
+            .with_body("boom")
+            .create();
+
+        let err = lfs_batch_upload("org/repo", "t", "x", 1, "model").expect_err("500 must error");
+        mock.assert();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    #[serial]
+    fn lfs_batch_upload_per_object_error_surfaces() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/org/repo.git/info/lfs/objects/batch")
+            .with_status(200)
+            .with_body(r#"{"objects":[{"error":{"code":422,"message":"too big"}}]}"#)
+            .create();
+
+        let err = lfs_batch_upload("org/repo", "t", "x", 1, "model").expect_err("inline error");
+        mock.assert();
+        assert!(err.to_string().contains("LFS batch object error"));
+    }
+
+    // ── stream_put_with_progress ──
+
+    #[test]
+    #[serial]
+    fn stream_put_uploads_body_and_ticks_progress_to_100() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+        let payload = b"streaming-body-bytes";
+        let (_dir, path) = write_temp_bytes(payload);
+
+        let mock = server
+            .mock("PUT", "/lfs/upload/x")
+            .match_body(payload.to_vec())
+            .with_status(200)
+            .create();
+
+        let mut cb = CapturingCallbacks::default();
+        let href = format!("{}/lfs/upload/x", server.url());
+        let extra: HashMap<String, String> = HashMap::new();
+        stream_put_with_progress(&href, &extra, &path, payload.len() as u64, "blob.bin", &mut cb)
+            .unwrap();
+        mock.assert();
+        let last = cb.progress_calls.last().expect("at least one tick");
+        assert_eq!(last.0, "blob.bin");
+        assert_eq!(last.1, payload.len() as u64);
+        assert_eq!(last.2, payload.len() as u64);
+    }
+
+    #[test]
+    #[serial]
+    fn stream_put_forwards_extra_headers() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+        let (_dir, path) = write_temp_bytes(b"x");
+
+        let mock = server
+            .mock("PUT", "/sig")
+            .match_header("x-amz-signature", "test-sig")
+            .with_status(200)
+            .create();
+
+        let mut cb = CapturingCallbacks::default();
+        let href = format!("{}/sig", server.url());
+        let mut extra: HashMap<String, String> = HashMap::new();
+        extra.insert("X-Amz-Signature".to_string(), "test-sig".to_string());
+        stream_put_with_progress(&href, &extra, &path, 1, "x", &mut cb).unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn stream_put_propagates_http_error_with_filename() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+        let (_dir, path) = write_temp_bytes(b"x");
+
+        let mock = server
+            .mock("PUT", "/blocked")
+            .with_status(403)
+            .with_body("nope")
+            .create();
+
+        let mut cb = CapturingCallbacks::default();
+        let href = format!("{}/blocked", server.url());
+        let extra: HashMap<String, String> = HashMap::new();
+        let err = stream_put_with_progress(&href, &extra, &path, 1, "blocked.bin", &mut cb)
+            .expect_err("403 must error");
+        mock.assert();
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "{msg}");
+        assert!(msg.contains("blocked.bin"), "{msg}");
+    }
+
+    // ── lfs_verify ──
+
+    #[test]
+    #[serial]
+    fn lfs_verify_posts_oid_and_size() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/lfs/verify")
+            .match_header("authorization", "Bearer t")
+            .match_header("accept", "application/vnd.git-lfs+json")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"oid": "sha", "size": 42}),
+            ))
+            .with_status(200)
+            .create();
+
+        let href = format!("{}/lfs/verify", server.url());
+        let extra: HashMap<String, String> = HashMap::new();
+        lfs_verify(&href, &extra, "t", "sha", 42).unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn lfs_verify_http_error_propagates() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/lfs/verify")
+            .with_status(500)
+            .create();
+
+        let href = format!("{}/lfs/verify", server.url());
+        let extra: HashMap<String, String> = HashMap::new();
+        let err = lfs_verify(&href, &extra, "t", "sha", 42).expect_err("500 errors");
+        mock.assert();
+        assert!(err.to_string().contains("500"));
+    }
+
+    // ── commit_lfs_file ──
+
+    #[test]
+    #[serial]
+    fn commit_lfs_file_posts_ndjson_pointer() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/models/org/repo/commit/main")
+            .match_header("authorization", "Bearer t")
+            .match_header("content-type", "application/x-ndjson")
+            .match_body(mockito::Matcher::Regex(r#""key":\s*"lfsFile""#.into()))
+            .match_body(mockito::Matcher::Regex(r#""algo":\s*"sha256""#.into()))
+            .match_body(mockito::Matcher::Regex(r#""path":\s*"file\.bin""#.into()))
+            .with_status(200)
+            .create();
+
+        commit_lfs_file("org/repo", "t", "file.bin", "deadbeef", 100, "model").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn commit_lfs_file_dataset_uses_datasets_path() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/datasets/org/repo/commit/main")
+            .with_status(200)
+            .create();
+
+        commit_lfs_file("org/repo", "t", "file.bin", "deadbeef", 100, "dataset").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn commit_lfs_file_http_error_includes_filename() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+
+        let mock = server
+            .mock("POST", "/api/models/org/repo/commit/main")
+            .with_status(409)
+            .with_body("conflict")
+            .create();
+
+        let err = commit_lfs_file("org/repo", "t", "conf.bin", "x", 1, "model")
+            .expect_err("409 errors");
+        mock.assert();
+        let msg = err.to_string();
+        assert!(msg.contains("conf.bin"), "{msg}");
+        assert!(msg.contains("409"), "{msg}");
+    }
+
+    // ── upload_lfs orchestrator (batch → PUT → verify → commit) ──
+
+    #[test]
+    #[serial]
+    fn upload_lfs_full_path_with_upload_action() {
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+        let (_dir, path) = write_temp_bytes(b"payload");
+
+        let put_url = format!("{}/lfs/up", server.url());
+        let verify_url = format!("{}/lfs/v", server.url());
+
+        let batch_mock = server
+            .mock("POST", "/org/repo.git/info/lfs/objects/batch")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "objects": [{
+                        "actions": {
+                            "upload": {"href": put_url, "header": {}},
+                            "verify": {"href": verify_url, "header": {}}
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let put_mock = server.mock("PUT", "/lfs/up").with_status(200).create();
+        let verify_mock = server.mock("POST", "/lfs/v").with_status(200).create();
+        let commit_mock = server
+            .mock("POST", "/api/models/org/repo/commit/main")
+            .with_status(200)
+            .create();
+
+        let mut cb = CapturingCallbacks::default();
+        upload_lfs("org/repo", "t", &path, "p.bin", 7, "sha", &mut cb, "model").unwrap();
+        batch_mock.assert();
+        put_mock.assert();
+        verify_mock.assert();
+        commit_mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn upload_lfs_skips_put_when_object_already_present() {
+        // Batch returns no `actions.upload` ⇒ HF says the LFS object is
+        // already stored. upload_lfs must skip the PUT and proceed
+        // straight to verify (if present) + commit.
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+        let (_dir, path) = write_temp_bytes(b"payload");
+
+        let verify_url = format!("{}/lfs/v", server.url());
+
+        let batch_mock = server
+            .mock("POST", "/org/repo.git/info/lfs/objects/batch")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "objects": [{
+                        "actions": {
+                            "verify": {"href": verify_url, "header": {}}
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let verify_mock = server.mock("POST", "/lfs/v").with_status(200).create();
+        let commit_mock = server
+            .mock("POST", "/api/models/org/repo/commit/main")
+            .with_status(200)
+            .create();
+        // Deliberately no PUT mock — if upload_lfs calls PUT, it'll
+        // hit a 501 from mockito and fail.
+
+        let mut cb = CapturingCallbacks::default();
+        upload_lfs("org/repo", "t", &path, "p.bin", 7, "sha", &mut cb, "model").unwrap();
+        batch_mock.assert();
+        verify_mock.assert();
+        commit_mock.assert();
+        // Bar still ticks 100% via the skip path.
+        assert!(cb.progress_calls.iter().any(|(_, sent, total)| sent == total && *sent == 7));
+    }
+
+    #[test]
+    #[serial]
+    fn upload_lfs_no_verify_action_skips_verify_and_commits() {
+        // Some LFS servers omit `verify` when not required. upload_lfs
+        // must skip verify cleanly and still commit.
+        let mut server = mockito::Server::new();
+        let _guard = EnvBaseGuard::new(&server.url());
+        let (_dir, path) = write_temp_bytes(b"payload");
+
+        let put_url = format!("{}/lfs/up", server.url());
+
+        let batch_mock = server
+            .mock("POST", "/org/repo.git/info/lfs/objects/batch")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "objects": [{
+                        "actions": {
+                            "upload": {"href": put_url, "header": {}}
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let put_mock = server.mock("PUT", "/lfs/up").with_status(200).create();
+        let commit_mock = server
+            .mock("POST", "/api/models/org/repo/commit/main")
+            .with_status(200)
+            .create();
+
+        let mut cb = CapturingCallbacks::default();
+        upload_lfs("org/repo", "t", &path, "p.bin", 7, "sha", &mut cb, "model").unwrap();
+        batch_mock.assert();
+        put_mock.assert();
+        commit_mock.assert();
     }
 }
