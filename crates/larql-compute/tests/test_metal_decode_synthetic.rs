@@ -804,14 +804,14 @@ fn qkv_pipeline_geometry_matches_shader_constants() {
 
     use larql_compute::metal::shaders::{q4k_qkv_proj as q4k, q4kf_qkv_proj as q4kf};
 
-    assert_eq!(metal.q4k_qkv_proj_pipeline.rows_per_tg, q4k::ROWS_PER_TG);
+    assert_eq!(metal.attention.q4k_qkv_proj_pipeline.rows_per_tg, q4k::ROWS_PER_TG);
     assert_eq!(
-        metal.q4k_qkv_proj_pipeline.threads_per_tg,
+        metal.attention.q4k_qkv_proj_pipeline.threads_per_tg,
         q4k::THREADS_PER_TG
     );
-    assert_eq!(metal.q4kf_qkv_proj_pipeline.rows_per_tg, q4kf::ROWS_PER_TG);
+    assert_eq!(metal.attention.q4kf_qkv_proj_pipeline.rows_per_tg, q4kf::ROWS_PER_TG);
     assert_eq!(
-        metal.q4kf_qkv_proj_pipeline.threads_per_tg,
+        metal.attention.q4kf_qkv_proj_pipeline.threads_per_tg,
         q4kf::THREADS_PER_TG
     );
 
@@ -819,9 +819,9 @@ fn qkv_pipeline_geometry_matches_shader_constants() {
     // reason the bug existed. If they ever converge, delete this assert
     // and document the consolidation.
     assert!(
-        metal.q4k_qkv_proj_pipeline.rows_per_tg != metal.q4kf_qkv_proj_pipeline.rows_per_tg
-            || metal.q4k_qkv_proj_pipeline.threads_per_tg
-                != metal.q4kf_qkv_proj_pipeline.threads_per_tg,
+        metal.attention.q4k_qkv_proj_pipeline.rows_per_tg != metal.attention.q4kf_qkv_proj_pipeline.rows_per_tg
+            || metal.attention.q4k_qkv_proj_pipeline.threads_per_tg
+                != metal.attention.q4kf_qkv_proj_pipeline.threads_per_tg,
         "Q4_K and Q4_KF QKV pipelines now share geometry — \
          the decode_hybrid bug class no longer applies"
     );
@@ -847,19 +847,19 @@ fn moe_gate_up_pipeline_geometry_matches_shader_constants() {
     };
 
     assert_eq!(
-        metal.q4k_ffn_gate_up_pipeline.rows_per_tg,
+        metal.ffn.q4k_ffn_gate_up_pipeline.rows_per_tg,
         q4k_gu::ROWS_PER_TG
     );
     assert_eq!(
-        metal.q4k_ffn_gate_up_pipeline.threads_per_tg,
+        metal.ffn.q4k_ffn_gate_up_pipeline.threads_per_tg,
         q4k_gu::THREADS_PER_TG
     );
     assert_eq!(
-        metal.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg,
+        metal.ffn.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg,
         q4k_gu_8sg::ROWS_PER_TG
     );
     assert_eq!(
-        metal.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg,
+        metal.ffn.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg,
         q4k_gu_8sg::THREADS_PER_TG
     );
 }

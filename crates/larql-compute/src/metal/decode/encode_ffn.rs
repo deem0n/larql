@@ -124,7 +124,7 @@ impl MetalBackend {
         if layer.is_gated() {
             // Fused gate+up
             let n_tgs_per_mat = (inter as u64).div_ceil(q4kf_gu::ROWS_PER_TG);
-            enc.set_compute_pipeline_state(&self.q4kf_ffn_gate_up_pipeline.state);
+            enc.set_compute_pipeline_state(&self.ffn.q4kf_ffn_gate_up_pipeline.state);
             enc.set_buffer(0, Some(bufs.gate_w), 0);
             enc.set_buffer(1, Some(bufs.up_w), 0);
             enc.set_buffer(2, Some(bufs.ffn_norm_out), 0);
@@ -146,7 +146,7 @@ impl MetalBackend {
         } else {
             // Standard FFN: up + activation + down
             let n_tgs_up = (inter as u64).div_ceil(q4kf::ROWS_PER_TG);
-            enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
+            enc.set_compute_pipeline_state(&self.attention.q4kf_proj_pipeline.state);
             enc.set_buffer(0, Some(bufs.up_w), 0);
             enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
             enc.set_buffer(2, Some(bufs.up_out), 0);
@@ -166,7 +166,7 @@ impl MetalBackend {
                 inter as u64,
             );
 
-            enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
+            enc.set_compute_pipeline_state(&self.attention.q4kf_proj_pipeline.state);
             enc.set_buffer(0, Some(bufs.down_w), 0);
             enc.set_buffer(1, Some(bufs.act_buf), 0);
             enc.set_buffer(2, Some(bufs.down_out), 0);
@@ -240,19 +240,19 @@ impl MetalBackend {
                 // Cooperative wins over the other flags — it's the
                 // newest variant under measurement.
                 (
-                    &self.q4k_ffn_gate_up_coop_pipeline.state,
+                    &self.ffn.q4k_ffn_gate_up_coop_pipeline.state,
                     q4k_gu_coop::ROWS_PER_TG,
                     q4k_gu_coop::THREADS_PER_TG,
                 )
             } else if use_4sg && use_f16 {
                 (
-                    &self.q4k_ffn_gate_up_f16acc_pipeline.state,
+                    &self.ffn.q4k_ffn_gate_up_f16acc_pipeline.state,
                     q4k_gu::ROWS_PER_TG,
                     q4k_gu::THREADS_PER_TG,
                 )
             } else if use_4sg {
                 (
-                    &self.q4k_ffn_gate_up_pipeline.state,
+                    &self.ffn.q4k_ffn_gate_up_pipeline.state,
                     q4k_gu::ROWS_PER_TG,
                     q4k_gu::THREADS_PER_TG,
                 )
@@ -261,7 +261,7 @@ impl MetalBackend {
                 // 8sg dispatch, so 8sg wins if both flags conflict.
                 let _ = use_f16;
                 (
-                    &self.q4k_ffn_gate_up_8sg_pipeline.state,
+                    &self.ffn.q4k_ffn_gate_up_8sg_pipeline.state,
                     q4k_gu_8sg::ROWS_PER_TG,
                     q4k_gu_8sg::THREADS_PER_TG,
                 )
@@ -319,7 +319,7 @@ impl MetalBackend {
                 && layer.down.format == crate::QuantFormat::Q6_K
                 && matches!(layer.activation, crate::Activation::GeluTanh);
             if use_fused_q6k_down {
-                let kh = &self.q6k_geglu_gelu_tanh_down_pipeline;
+                let kh = &self.ffn.q6k_geglu_gelu_tanh_down_pipeline;
                 let n_tgs = (hidden as u64).div_ceil(kh.rows_per_tg);
                 enc.set_compute_pipeline_state(&kh.state);
                 enc.set_buffer(0, Some(bufs.down_w), 0);
@@ -362,7 +362,7 @@ impl MetalBackend {
                 self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
                 use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
                 let pipes = Pipelines {
-                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                    q4kf_proj: Some(&self.attention.q4kf_proj_pipeline.state),
                     q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
                     q6k_matvec: &self.quant.q6k_matvec_pipeline,
                     q4_matvec: &self.q4.matvec,
@@ -506,8 +506,8 @@ impl MetalBackend {
             "metal::decode::encode_geglu",
         );
         let geglu = match layer.activation {
-            crate::Activation::Silu => &self.geglu_pipeline,
-            crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,
+            crate::Activation::Silu => &self.ffn.geglu_pipeline,
+            crate::Activation::GeluTanh => &self.ffn.geglu_gelu_tanh_pipeline,
             // assert above prevents reaching here.
             crate::Activation::GeluExact | crate::Activation::ReLU => unreachable!(),
         };
@@ -542,8 +542,8 @@ impl MetalBackend {
             "metal::decode::encode_q4k_fused_geglu_down",
         );
         let kernel = match layer.activation {
-            crate::Activation::Silu => &self.q4k_geglu_silu_down_pipeline,
-            crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
+            crate::Activation::Silu => &self.ffn.q4k_geglu_silu_down_pipeline,
+            crate::Activation::GeluTanh => &self.ffn.q4k_geglu_gelu_tanh_down_pipeline,
             crate::Activation::GeluExact | crate::Activation::ReLU => unreachable!(),
         };
         Self::dispatch_fused_geglu_down(enc, kernel, bufs, hidden, hidden_val, inter_padded_val);
@@ -617,7 +617,7 @@ impl MetalBackend {
             use crate::metal::shaders::q4kf_qkv_proj as q4kf;
             if layer.is_gated() {
                 let n = (inter as u64).div_ceil(q4kf_gu::ROWS_PER_TG);
-                enc.set_compute_pipeline_state(&self.q4kf_ffn_gate_up_pipeline.state);
+                enc.set_compute_pipeline_state(&self.ffn.q4kf_ffn_gate_up_pipeline.state);
                 enc.set_buffer(0, Some(bufs.gate_w), 0);
                 enc.set_buffer(1, Some(bufs.up_w), 0);
                 enc.set_buffer(2, Some(bufs.ffn_norm_out), 0);
@@ -631,7 +631,7 @@ impl MetalBackend {
                 );
             } else {
                 let n = (inter as u64).div_ceil(q4kf::ROWS_PER_TG);
-                enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
+                enc.set_compute_pipeline_state(&self.attention.q4kf_proj_pipeline.state);
                 enc.set_buffer(0, Some(bufs.up_w), 0);
                 enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
                 enc.set_buffer(2, Some(bufs.up_out), 0);
@@ -643,11 +643,11 @@ impl MetalBackend {
                 );
             }
         } else if ffn_uses_q4k {
-            let rows = self.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg;
-            let tgs = self.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg;
+            let rows = self.ffn.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg;
+            let tgs = self.ffn.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg;
             if layer.is_gated() {
                 let n = (inter as u64).div_ceil(rows);
-                enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_8sg_pipeline.state);
+                enc.set_compute_pipeline_state(&self.ffn.q4k_ffn_gate_up_8sg_pipeline.state);
                 enc.set_buffer(0, Some(bufs.gate_w), 0);
                 enc.set_buffer(1, Some(bufs.up_w), 0);
                 enc.set_buffer(2, Some(bufs.ffn_norm_out), 0);
@@ -733,7 +733,7 @@ impl MetalBackend {
                 );
                 use crate::metal::shaders::q4kf_qkv_proj as q4kf;
                 let n = (hidden as u64).div_ceil(q4kf::ROWS_PER_TG);
-                enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
+                enc.set_compute_pipeline_state(&self.attention.q4kf_proj_pipeline.state);
                 enc.set_buffer(0, Some(bufs.down_w), 0);
                 enc.set_buffer(1, Some(bufs.act_buf), 0);
                 enc.set_buffer(2, Some(bufs.down_out), 0);
@@ -760,7 +760,7 @@ impl MetalBackend {
                         inter_padded_val,
                     );
                 } else if use_fused_q6k {
-                    let kh = &self.q6k_geglu_gelu_tanh_down_pipeline;
+                    let kh = &self.ffn.q6k_geglu_gelu_tanh_down_pipeline;
                     let n_tgs = (hidden as u64).div_ceil(kh.rows_per_tg);
                     enc.set_compute_pipeline_state(&kh.state);
                     enc.set_buffer(0, Some(bufs.down_w), 0);
@@ -839,8 +839,8 @@ impl MetalBackend {
             "metal::decode::encode_activation",
         );
         let pipe = match layer.activation {
-            crate::Activation::Silu => &self.silu_pipeline,
-            crate::Activation::GeluTanh => &self.gelu_tanh_pipeline,
+            crate::Activation::Silu => &self.ffn.silu_pipeline,
+            crate::Activation::GeluTanh => &self.ffn.gelu_tanh_pipeline,
             crate::Activation::GeluExact | crate::Activation::ReLU => unreachable!(),
         };
         enc.set_compute_pipeline_state(pipe);
@@ -860,7 +860,7 @@ impl MetalBackend {
     ) {
         use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
         let pipes = Pipelines {
-            q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+            q4kf_proj: Some(&self.attention.q4kf_proj_pipeline.state),
             q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
             q6k_matvec: &self.quant.q6k_matvec_pipeline,
             q4_matvec: &self.q4.matvec,

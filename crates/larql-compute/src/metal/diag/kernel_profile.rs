@@ -318,7 +318,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let xb = metal.bufs().transient_from_f32(&x);
         let go = metal.bufs().output((n * 4) as u64);
         let uo = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q4k_ffn_gate_up_8sg_pipeline;
+        let kh = &metal.ffn.q4k_ffn_gate_up_8sg_pipeline;
         let tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;
@@ -526,7 +526,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let qo = metal.bufs().output((q_rows * 4) as u64);
         let ko = metal.bufs().output((k_rows * 4) as u64);
         let vo = metal.bufs().output((v_rows * 4) as u64);
-        let kh = &metal.q4k_qkv_proj_pipeline;
+        let kh = &metal.attention.q4k_qkv_proj_pipeline;
         let n_tgs = (total_rows as u64).div_ceil(kh.rows_per_tg);
         let q_val = q_rows as u32;
         let k_val_n = k_rows as u32;
@@ -617,7 +617,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let qo = metal.bufs().output((q_rows * 4) as u64);
         let ko = metal.bufs().output((k_rows * 4) as u64);
         let vo = metal.bufs().output((v_rows * 4) as u64);
-        let kh = &metal.q4k_q6k_qkv_proj_normed_pipeline;
+        let kh = &metal.attention.q4k_q6k_qkv_proj_normed_pipeline;
         let n_tgs = (total_rows as u64).div_ceil(kh.rows_per_tg);
         let q_val = q_rows as u32;
         let k_rows_val = k_rows as u32;

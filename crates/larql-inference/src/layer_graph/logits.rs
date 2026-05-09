@@ -177,4 +177,83 @@ mod tests {
         );
         assert!(result.predictions.is_empty() || result.predictions.len() <= 3);
     }
+
+    /// Build a `VectorIndex` whose `lm_head_knn_backend` returns real hits
+    /// by materialising `lm_head.bin` on disk in a tempdir and calling
+    /// `load_lm_head`. The bytes come from the synthetic `weights.lm_head`
+    /// matrix so the f32 BLAS fallback path produces deterministic scores.
+    fn vindex_with_lm_head(
+        weights: &larql_models::ModelWeights,
+        dir: &std::path::Path,
+    ) -> larql_vindex::VectorIndex {
+        // lm_head shape = (vocab, hidden). Serialise as little-endian f32.
+        let lm = &weights.lm_head;
+        assert_eq!(lm.shape(), &[weights.vocab_size, weights.hidden_size]);
+        let mut bytes: Vec<u8> = Vec::with_capacity(lm.len() * 4);
+        for &v in lm.iter() {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(dir.join("lm_head.bin"), &bytes).expect("write lm_head.bin");
+
+        let mut index = make_test_vindex(weights);
+        index.load_lm_head(dir).expect("load_lm_head");
+        assert!(index.has_lm_head(), "lm_head must report loaded");
+        index
+    }
+
+    #[test]
+    fn finalize_logits_returns_predictions_with_lm_head_hits() {
+        // Drives the inner closures (scaled / predictions / max-logit fold)
+        // by giving the vindex real lm_head bytes so `lm_head_knn_backend`
+        // returns a non-empty top-k.
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let tmp = tempfile::tempdir().unwrap();
+        let index = vindex_with_lm_head(&weights, tmp.path());
+        let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.05f32);
+        let norm_offset = weights.arch.norm_weight_offset();
+        let result = finalize_logits(
+            &weights,
+            &tokenizer,
+            &h,
+            5,
+            &index,
+            &CpuBackend,
+            norm_offset,
+        );
+        // f32 BLAS fallback returns up to top_k entries.
+        assert!(
+            !result.predictions.is_empty(),
+            "lm_head fallback should produce hits"
+        );
+        assert!(result.predictions.len() <= 5);
+        let total: f64 = result.predictions.iter().map(|(_, p)| *p).sum();
+        // Probabilities are softmaxed across the top_k subset, so they sum
+        // to ≈1 (within fp tolerance).
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "predictions probs should ~sum to 1, got {total}"
+        );
+    }
+
+    #[test]
+    fn finalize_logits_picks_highest_logit_first() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let tmp = tempfile::tempdir().unwrap();
+        let index = vindex_with_lm_head(&weights, tmp.path());
+        let h = ndarray::Array2::from_elem((1, weights.hidden_size), 0.1f32);
+        let norm_offset = weights.arch.norm_weight_offset();
+        let result =
+            finalize_logits(&weights, &tokenizer, &h, 5, &index, &CpuBackend, norm_offset);
+
+        // First entry has the highest probability (top-k is sorted descending).
+        let probs: Vec<f64> = result.predictions.iter().map(|(_, p)| *p).collect();
+        for w in probs.windows(2) {
+            assert!(
+                w[0] >= w[1] - 1e-9,
+                "predictions must be in descending probability order: {probs:?}"
+            );
+        }
+    }
 }

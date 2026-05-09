@@ -2153,6 +2153,7 @@ name = "larql-kv"
 version = "0.1.0"
 dependencies = [
  "blas-src",
+ "criterion",
  "larql-compute",
  "larql-inference",
  "larql-vindex",

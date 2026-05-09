@@ -131,7 +131,7 @@ impl CompressedLayer {
 
 pub(super) fn detect_head_dim(kv_dim: usize) -> usize {
     for &hd in &[256usize, 128, 64, 32] {
-        if kv_dim.is_multiple_of(hd) {
+        if kv_dim % hd == 0 {
             return hd;
         }
     }

@@ -149,7 +149,7 @@ impl MetalBackend {
             while tg_w < layer_head_dim as u64 && tg_w < MAX_HEAD_DIM_SINGLE_SG as u64 {
                 tg_w <<= 1;
             }
-            enc.set_compute_pipeline_state(&self.attn_fused_pipeline);
+            enc.set_compute_pipeline_state(&self.attention.attn_fused_pipeline);
             enc.set_buffer(0, Some(bufs.q_out), 0);
             enc.set_buffer(1, Some(bufs.k_out), 0);
             enc.set_buffer(2, Some(bufs.v_out), 0);
@@ -247,7 +247,7 @@ impl MetalBackend {
             let rope_pairs = (layer_rotary_dim / 2) as u64;
             let num_q = layer_num_q_heads as u32;
             let total_qk_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
-            enc.set_compute_pipeline_state(&self.rope_at_pos_batched_qk_pipeline);
+            enc.set_compute_pipeline_state(&self.attention.rope_at_pos_batched_qk_pipeline);
             enc.set_buffer(0, Some(bufs.q_out), 0);
             enc.set_buffer(1, Some(bufs.k_out), 0);
             enc.set_bytes(2, 4, &hd as *const u32 as *const std::ffi::c_void);
@@ -297,7 +297,7 @@ impl MetalBackend {
             let hd = cache.head_dim as u32;
             let num_q_val = layer_num_q_heads as u32;
             let num_kv = cache.num_kv_heads as u32;
-            enc.set_compute_pipeline_state(&self.kv_append_attend_fused_pipeline);
+            enc.set_compute_pipeline_state(&self.attention.kv_append_attend_fused_pipeline);
             enc.set_buffer(0, Some(bufs.q_out), 0);
             enc.set_buffer(1, Some(&cache.k_cache), 0);
             enc.set_buffer(2, Some(&cache.v_cache), 0);
@@ -318,15 +318,15 @@ impl MetalBackend {
             ops::kv_cache::encode_kv_append(
                 enc,
                 &kv_cache.layers[layer_idx],
-                &self.kv_append_pipeline,
+                &self.attention.kv_append_pipeline,
                 bufs.k_out,
                 bufs.v_out,
             );
             ops::kv_cache::encode_kv_attend(
                 enc,
                 &kv_cache.layers[layer_idx],
-                &self.kv_attend_pipeline,
-                Some(&self.kv_attend_long_pipeline),
+                &self.attention.kv_attend_pipeline,
+                Some(&self.attention.kv_attend_long_pipeline),
                 bufs.q_out,
                 bufs.attn_out_buf,
                 layer_num_q_heads,
@@ -342,7 +342,7 @@ impl MetalBackend {
         if uses_q4k {
             use crate::metal::stages::quant_matvec::Pipelines;
             let pipes = Pipelines {
-                q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                q4kf_proj: Some(&self.attention.q4kf_proj_pipeline.state),
                 q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
                 q6k_matvec: &self.quant.q6k_matvec_pipeline,
                 q4_matvec: &self.q4.matvec,

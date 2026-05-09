@@ -102,9 +102,9 @@ impl MetalBackend {
             // Same dispatch-geometry-mismatch class as the q4_matvec_v4
             // ROADMAP ship-log entry.
             let qkv_pipeline = if layer.wq.format == crate::QuantFormat::Q4_KF {
-                &self.q4kf_qkv_proj_pipeline
+                &self.attention.q4kf_qkv_proj_pipeline
             } else {
-                &self.q4k_qkv_proj_pipeline
+                &self.attention.q4k_qkv_proj_pipeline
             };
             let num_tgs = (total_rows as u64).div_ceil(qkv_pipeline.rows_per_tg);
             enc_a.set_compute_pipeline_state(&qkv_pipeline.state);
@@ -142,7 +142,7 @@ impl MetalBackend {
             );
 
             let total_rows = (q_dim + kv_dim + kv_dim) as u32;
-            enc_a.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline.state);
+            enc_a.set_compute_pipeline_state(&self.attention.q8_qkv_proj_pipeline.state);
             enc_a.set_buffer(0, Some(&wq_buf), 0);
             enc_a.set_buffer(1, Some(&wk_buf), 0);
             enc_a.set_buffer(2, Some(&wv_buf), 0);
@@ -176,11 +176,11 @@ impl MetalBackend {
             );
             enc_a.dispatch_thread_groups(
                 MTLSize::new(
-                    (total_rows as u64).div_ceil(self.q8_qkv_proj_pipeline.rows_per_tg),
+                    (total_rows as u64).div_ceil(self.attention.q8_qkv_proj_pipeline.rows_per_tg),
                     1,
                     1,
                 ),
-                MTLSize::new(self.q8_qkv_proj_pipeline.threads_per_tg, 1, 1),
+                MTLSize::new(self.attention.q8_qkv_proj_pipeline.threads_per_tg, 1, 1),
             );
         }
 
@@ -193,7 +193,7 @@ impl MetalBackend {
 
             for qh in 0..layer_num_q_heads {
                 let offset = (qh * layer_head_dim * 4) as u64;
-                enc_a.set_compute_pipeline_state(&self.rope_at_pos_pipeline);
+                enc_a.set_compute_pipeline_state(&self.attention.rope_at_pos_pipeline);
                 enc_a.set_buffer(0, Some(&q_out), offset);
                 enc_a.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
                 enc_a.set_bytes(
@@ -210,7 +210,7 @@ impl MetalBackend {
             }
             for kvh in 0..layer_num_kv_heads {
                 let offset = (kvh * layer_head_dim * 4) as u64;
-                enc_a.set_compute_pipeline_state(&self.rope_at_pos_pipeline);
+                enc_a.set_compute_pipeline_state(&self.attention.rope_at_pos_pipeline);
                 enc_a.set_buffer(0, Some(&k_out), offset);
                 enc_a.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
                 enc_a.set_bytes(
@@ -255,15 +255,15 @@ impl MetalBackend {
             ops::kv_cache::encode_kv_append(
                 enc_b,
                 &kv_cache.layers[layer_idx],
-                &self.kv_append_pipeline,
+                &self.attention.kv_append_pipeline,
                 &k_out,
                 &v_out,
             );
             ops::kv_cache::encode_kv_attend(
                 enc_b,
                 &kv_cache.layers[layer_idx],
-                &self.kv_attend_pipeline,
-                Some(&self.kv_attend_long_pipeline),
+                &self.attention.kv_attend_pipeline,
+                Some(&self.attention.kv_attend_long_pipeline),
                 &q_out,
                 &attn_out,
                 layer_num_q_heads,
@@ -288,7 +288,7 @@ impl MetalBackend {
             let o_k = layer_q_dim as u32;
             let o_out = self.bufs.output((hidden * 4) as u64);
             let o_pipeline = if layer.wo.format == crate::QuantFormat::Q4_KF {
-                &self.q4kf_proj_pipeline
+                &self.attention.q4kf_proj_pipeline
             } else if layer.wo.format == crate::QuantFormat::Q6_K {
                 &self.quant.q6k_matvec_pipeline
             } else {

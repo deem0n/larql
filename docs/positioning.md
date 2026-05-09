@@ -4,8 +4,8 @@
 **Audience**: anyone framing what LARQL *is* and *is not* relative to the dominant inference engines.
 **Companion docs**:
 - `crates/larql-compute/docs/llama-cpp-comparison.md` — kernel-level Metal diff vs llama.cpp.
-- `ROADMAP.md` — top-level critical path.
-- `crates/larql-server/ROADMAP.md` § N0 — OpenAI API compatibility plan.
+- `ROADMAP.md` — top-level critical path; § "Engine purpose" for the load-bearing framing; § "ADR-019" for the MoE-substrate decision; § "Video pipeline" for the engineering↔video dependency map.
+- `crates/larql-server/ROADMAP.md` § N0 — OpenAI API compatibility plan (scope reduced — see roadmap implications below).
 
 ---
 
@@ -31,6 +31,46 @@ The aim demands competitive performance *now* and progress toward GPU-free *even
 LARQL is a research substrate — but substrate-for-its-own-sake isn't the goal. The substrate exists because the techniques that make the ultimate aim possible (sparse retrieval, hash routing, FP4, KV compression, expert sharding, AOT compilation, boundary refs) have to be developed *somewhere*. LARQL is that somewhere. Adoption, OpenAI-API ergonomics, multi-tenant batched serving, and other "production engine" concerns are out of scope except where they accelerate experiments or affect measurement credibility.
 
 **LARQL is not a production inference engine and will not become one** in the commercial sense. But it must operate at production-engine baseline performance on its leading device class — otherwise the techniques developed on it can't be credibly compared against state-of-the-art.
+
+### Achievability — conditionally yes, asymmetric across model class
+
+The aim is **achievable for MoE frontier models on consumer hardware**. That's where the field is going (DeepSeek-V3, Llama 4 Maverick, Gemma 4 26B-A4B, GPT-OSS family — all MoE).
+
+The arithmetic on a 671B MoE with 37B active params:
+
+| Stack | Bytes touched/token | tok/s @ 50 GB/s consumer DDR5 |
+|---|---|---|
+| Naïve dense over active experts | 18.5 GB | 2.7 |
+| + hash-routed FFN within active experts (5×, exp 27) | 5 GB | 10 |
+| + FP4 (2×, exp 26) | 2.5 GB | 20 |
+
+Tier-by-tier honest confidence:
+
+| Acceptance tier | Confidence |
+|---|---|
+| Short-term (Gemma 3 4B CPU within 10% of `llama.cpp -ngl 0`) | ~95% — pure engineering |
+| Medium-term (Gemma 4 26B-A4B at ≥10 tok/s on 64 GB consumer, no GPU) | ~80% — gated on V1+V2 |
+| Long-term (100B-class MoE at ≥5 tok/s, no GPU) | ~60% — adds disk-locality bet (V3) |
+| Ultimate (671B-class via consumer multi-machine grid) | ~40% — integration risk dominates; gated on re-promoting C9 per ADR-019 (multi-machine grid demoted to P2 2026-05-09) |
+| Dense frontier (if field stays dense at 1T+) | ~15% — needs research breakthroughs outside engineering control |
+
+The "100× combined effect" assumes techniques compound multiplicatively. ADR-015 ("isolated kernel speedup ≠ end-to-end win") says they often don't — and D-RMS-FUSE Phase 1 (2026-05-09) gave us a concrete falsification: predicted ~0.2 ms/tok savings collapsed to zero. **Four** load-bearing assumptions need falsifying *before* committing years to the build that rests on them (three isolated + one compound) — see **"P0 — Aim-validation tests (V1–V4)"** in `ROADMAP.md`. Those tests are currently the highest-leverage items on the entire roadmap.
+
+#### Known unknowns (from ROADMAP.md § "Engine purpose")
+
+The bandwidth math assumes the architecture cooperates with sparse retrieval. Five open questions could shift the achievability boundaries (full table in `ROADMAP.md`):
+
+- **KU1** — static-attention fraction at 31B scale (validated at 4B: 91.7%; if degrades, VID7 weakens and MTP acceptance drops).
+- **KU2** — softmax bottleneck above ~1,142-token RoPE distance (Q-side fixable; KV-side at last position not, with current architecture; BR4 is the workaround, not a fix).
+- **KU3** — FP4 friendliness across non-Gemma archs (V2 covers).
+- **KU4** — hash-routing compounding across all layers (V1 covers).
+- **KU5** — mmap thrash on disk-resident frontier models (V3 covers).
+
+KU3, KU4, KU5 are scheduled. KU1, KU2 are parked.
+
+#### ADR-019 resolved (2026-05-09)
+
+Substrate-primary model is **Gemma 4 31B dense + vindex**. MoE coverage retained at single-machine scale (Gemma 4 26B-A4B for cross-arch validation, virtual-expert work). Multi-machine MoE grid demoted to P2. Reasoning: vindex is MoE taken to its logical extreme (every fact is its own expert), and multi-machine production-engineering doesn't accelerate any current experiment. Full resolution + demotions/promotions tables in `ROADMAP.md` § "ADR-019".
 
 ### Baseline-credibility threshold (methodological, not commercial)
 
@@ -240,9 +280,10 @@ Re-tiered 2026-05-09 under the substrate framing. Each item is scored by *"does 
 | T1–T7, C1–C3 | Interpretability truthfulness + commit semantics | P0 | **KEEP — central**. Substrate that lies to you is worse than no substrate. |
 | MI4–MI8 | Rich attribution, causal operators, Q4K/MoE trace parity | P0 | **KEEP — central**. The substrate's plug-in surface lives here. |
 | R1–R5 | OV/RD → engine primitive promotion | P1 | **KEEP — exemplar pattern**. This *is* the substrate development model: experiments harden into engine APIs. |
+| R6 | Depth-fraction-law probe API as engine primitive | P1 | **KEEP — sequencing-critical**. Must land before MTP3; consumed by MTP3 (drafter activation extraction layer choice), virtual-expert dispatch (Act 3), grammar-mask routing. |
 | BR4–BR8 | Boundary refs (residual codec) server integration | P1 | **KEEP** — itself a research direction (Shannon-arc continuation). |
 | Coverage → 90% | larql-compute test coverage | P1 | **KEEP — load-bearing**. Measurement integrity needs correctness trust. |
-| Acts 1/2/3 demo narrative | Demo plan | n/a | **REFRAME** — not a product demo. The narrative still works but as *substrate communication*: Act 1 = "model is a database" (substrate pitch), Act 2 = experts elsewhere (substrate distribution), Act 3 = replace an expert (substrate manipulation). |
+| Acts 1/2/3/4 demo narrative | Demo plan | n/a | **REFRAME** — not a product demo. Act 1 = "model is a database" (substrate pitch); Act 2 = "experts are addressable" (reframed per ADR-019 — single-machine, not multi-machine); Act 3 = replace an expert (single-machine via VID4-style); Act 4 = "I killed attention" (gated on KU1 + MTP6, becomes video VID7). |
 | Critical-path #1–#2 (chat template + EOS, CLI streaming) | Demo unblocker | P0 | **KEEP only as needed by experiments**. If experiments operate at residual/weight level, EOS handling is downstream. If demos are the communication channel, ship #1 to make Act 1 work. |
 | OpenAI API surface (server N0) | OpenAI compat | n/a | **REDUCE SCOPE** — keep only what experiments call. Drop `/v1/completions`, `/v1/responses`, multimodal until an experiment needs them. |
 

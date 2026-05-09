@@ -66,6 +66,34 @@ from there.
   `larql_kv::apollo`; `mech_interp_demo.rs` uses
   `larql_inference::test_utils`.
 
+### kv-cache-benchmark cleanup
+
+After the extraction landed, `crates/kv-cache-benchmark/src/apollo/` still
+contained five orphan `.rs` files (`engine.rs`, `store.rs`, `routing.rs`,
+`entry.rs`, `npy.rs`) — pre-extraction copies that the `mod.rs` re-export
+shim didn't reference but had been kept around. Two `#[ignore]`'d
+`real-model`-feature demo tests (`tests/test_apollo_query.rs`,
+`tests/test_apollo_accuracy.rs`) called four demo helpers that lived only
+in the orphan `engine.rs` (`query_greedy_with_tokenizer`,
+`query_greedy_compressed`, `query_generate_compressed`,
+`query_generate_uncompressed`); the test build was failing on
+`--features real-model` as a result.
+
+All seven files were deleted as part of this cleanup. The
+`apollo-demo/apollo11_store` end-to-end harness can be reconstructed from
+git history if needed; the underlying functionality (routing, entry
+retrieval, boundary-residual injection) is exercised by the surviving
+larql-kv apollo unit tests plus the `kv-cache-benchmark` criterion bench.
+
+### Coverage at extraction
+
+After running `cargo llvm-cov --package larql-kv` plus `profiler.rs` test
+top-up, total line coverage is **69.82 %** (2 838 / 4 065 lines, 143 unit
+tests + 8 new profiler tests). 10 inherited files sit below the 90 %
+per-file floor and carry baselines in `coverage-policy.json` that may
+only ratchet upward. See [`ROADMAP.md`](ROADMAP.md) for the remediation
+list. `make larql-kv-coverage-policy` enforces the baselines.
+
 ### Rationale
 
 The four engines collectively share a trait and dispatch but diverge on

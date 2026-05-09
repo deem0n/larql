@@ -195,10 +195,10 @@ impl MetalBackend {
                 use crate::metal::stages::qkv_proj::FusedQkvKernel;
                 let (fused_pipe, fused_kernel) = match route {
                     QkvFormatRoute::UniformQ4Kf => {
-                        (&self.q4kf_qkv_proj_pipeline, FusedQkvKernel::Q4kf)
+                        (&self.attention.q4kf_qkv_proj_pipeline, FusedQkvKernel::Q4kf)
                     }
                     QkvFormatRoute::UniformQ4K => {
-                        (&self.q4k_qkv_proj_pipeline, FusedQkvKernel::Q4k)
+                        (&self.attention.q4k_qkv_proj_pipeline, FusedQkvKernel::Q4k)
                     }
                     _ => unreachable!("outer match restricts to Uniform*"),
                 };
@@ -225,7 +225,7 @@ impl MetalBackend {
             QkvFormatRoute::MixedQ4kQ6kV => {
                 // Geometry travels with the bound `KernelHandle` (mirrors the
                 // decode_hybrid Q4_K geometry-fix pattern).
-                let kh = &self.q4k_q6k_qkv_proj_pipeline;
+                let kh = &self.attention.q4k_q6k_qkv_proj_pipeline;
                 let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u64;
                 let num_tgs = total_rows.div_ceil(kh.rows_per_tg);
                 let q_rows_u = layer_q_dim as u32;
@@ -255,7 +255,7 @@ impl MetalBackend {
                 use crate::metal::stages::qkv_proj::{self, Proj};
                 use crate::metal::stages::quant_matvec::Pipelines;
                 let pipes = Pipelines {
-                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                    q4kf_proj: Some(&self.attention.q4kf_proj_pipeline.state),
                     q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
                     q6k_matvec: &self.quant.q6k_matvec_pipeline,
                     q4_matvec: &self.q4.matvec,
@@ -344,7 +344,7 @@ impl MetalBackend {
             let k_rows = layer_kv_dim as u32;
             let v_rows = layer_kv_dim as u32;
             let k_val = hidden as u32;
-            enc.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline.state);
+            enc.set_compute_pipeline_state(&self.attention.q8_qkv_proj_pipeline.state);
             enc.set_buffer(0, Some(bufs.wq), 0);
             enc.set_buffer(1, Some(bufs.wk), 0);
             enc.set_buffer(2, Some(bufs.wv), 0);
@@ -368,7 +368,7 @@ impl MetalBackend {
             use crate::metal::stages::qkv_proj::{self, Proj};
             use crate::metal::stages::quant_matvec::Pipelines;
             let pipes = Pipelines {
-                q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                q4kf_proj: Some(&self.attention.q4kf_proj_pipeline.state),
                 q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
                 q6k_matvec: &self.quant.q6k_matvec_pipeline,
                 q4_matvec: &self.q4.matvec,
@@ -438,7 +438,7 @@ impl MetalBackend {
         let v_u = layer_kv_dim as u32;
         let hidden_u = hidden as u32;
 
-        enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_normed_pipeline.state);
+        enc.set_compute_pipeline_state(&self.attention.q4k_q6k_qkv_proj_normed_pipeline.state);
         enc.set_buffer(0, Some(bufs.wq), 0);
         enc.set_buffer(1, Some(bufs.wk), 0);
         enc.set_buffer(2, Some(bufs.wv), 0);

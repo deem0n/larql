@@ -29,22 +29,22 @@ impl DecodeBackend for MetalBackend {
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
         {
-            &self.geglu_gelu_tanh_pipeline
+            &self.ffn.geglu_gelu_tanh_pipeline
         } else {
-            &self.geglu_pipeline
+            &self.ffn.geglu_pipeline
         };
         Some(ops::full_pipeline::dispatch_full_pipeline(
             &self.queue,
             &self.bufs,
             &self.q4,
             geglu,
-            &self.geglu_gelu_tanh_pipeline,
-            &self.silu_pipeline,
-            &self.gelu_tanh_pipeline,
+            &self.ffn.geglu_gelu_tanh_pipeline,
+            &self.ffn.silu_pipeline,
+            &self.ffn.gelu_tanh_pipeline,
             &self.quant.q8_quant_pipeline,
-            Some(&self.fused_attn_pipeline),
+            Some(&self.attention.fused_attn_pipeline),
             &self.quant.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline.state,
+            &self.attention.q8_qkv_proj_pipeline.state,
             &self.quant.q4k_matvec_pipeline,
             Some(&self.quant.q4k_matmul_pipeline),
             &self.quant.q6k_matvec_pipeline,
@@ -52,16 +52,16 @@ impl DecodeBackend for MetalBackend {
             &self.norms.residual_add_pipeline,
             &self.norms.rms_norm_q8_pipeline,
             &self.norms.residual_norm_q8_pipeline,
-            Some(&self.q4k_qkv_proj_pipeline.state),
-            Some(&self.q4kf_qkv_proj_pipeline.state),
-            Some(&self.q4kf_proj_pipeline.state),
+            Some(&self.attention.q4k_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_proj_pipeline.state),
             None,
             Some(&self.norms.qk_norm_pipeline),
             Some(&self.norms.scale_vector_pipeline),
-            Some(&self.q4k_geglu_silu_down_pipeline),
-            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
-            Some(&self.q6k_geglu_silu_down_pipeline),
-            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q4k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q6k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q6k_geglu_gelu_tanh_down_pipeline),
             None,
             layers,
             x,
@@ -105,9 +105,9 @@ impl DecodeBackend for MetalBackend {
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
         {
-            &self.geglu_gelu_tanh_pipeline
+            &self.ffn.geglu_gelu_tanh_pipeline
         } else {
-            &self.geglu_pipeline
+            &self.ffn.geglu_pipeline
         };
         let intervention = PipelineIntervention {
             target_layer,
@@ -123,13 +123,13 @@ impl DecodeBackend for MetalBackend {
             &self.bufs,
             &self.q4,
             geglu,
-            &self.geglu_gelu_tanh_pipeline,
-            &self.silu_pipeline,
-            &self.gelu_tanh_pipeline,
+            &self.ffn.geglu_gelu_tanh_pipeline,
+            &self.ffn.silu_pipeline,
+            &self.ffn.gelu_tanh_pipeline,
             &self.quant.q8_quant_pipeline,
-            Some(&self.fused_attn_pipeline),
+            Some(&self.attention.fused_attn_pipeline),
             &self.quant.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline.state,
+            &self.attention.q8_qkv_proj_pipeline.state,
             &self.quant.q4k_matvec_pipeline,
             Some(&self.quant.q4k_matmul_pipeline),
             &self.quant.q6k_matvec_pipeline,
@@ -137,16 +137,16 @@ impl DecodeBackend for MetalBackend {
             &self.norms.residual_add_pipeline,
             &self.norms.rms_norm_q8_pipeline,
             &self.norms.residual_norm_q8_pipeline,
-            Some(&self.q4k_qkv_proj_pipeline.state),
-            Some(&self.q4kf_qkv_proj_pipeline.state),
-            Some(&self.q4kf_proj_pipeline.state),
-            Some(&self.rope_at_pos_pipeline), // per-position RoPE — required for seq_len > 1
+            Some(&self.attention.q4k_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_proj_pipeline.state),
+            Some(&self.attention.rope_at_pos_pipeline), // per-position RoPE — required for seq_len > 1
             Some(&self.norms.qk_norm_pipeline),
             Some(&self.norms.scale_vector_pipeline),
-            Some(&self.q4k_geglu_silu_down_pipeline),
-            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
-            Some(&self.q6k_geglu_silu_down_pipeline),
-            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q4k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q6k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q6k_geglu_gelu_tanh_down_pipeline),
             None, // no KV cache — stateless prefill, each prompt independent
             layers,
             x,
@@ -206,9 +206,9 @@ impl DecodeBackend for MetalBackend {
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
         {
-            &self.geglu_gelu_tanh_pipeline
+            &self.ffn.geglu_gelu_tanh_pipeline
         } else {
-            &self.geglu_pipeline
+            &self.ffn.geglu_pipeline
         };
 
         // Concrete macro to avoid duplicating the 30-param dispatch call.
@@ -220,13 +220,13 @@ impl DecodeBackend for MetalBackend {
                     &self.bufs,
                     &self.q4,
                     geglu,
-                    &self.geglu_gelu_tanh_pipeline,
-                    &self.silu_pipeline,
-                    &self.gelu_tanh_pipeline,
+                    &self.ffn.geglu_gelu_tanh_pipeline,
+                    &self.ffn.silu_pipeline,
+                    &self.ffn.gelu_tanh_pipeline,
                     &self.quant.q8_quant_pipeline,
-                    Some(&self.fused_attn_pipeline),
+                    Some(&self.attention.fused_attn_pipeline),
                     &self.quant.q8_matvec_pipeline.state,
-                    &self.q8_qkv_proj_pipeline.state,
+                    &self.attention.q8_qkv_proj_pipeline.state,
                     &self.quant.q4k_matvec_pipeline,
                     Some(&self.quant.q4k_matmul_pipeline),
                     &self.quant.q6k_matvec_pipeline,
@@ -234,16 +234,16 @@ impl DecodeBackend for MetalBackend {
                     &self.norms.residual_add_pipeline,
                     &self.norms.rms_norm_q8_pipeline,
                     &self.norms.residual_norm_q8_pipeline,
-                    Some(&self.q4k_qkv_proj_pipeline.state),
-                    Some(&self.q4kf_qkv_proj_pipeline.state),
-                    Some(&self.q4kf_proj_pipeline.state),
-                    Some(&self.rope_at_pos_pipeline),
+                    Some(&self.attention.q4k_qkv_proj_pipeline.state),
+                    Some(&self.attention.q4kf_qkv_proj_pipeline.state),
+                    Some(&self.attention.q4kf_proj_pipeline.state),
+                    Some(&self.attention.rope_at_pos_pipeline),
                     Some(&self.norms.qk_norm_pipeline),
                     Some(&self.norms.scale_vector_pipeline),
-                    Some(&self.q4k_geglu_silu_down_pipeline),
-                    Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
-                    Some(&self.q6k_geglu_silu_down_pipeline),
-                    Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+                    Some(&self.ffn.q4k_geglu_silu_down_pipeline),
+                    Some(&self.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+                    Some(&self.ffn.q6k_geglu_silu_down_pipeline),
+                    Some(&self.ffn.q6k_geglu_gelu_tanh_down_pipeline),
                     Some(kv),
                     layers,
                     x,
@@ -353,9 +353,9 @@ impl DecodeBackend for MetalBackend {
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
         {
-            &self.geglu_gelu_tanh_pipeline
+            &self.ffn.geglu_gelu_tanh_pipeline
         } else {
-            &self.geglu_pipeline
+            &self.ffn.geglu_pipeline
         };
         let intervention = PipelineIntervention {
             target_layer,
@@ -372,13 +372,13 @@ impl DecodeBackend for MetalBackend {
             &self.bufs,
             &self.q4,
             geglu,
-            &self.geglu_gelu_tanh_pipeline,
-            &self.silu_pipeline,
-            &self.gelu_tanh_pipeline,
+            &self.ffn.geglu_gelu_tanh_pipeline,
+            &self.ffn.silu_pipeline,
+            &self.ffn.gelu_tanh_pipeline,
             &self.quant.q8_quant_pipeline,
-            Some(&self.fused_attn_pipeline),
+            Some(&self.attention.fused_attn_pipeline),
             &self.quant.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline.state,
+            &self.attention.q8_qkv_proj_pipeline.state,
             &self.quant.q4k_matvec_pipeline,
             Some(&self.quant.q4k_matmul_pipeline),
             &self.quant.q6k_matvec_pipeline,
@@ -386,16 +386,16 @@ impl DecodeBackend for MetalBackend {
             &self.norms.residual_add_pipeline,
             &self.norms.rms_norm_q8_pipeline,
             &self.norms.residual_norm_q8_pipeline,
-            Some(&self.q4k_qkv_proj_pipeline.state),
-            Some(&self.q4kf_qkv_proj_pipeline.state),
-            Some(&self.q4kf_proj_pipeline.state),
-            Some(&self.rope_at_pos_pipeline),
+            Some(&self.attention.q4k_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_proj_pipeline.state),
+            Some(&self.attention.rope_at_pos_pipeline),
             Some(&self.norms.qk_norm_pipeline),
             Some(&self.norms.scale_vector_pipeline),
-            Some(&self.q4k_geglu_silu_down_pipeline),
-            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
-            Some(&self.q6k_geglu_silu_down_pipeline),
-            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q4k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q6k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q6k_geglu_gelu_tanh_down_pipeline),
             None, // no KV cache
             layers,
             x,
@@ -470,9 +470,9 @@ impl DecodeBackend for MetalBackend {
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
         {
-            &self.geglu_gelu_tanh_pipeline
+            &self.ffn.geglu_gelu_tanh_pipeline
         } else {
-            &self.geglu_pipeline
+            &self.ffn.geglu_pipeline
         };
         let intervention = ops::full_pipeline::PipelineIntervention {
             target_layer,
@@ -488,13 +488,13 @@ impl DecodeBackend for MetalBackend {
             &self.bufs,
             &self.q4,
             geglu,
-            &self.geglu_gelu_tanh_pipeline,
-            &self.silu_pipeline,
-            &self.gelu_tanh_pipeline,
+            &self.ffn.geglu_gelu_tanh_pipeline,
+            &self.ffn.silu_pipeline,
+            &self.ffn.gelu_tanh_pipeline,
             &self.quant.q8_quant_pipeline,
-            Some(&self.fused_attn_pipeline),
+            Some(&self.attention.fused_attn_pipeline),
             &self.quant.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline.state,
+            &self.attention.q8_qkv_proj_pipeline.state,
             &self.quant.q4k_matvec_pipeline,
             Some(&self.quant.q4k_matmul_pipeline),
             &self.quant.q6k_matvec_pipeline,
@@ -502,16 +502,16 @@ impl DecodeBackend for MetalBackend {
             &self.norms.residual_add_pipeline,
             &self.norms.rms_norm_q8_pipeline,
             &self.norms.residual_norm_q8_pipeline,
-            Some(&self.q4k_qkv_proj_pipeline.state),
-            Some(&self.q4kf_qkv_proj_pipeline.state),
-            Some(&self.q4kf_proj_pipeline.state),
-            Some(&self.rope_at_pos_pipeline),
+            Some(&self.attention.q4k_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_proj_pipeline.state),
+            Some(&self.attention.rope_at_pos_pipeline),
             Some(&self.norms.qk_norm_pipeline),
             Some(&self.norms.scale_vector_pipeline),
-            Some(&self.q4k_geglu_silu_down_pipeline),
-            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
-            Some(&self.q6k_geglu_silu_down_pipeline),
-            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q4k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q6k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q6k_geglu_gelu_tanh_down_pipeline),
             Some(kv),
             layers,
             x,

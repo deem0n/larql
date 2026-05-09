@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-check-fast larql-compute-check-tests larql-compute-check-all larql-compute-test-metal-decode larql-compute-test-metal-lib larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples larql-kv-ci larql-kv-test larql-kv-fmt-check larql-kv-lint larql-kv-examples larql-kv-bench-test larql-kv-bench larql-kv-coverage larql-kv-coverage-summary larql-kv-coverage-html larql-kv-coverage-policy
 
 # Build
 build:
@@ -166,6 +166,73 @@ larql-vindex-coverage-html:
 
 larql-vindex-ci: larql-vindex-fmt-check larql-vindex-lint larql-vindex-test larql-vindex-examples larql-vindex-bench-test larql-vindex-coverage-summary
 
+# larql-kv — pluggable KV-cache engines (markov-rs, unlimited-context, turbo-quant, apollo)
+#
+# Default policy is 90% per-file line coverage; total floor tracks the
+# starting baseline and ratchets upward.
+LARQL_KV_COVERAGE_MIN ?= 69
+LARQL_KV_COVERAGE_POLICY ?= crates/larql-kv/coverage-policy.json
+LARQL_KV_COVERAGE_REPORT ?= coverage/larql-kv/summary.json
+
+larql-kv-test:
+	cargo test -p larql-kv
+
+larql-kv-fmt-check:
+	cargo fmt -p larql-kv -- --check
+
+larql-kv-lint:
+	cargo clippy -p larql-kv --all-targets -- -D warnings
+
+larql-kv-examples:
+	cargo check -p larql-kv --examples
+
+larql-kv-bench-test:
+	cargo test -p larql-kv --benches
+
+larql-kv-bench:
+	cargo bench -p larql-kv --bench engine_decode
+
+larql-kv-coverage-policy:
+	@if [ ! -f "$(LARQL_KV_COVERAGE_REPORT)" ]; then \
+		echo "Coverage report not found: $(LARQL_KV_COVERAGE_REPORT)"; \
+		echo "Run: make larql-kv-coverage-summary"; \
+		exit 1; \
+	fi
+	python3 scripts/check_coverage_policy.py $(LARQL_KV_COVERAGE_REPORT) $(LARQL_KV_COVERAGE_POLICY)
+
+larql-kv-coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-kv --fail-under-lines $(LARQL_KV_COVERAGE_MIN)
+	@mkdir -p coverage/larql-kv
+	cargo llvm-cov report --package larql-kv --json --summary-only --output-path $(LARQL_KV_COVERAGE_REPORT)
+	$(MAKE) larql-kv-coverage-policy
+
+larql-kv-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-kv --summary-only --fail-under-lines $(LARQL_KV_COVERAGE_MIN)
+	@mkdir -p coverage/larql-kv
+	cargo llvm-cov report --package larql-kv --json --summary-only --output-path $(LARQL_KV_COVERAGE_REPORT)
+	$(MAKE) larql-kv-coverage-policy
+
+larql-kv-coverage-html:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; exit 1; \
+	fi
+	cargo llvm-cov --package larql-kv --html --output-dir coverage/larql-kv --fail-under-lines $(LARQL_KV_COVERAGE_MIN)
+	cargo llvm-cov report --package larql-kv --json --summary-only --output-path $(LARQL_KV_COVERAGE_REPORT)
+	$(MAKE) larql-kv-coverage-policy
+	@echo "Report: coverage/larql-kv/html/index.html"
+
+larql-kv-ci: larql-kv-fmt-check larql-kv-lint larql-kv-test larql-kv-examples larql-kv-bench-test larql-kv-coverage-summary
+
 # larql-compute — CPU/Metal kernels and backend contracts
 #
 # Current local default-feature baseline: 93.59% line coverage from
@@ -182,6 +249,45 @@ larql-compute-test: larql-compute-test-fast
 # that have zero runnable tests on default-feature builds.
 larql-compute-test-fast:
 	cargo test -p larql-compute --lib
+
+# ── Iteration loops for refactor work (no test execution, just type-check) ──
+#
+# These shave 1–3 minutes off the inner refactor loop versus
+# `cargo test --tests --features metal` by skipping codegen and execution.
+# Use the smallest one that catches the change you're making, then promote
+# to `larql-compute-test-metal-decode` (executes the synthetic decode
+# integration suite) only when ready to validate runtime behaviour.
+
+# Fastest type-check — `lib` only, with the `metal` feature on so Metal
+# code is type-checked too. ~5–30 s warm. The right loop for refactors
+# that don't change test signatures (registry sweeps, env-flag plumbing,
+# struct rearrangements that keep field names).
+larql-compute-check-fast:
+	cargo check -p larql-compute --features metal --lib
+
+# Type-check `lib` + every integration-test binary under `tests/` with
+# the `metal` feature. ~30 s – 3 min depending on warm cache. Use when a
+# refactor renames or moves something that integration tests reach into
+# (e.g. `MetalBackend`'s public fields).
+larql-compute-check-tests:
+	cargo check -p larql-compute --features metal --tests
+
+# Same but also walks examples + benches — the most thorough type check
+# short of building everything. Catches breakage in `examples/diag_*`
+# and `benches/quant_matvec` etc that the `--tests` form misses.
+larql-compute-check-all:
+	cargo check -p larql-compute --features metal --tests --benches --examples
+
+# Run JUST the synthetic-decode integration test under `metal`. Smallest
+# end-to-end runtime validation — ~1–2 min cold, faster warm. Use after
+# `larql-compute-check-tests` passes, before declaring a refactor done.
+larql-compute-test-metal-decode:
+	cargo test -p larql-compute --features metal --test test_metal_decode_synthetic
+
+# Lib-test execution under `metal`. Adds the unit tests inside
+# `src/metal/**` to what `larql-compute-test-fast` covers.
+larql-compute-test-metal-lib:
+	cargo test -p larql-compute --features metal --lib
 
 # Full integration suite — turns on `heavy_tests` for the slow non-Metal
 # correctness/parity suites and walks every integration binary under

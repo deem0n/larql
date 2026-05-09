@@ -130,11 +130,11 @@ fn k_matvec_handle_contract() {
 fn ffn_gate_up_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_ffn_gate_up::Kernel>(
-        &metal.q4k_ffn_gate_up_pipeline,
+        &metal.ffn.q4k_ffn_gate_up_pipeline,
         "q4k_ffn_gate_up_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_ffn_gate_up::Kernel>(
-        &metal.q4kf_ffn_gate_up_pipeline,
+        &metal.ffn.q4kf_ffn_gate_up_pipeline,
         "q4kf_ffn_gate_up_pipeline",
     );
 }
@@ -145,23 +145,23 @@ fn ffn_gate_up_handle_contract() {
 fn qkv_proj_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_qkv_proj::QkvKernel>(
-        &metal.q4k_qkv_proj_pipeline,
+        &metal.attention.q4k_qkv_proj_pipeline,
         "q4k_qkv_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_qkv_proj::ProjKernel>(
-        &metal.q4k_proj_pipeline,
+        &metal.attention.q4k_proj_pipeline,
         "q4k_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_qkv_proj::QkvKernel>(
-        &metal.q4kf_qkv_proj_pipeline,
+        &metal.attention.q4kf_qkv_proj_pipeline,
         "q4kf_qkv_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_qkv_proj::ProjKernel>(
-        &metal.q4kf_proj_pipeline,
+        &metal.attention.q4kf_proj_pipeline,
         "q4kf_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_q6k_qkv_proj::Kernel>(
-        &metal.q4k_q6k_qkv_proj_pipeline,
+        &metal.attention.q4k_q6k_qkv_proj_pipeline,
         "q4k_q6k_qkv_proj_pipeline",
     );
 }
@@ -174,7 +174,7 @@ fn qkv_proj_handle_contract() {
 fn q8_qkv_proj_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q8_attn_proj::QkvKernel>(
-        &metal.q8_qkv_proj_pipeline,
+        &metal.attention.q8_qkv_proj_pipeline,
         "q8_qkv_proj_pipeline",
     );
 }
@@ -184,11 +184,11 @@ fn q8_qkv_proj_handle_contract() {
 fn geglu_down_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_geglu_down::SiluKernel>(
-        &metal.q4k_geglu_silu_down_pipeline,
+        &metal.ffn.q4k_geglu_silu_down_pipeline,
         "q4k_geglu_silu_down_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_geglu_down::GeluTanhKernel>(
-        &metal.q4k_geglu_gelu_tanh_down_pipeline,
+        &metal.ffn.q4k_geglu_gelu_tanh_down_pipeline,
         "q4k_geglu_gelu_tanh_down_pipeline",
     );
 }

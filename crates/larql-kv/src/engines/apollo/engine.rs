@@ -295,6 +295,105 @@ impl ApolloEngine {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+// ─── KvEngine impl ────────────────────────────────────────────────────────────
+
+impl KvEngine for ApolloEngine {
+    fn name(&self) -> &str {
+        "apollo"
+    }
+
+    fn info(&self) -> EngineInfo {
+        let windows = self.store.as_ref().map_or(0, |s| s.window_tokens.len());
+        let entries = self.store.as_ref().map_or(0, |s| s.entries.len());
+        let store_kb = self.store.as_ref().map_or(0, |s| s.total_bytes()) / 1024;
+        let crystal = self.store.as_ref().map_or(0, |s| s.manifest.crystal_layer);
+        let has_boundaries = self
+            .store
+            .as_ref()
+            .is_some_and(|s| !s.boundaries.is_empty());
+        let path = if has_boundaries {
+            format!("compressed(layer={crystal})")
+        } else {
+            "uncompressed".into()
+        };
+        EngineInfo {
+            name: "apollo".into(),
+            description: format!(
+                "retrieval+injection [{path}]: {windows} windows, {entries} entries, {store_kb}KB",
+            ),
+            backend: "cpu".into(),
+            config: format!(
+                "inject_layer={}, coef={}, top_k={}",
+                self.config.injection_layer, self.config.inject_coefficient, self.config.top_k,
+            ),
+        }
+    }
+
+    /// Prefill routes token_ids, retrieves entries, builds the injection delta,
+    /// and runs the forward pass.
+    ///
+    /// **Compressed path** (when store has boundary residuals): runs only
+    /// `crystal_layer..num_layers` (~4 layers for Gemma 3 4B), ~8.5× faster.
+    ///
+    /// **Uncompressed path** (no boundaries): full forward over window+query tokens.
+    fn prefill(&mut self, weights: &ModelWeights, token_ids: &[u32]) -> Option<Array2<f32>> {
+        if self.routing.is_empty() {
+            let store = self.store.as_ref()?;
+            self.routing = RoutingIndex::from_store(store);
+        }
+
+        let (context, delta, boundary, crystal) = self.prepare_injection(weights, token_ids)?;
+        let perturb = Some((self.config.injection_layer, delta.view()));
+
+        let raw = if let Some(ref bnd) = boundary {
+            // Compressed: boundary residual acts as position-0; skip layers 0..crystal.
+            forward_from_layer(weights, token_ids, bnd, crystal, perturb)
+        } else {
+            forward_raw_logits(weights, &context, perturb)
+        };
+
+        // Cache decode state.
+        self.context_tokens = if boundary.is_some() {
+            token_ids.to_vec() // compressed: just the query
+        } else {
+            context
+        };
+        self.injection_delta = Some(delta);
+        self.boundary_residual = boundary;
+        self.crystal_layer = crystal;
+
+        let last = raw.h_pre_norm.shape()[0] - 1;
+        Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
+    }
+
+    /// Extend by one token. Uses the boundary compressed path when available
+    /// (4 layers), otherwise full 34-layer re-forward.
+    fn decode_step(&mut self, weights: &ModelWeights, token_id: u32) -> Option<Array2<f32>> {
+        self.context_tokens.push(token_id);
+        let delta = self.injection_delta.as_ref()?;
+        let perturb = Some((self.config.injection_layer, delta.view()));
+
+        let raw = if let Some(ref bnd) = self.boundary_residual {
+            // Compressed: re-run only crystal_layer..num_layers over growing query.
+            forward_from_layer(
+                weights,
+                &self.context_tokens,
+                bnd,
+                self.crystal_layer,
+                perturb,
+            )
+        } else {
+            forward_raw_logits(weights, &self.context_tokens, perturb)
+        };
+
+        let last = raw.h_pre_norm.shape()[0] - 1;
+        Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.store.as_ref().map_or(0, |s| s.total_bytes())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,102 +607,3 @@ mod tests {
     }
 }
 
-// ─── KvEngine impl ────────────────────────────────────────────────────────────
-
-impl KvEngine for ApolloEngine {
-    fn name(&self) -> &str {
-        "apollo"
-    }
-
-    fn info(&self) -> EngineInfo {
-        let windows = self.store.as_ref().map_or(0, |s| s.window_tokens.len());
-        let entries = self.store.as_ref().map_or(0, |s| s.entries.len());
-        let store_kb = self.store.as_ref().map_or(0, |s| s.total_bytes()) / 1024;
-        let crystal = self.store.as_ref().map_or(0, |s| s.manifest.crystal_layer);
-        let has_boundaries = self
-            .store
-            .as_ref()
-            .is_some_and(|s| !s.boundaries.is_empty());
-        let path = if has_boundaries {
-            format!("compressed(layer={crystal})")
-        } else {
-            "uncompressed".into()
-        };
-        EngineInfo {
-            name: "apollo".into(),
-            description: format!(
-                "retrieval+injection [{path}]: {windows} windows, {entries} entries, {store_kb}KB",
-            ),
-            backend: "cpu".into(),
-            config: format!(
-                "inject_layer={}, coef={}, top_k={}",
-                self.config.injection_layer, self.config.inject_coefficient, self.config.top_k,
-            ),
-        }
-    }
-
-    /// Prefill routes token_ids, retrieves entries, builds the injection delta,
-    /// and runs the forward pass.
-    ///
-    /// **Compressed path** (when store has boundary residuals): runs only
-    /// `crystal_layer..num_layers` (~4 layers for Gemma 3 4B), ~8.5× faster.
-    ///
-    /// **Uncompressed path** (no boundaries): full forward over window+query tokens.
-    fn prefill(&mut self, weights: &ModelWeights, token_ids: &[u32]) -> Option<Array2<f32>> {
-        if self.routing.is_empty() {
-            let store = self.store.as_ref()?;
-            self.routing = RoutingIndex::from_store(store);
-        }
-
-        let (context, delta, boundary, crystal) = self.prepare_injection(weights, token_ids)?;
-        let perturb = Some((self.config.injection_layer, delta.view()));
-
-        let raw = if let Some(ref bnd) = boundary {
-            // Compressed: boundary residual acts as position-0; skip layers 0..crystal.
-            forward_from_layer(weights, token_ids, bnd, crystal, perturb)
-        } else {
-            forward_raw_logits(weights, &context, perturb)
-        };
-
-        // Cache decode state.
-        self.context_tokens = if boundary.is_some() {
-            token_ids.to_vec() // compressed: just the query
-        } else {
-            context
-        };
-        self.injection_delta = Some(delta);
-        self.boundary_residual = boundary;
-        self.crystal_layer = crystal;
-
-        let last = raw.h_pre_norm.shape()[0] - 1;
-        Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
-    }
-
-    /// Extend by one token. Uses the boundary compressed path when available
-    /// (4 layers), otherwise full 34-layer re-forward.
-    fn decode_step(&mut self, weights: &ModelWeights, token_id: u32) -> Option<Array2<f32>> {
-        self.context_tokens.push(token_id);
-        let delta = self.injection_delta.as_ref()?;
-        let perturb = Some((self.config.injection_layer, delta.view()));
-
-        let raw = if let Some(ref bnd) = self.boundary_residual {
-            // Compressed: re-run only crystal_layer..num_layers over growing query.
-            forward_from_layer(
-                weights,
-                &self.context_tokens,
-                bnd,
-                self.crystal_layer,
-                perturb,
-            )
-        } else {
-            forward_raw_logits(weights, &self.context_tokens, perturb)
-        };
-
-        let last = raw.h_pre_norm.shape()[0] - 1;
-        Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
-    }
-
-    fn memory_bytes(&self) -> usize {
-        self.store.as_ref().map_or(0, |s| s.total_bytes())
-    }
-}

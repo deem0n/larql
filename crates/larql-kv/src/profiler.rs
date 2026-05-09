@@ -130,3 +130,140 @@ impl EngineProfiler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn stage_accumulator_avg_us_zero_when_empty() {
+        let acc = StageAccumulator::default();
+        assert_eq!(acc.avg_us(), 0.0);
+        assert_eq!(acc.count, 0);
+    }
+
+    #[test]
+    fn stage_accumulator_records_and_averages() {
+        let mut acc = StageAccumulator::default();
+        for _ in 0..3 {
+            let t = Instant::now();
+            sleep(Duration::from_micros(50));
+            acc.record(t);
+        }
+        assert_eq!(acc.count, 3);
+        assert!(acc.total_us >= 150.0, "expected ≥150 µs, got {}", acc.total_us);
+        let avg = acc.avg_us();
+        assert!(avg >= 50.0, "expected avg ≥50 µs, got {avg}");
+    }
+
+    #[test]
+    fn stage_accumulator_clone_preserves_state() {
+        let mut acc = StageAccumulator::default();
+        let t = Instant::now();
+        sleep(Duration::from_micros(10));
+        acc.record(t);
+        let copy = acc.clone();
+        assert_eq!(copy.count, acc.count);
+        assert_eq!(copy.total_us, acc.total_us);
+    }
+
+    #[test]
+    fn engine_profiler_summary_reflects_decode_total_steps() {
+        let mut prof = EngineProfiler::default();
+        for _ in 0..5 {
+            prof.decode_total.record(Instant::now());
+        }
+        let summary = prof.summary("test-engine", "cpu");
+        assert_eq!(summary.engine, "test-engine");
+        assert_eq!(summary.backend, "cpu");
+        assert_eq!(summary.steps, 5);
+        assert_eq!(summary.avg_embed_us, 0.0);
+        assert_eq!(summary.avg_attention_us, 0.0);
+    }
+
+    #[test]
+    fn engine_profiler_summary_carries_per_stage_averages() {
+        let mut prof = EngineProfiler::default();
+        let t = Instant::now();
+        sleep(Duration::from_micros(20));
+        prof.embed.record(t);
+        prof.attention.record(t);
+        prof.ffn.record(t);
+        prof.decode_total.record(t);
+
+        let s = prof.summary("e", "metal");
+        assert!(s.avg_embed_us > 0.0);
+        assert!(s.avg_attention_us > 0.0);
+        assert!(s.avg_ffn_us > 0.0);
+        assert!(s.avg_total_decode_us > 0.0);
+        assert_eq!(s.avg_recompute_total_us(), 0.0);
+    }
+
+    #[test]
+    fn decode_stage_summary_recompute_total_sums_tiers() {
+        let s = DecodeStageSummary {
+            engine: "x".into(),
+            backend: "cpu".into(),
+            steps: 1,
+            avg_embed_us: 0.0,
+            avg_recompute_cold_us: 12.0,
+            avg_recompute_hot_us: 8.0,
+            avg_attention_us: 0.0,
+            avg_ffn_us: 0.0,
+            avg_total_decode_us: 0.0,
+        };
+        assert_eq!(s.avg_recompute_total_us(), 20.0);
+    }
+
+    #[test]
+    fn decode_stage_summary_print_with_recompute() {
+        // Smoke test that print() handles both branches (recompute_total > 0
+        // and == 0). Output goes to stdout — captured by the test harness.
+        let with_recompute = DecodeStageSummary {
+            engine: "markov-rs".into(),
+            backend: "cpu".into(),
+            steps: 10,
+            avg_embed_us: 100.0,
+            avg_recompute_cold_us: 500.0,
+            avg_recompute_hot_us: 300.0,
+            avg_attention_us: 1500.0,
+            avg_ffn_us: 800.0,
+            avg_total_decode_us: 3200.0,
+        };
+        with_recompute.print();
+
+        let no_recompute = DecodeStageSummary {
+            engine: "turbo-quant".into(),
+            backend: "metal".into(),
+            steps: 0,
+            avg_embed_us: 0.0,
+            avg_recompute_cold_us: 0.0,
+            avg_recompute_hot_us: 0.0,
+            avg_attention_us: 0.0,
+            avg_ffn_us: 0.0,
+            avg_total_decode_us: 0.0,
+        };
+        // total == 0 hits the fallback branch in `pct`.
+        no_recompute.print();
+    }
+
+    #[test]
+    fn decode_stage_summary_clone_is_independent() {
+        let s = DecodeStageSummary {
+            engine: "a".into(),
+            backend: "b".into(),
+            steps: 1,
+            avg_embed_us: 1.0,
+            avg_recompute_cold_us: 2.0,
+            avg_recompute_hot_us: 3.0,
+            avg_attention_us: 4.0,
+            avg_ffn_us: 5.0,
+            avg_total_decode_us: 15.0,
+        };
+        let copy = s.clone();
+        assert_eq!(copy.steps, s.steps);
+        assert_eq!(copy.avg_total_decode_us, s.avg_total_decode_us);
+    }
+}

@@ -135,7 +135,7 @@ fn append_one(
     encode_kv_append(
         enc,
         cache,
-        &metal.kv_append_pipeline,
+        &metal.attention.kv_append_pipeline,
         &new_k_buf,
         &new_v_buf,
     );
@@ -162,8 +162,8 @@ fn attend(
     encode_kv_attend(
         enc,
         cache,
-        &metal.kv_attend_pipeline,
-        Some(&metal.kv_attend_long_pipeline),
+        &metal.attention.kv_attend_pipeline,
+        Some(&metal.attention.kv_attend_long_pipeline),
         &q_buf,
         &out_buf,
         num_q,

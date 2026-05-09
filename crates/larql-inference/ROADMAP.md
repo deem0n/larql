@@ -1,6 +1,45 @@
 # Roadmap — larql-inference
 
-## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines
+## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 631 lib tests | 53.11% line cov
+
+## Recommended next (priority order, 2026-05-09)
+
+Curated from the open work below. Each item links to the section that owns the
+detail.
+
+1. **A1-A3 — heterogeneous attention geometry** — *confirmed blocker*. Until A1-A3
+   land, Gemma 4 31B local Metal is dead (immediate-EOS at L5). Workaround in
+   place via remote-FFN batch but slow (6.5 tok/s on the same machine). See
+   "Open: Model architecture independence hardening".
+
+2. **G-3 (= G-4) — flash-attention-style fused attention kernel** — highest
+   GPU-fwd lever after G-1/G-2 missed. Stub at
+   `crates/larql-compute/src/metal/shaders/fused_attention.rs`; collapse
+   RoPE + QK_norm + KV_append + KV_attend into 1-2 dispatches → ~0.85 ms/tok
+   recoverable, projects to 95-105 tok/s on Gemma 3 4B (ollama parity). See
+   "Open: GPU-forward kernel utilization" → G-3 / G-4 (canonical entry: G-3).
+
+3. **Finish hardening H8/H9/H11/H12** — the four partial items from the
+   2026-05-09 cleanup pass: more env-vars behind typed config (H8), narrower
+   crate root surface (H9), more model-family branching pushed into
+   architecture/tokenizer policy (H11), and continued split of large
+   orchestration files (H12: `layer_graph/grid.rs`, `generate/gpu.rs`,
+   `moe_remote/shard.rs`). See "Open: inference crate hardening".
+
+4. **R4 — research trace export contract** — only remaining R-item from the
+   mech-interp engine surface; unblocks MI4 onwards. See "Open: Mechanistic
+   research engine surface" → R4.
+
+5. **MI4 — golden parity tests for WalkFfn + patched-vindex** — dense and
+   custom-backend parity already pinned; add the same for vindex-backed paths
+   so MI5/6/7 attribution and patching work has a regression net. See "P0:
+   Best-in-class mechanistic interpretability engine".
+
+6. **P1 mechanical backlog** (parallelisable, low risk) — synthetic e2e test
+   for `generate()` (currently `#[ignore]` only); per-file 90% floor work for
+   the 84 files still below; the deferred structure moves (`capture.rs →
+   trace/`, `residual.rs → forward/norm.rs`, `predict.rs` 700-LOC split). See
+   "P1: Test coverage gaps", "P1: Structure & file layout", "P1: Quality bugs".
 
 ## Open: Mechanistic research engine surface — Q4K interventions for OV/RD
 
@@ -492,9 +531,15 @@ Stretch goal: **~95-100 tok/s, ollama parity**.
 
 ### G-3 — Flash-attention-style fused attention kernel (HIGH PRIORITY)
 
-**Status**: Open. Larger lift than G-2 but orthogonal — attacks
-**dispatch overhead** (~1.0 ms/tok savings) rather than per-kernel
-utilization.
+**Status**: Open. Canonical entry for the flash-attention work — see
+also `G-3' DEPRECATED` below (preserved cross-reference) and `G-4`
+which restates the same task with newer dispatch-count framing after
+the 2026-05-01 fusion experiments shipped. Treat this entry as the
+plan of record; the duplicate `G-4` block exists because the dispatch-
+count diagnosis was rewritten after G-1/G-2/G-2' all missed.
+
+Larger lift than G-2 but orthogonal — attacks **dispatch overhead**
+(~1.0 ms/tok savings) rather than per-kernel utilization.
 
 **Current decode dispatch chain per layer**: ~11 dispatches × 34
 layers = ~374 dispatches/tok × ~5 µs each = **1.87 ms/tok overhead**.
@@ -1519,7 +1564,13 @@ Added `# Diagnostics` section to module doc.
 
 ## P1: Test coverage gaps
 
-From 2026-04-26 coverage review (50.45% line coverage).
+Baseline 2026-04-26: 50.45% line coverage.
+Current 2026-05-09: **53.11% line coverage, 631 lib tests, 32/116 files at ≥90% per-file floor (84 below).**
+
+Most of the remaining gap is concentrated in:
+- 33 files at **0% line coverage** — GPU dispatch (`generate/gpu.rs`), Q4_K integration paths (`vindex/q4k_forward/*`), remote-shard orchestration (`grid/remote_*`, `ffn/moe_remote/*`). Mostly need real model fixtures or running services to cover.
+- 9 files at 1-29% — `attention/gpu.rs`, `forward/memit.rs`, `ffn/remote/http.rs`, `vindex/walk_ffn/sparse.rs`. Reachable with synthetic weights + tempfile fixtures.
+- 17 files at 70-89% — mechanical floor lifts (the 80-89% bucket cleared 2026-05-09).
 
 ### Critical
 
@@ -1702,3 +1753,17 @@ gap was somewhere in the wrapping, sampling, or routing logic.
 | `larql parity --component lm-head` works on dense | 2026-04-30 | Dropped the MoE-only gate for `lm-head` (Q4_K vs f32 reference is backend-agnostic) |
 | `test_logits_goldens.rs` compile fix + 5 new entries | 2026-04-30 | Added missing `None` for `predict_q4k_hidden`'s `Option<&RemoteMoeBackend>`; refreshed stale 5 goldens to match current kernel state; added `gemma3-4b-q4k-downq4k` (Q4_K-down regression test), `gemma4-31b-q4k-q6kdown` (Q6_K-down dense), `gemma4-e2b-q4k` (PLE auto-route) — 13/13 passing |
 | Discovered: in-process Metal MoE path (`gpu_moe_dispatch_with_scratch`) shares the bug | 2026-04-30 | Until now nobody had run `larql run --metal` on Gemma 4 26B-A4B (the gRPC grid was the only tested path). It produces the same wrong text as the server's Metal expert dispatch ("answer is in the context" instead of "Paris"). The gRPC-with-CPU-experts path has been the only working route all along — the in-process Metal MoE was always broken for this model. See `larql-compute/ROADMAP.md` "Open: Metal MoE expert kernel — accuracy bug at inter=704" for the kernel-side fix plan |
+
+### 2026-05-09 — Cleanup pass: blanket allows, f16 codec, raw.rs dedup, coverage lift
+
+Source surgery + targeted test work that doesn't change behaviour. All public APIs preserved.
+
+| Item | Date | Impact |
+|------|------|--------|
+| Drop `lib.rs` blanket `#![allow(...)]` (28 lints) | 2026-05-09 | Surfaced 31 real warnings hidden behind `dead_code` / `unused_imports` / `private_interfaces` / `deprecated` / etc. All fixed (deleted dead helpers + structs, cleaned imports, fixed `into_shape` deprecation, fixed `UdsState` privacy, fixed dead V cosine in turbo_quant test) |
+| `ffn/moe_remote/wire.rs` f16 codec → `half` crate | 2026-05-09 | Removed ~85 lines of hand-rolled IEEE-754 binary16 conversion; replaced with `half::f16::from_f32().to_bits()` / `from_bits().to_f32()`. All 6 existing f16 round-trip tests still pass bit-for-bit |
+| `capture.rs::current_date` Gregorian leap-year fix | 2026-05-09 | Old impl divided days by 365 / months by 30 — drifted weeks per year. Rewrote with proper leap-year arithmetic; `extraction_date` field in every `VectorFileHeader` now correct. 7 new date tests (epoch zero, 2024 leap boundaries, century rule for 2000, format guards) |
+| `forward/predict/raw.rs` dedup | 2026-05-09 | `forward_raw_logits_with_prefix` and `forward_from_layer` were ~70% identical; collapsed into a private `forward_layer_range(prefix, layer_range)` core. Three copies of the softcap reduction → single `apply_logits_transform`. ~120 dup lines gone |
+| `lib.rs` re-exports trimmed | 2026-05-09 | Dropped 8 `larql_compute::*` proxies with no external consumers via `larql_inference::*`: `cpu_moe_forward`, `ComputeActivation`, `CpuBackend`, `MoeLayerWeights`, `dot_proj_gpu`, `matmul_gpu`, `MatMulOp`, `MetalBackend`. Callers `use larql_compute::*` directly |
+| Chat-template stack cross-references | 2026-05-09 | `prompt.rs` (heuristic enum), `chat/` (Jinja+vindex), `chat_session::TurnRenderer` (incremental) are complementary, not redundant — added module-level docs cross-referencing each so the boundary is discoverable. Original review's "collapse" recommendation was incorrect (3 external consumers depend on `prompt::ChatTemplate`) |
+| Coverage: 80-89% bucket → ≥90% | 2026-05-09 | 8 files lifted across the per-file 90% floor: `chat/render.rs` 82.64→99.44%, `experts/session.rs` 85.15→95.22%, `ffn/moe_remote/config.rs` 86.90→100%, `ffn/moe_remote/wire.rs` 81.76→99.75%, `forward/patching.rs` 83.77→89.96% (last gap is unreachable defensive guard), `layer_graph/logits.rs` 82.52→96.83% (inline tempfile fixture for `lm_head.bin`), `trace/capture.rs` 89.87→90.55%, `trace/store.rs` 85.22→98.37%. +56 tests, 575→631 lib tests |

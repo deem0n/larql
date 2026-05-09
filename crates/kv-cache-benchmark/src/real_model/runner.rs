@@ -16,14 +16,13 @@
 use larql_compute::ComputeBackend;
 use larql_kv::accuracy::compare_hidden;
 use larql_kv::markov_residual::kv_memory_bytes_for_seq;
-use larql_kv::{EngineKind, KvEngine};
+use larql_kv::EngineKind;
 use larql_inference::forward::{hidden_to_raw_logits, logits_to_predictions_pub};
 use larql_inference::model::ModelWeights;
 use larql_vindex::VectorIndex;
 
 use super::graph_walk_layer;
 use super::kv_capture;
-use super::markov_layer;
 use super::turboquant_layer;
 use crate::turboquant::TurboQuant;
 

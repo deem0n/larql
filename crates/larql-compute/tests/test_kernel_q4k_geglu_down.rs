@@ -81,9 +81,9 @@ fn metal_fused_geglu_down(
 ) -> Vec<f32> {
     use larql_compute::metal::shaders::q4k_geglu_down as gd;
     let kernel = if silu {
-        &metal.q4k_geglu_silu_down_pipeline
+        &metal.ffn.q4k_geglu_silu_down_pipeline
     } else {
-        &metal.q4k_geglu_gelu_tanh_down_pipeline
+        &metal.ffn.q4k_geglu_gelu_tanh_down_pipeline
     };
 
     let w_buf = metal.bufs().get_bytes(w_down_q4k);

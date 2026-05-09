@@ -306,7 +306,7 @@ impl MetalBackend {
         // constants, so a future bump of the field to a different
         // simdgroup variant doesn't silently drop rows. Same dispatch-
         // geometry-mismatch class as the q4_matvec_v4 ROADMAP entry.
-        let gate_up_kh = &self.q4k_ffn_gate_up_pipeline;
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_pipeline;
         let tgs_per_mat = (inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
         for (e, (gate_up_buf, _)) in expert_bufs.iter().enumerate().take(valid_count) {
@@ -334,7 +334,7 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
-            enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+            enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
             enc.set_buffer(0, Some(&scratch.g_out), g_offset);
             enc.set_buffer(1, Some(&scratch.u_out), u_offset);
             enc.set_buffer(2, Some(&scratch.act_buf), a_offset);
@@ -513,7 +513,7 @@ impl MetalBackend {
         // q4k_ffn_gate_up over all valid_count experts at once.
         // Geometry travels with the `KernelHandle` (see `decode_hybrid.rs`
         // ship-log entry on this bug class).
-        let gate_up_kh = &self.q4k_ffn_gate_up_pipeline;
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_pipeline;
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
         let tgs = (valid_count as u64 * inter as u64).div_ceil(gate_up_kh.rows_per_tg);
@@ -537,7 +537,7 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
-            enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+            enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
             enc.set_buffer(0, Some(&scratch.g_out), g_offset);
             enc.set_buffer(1, Some(&scratch.u_out), u_offset);
             enc.set_buffer(2, Some(&scratch.act_buf), a_offset);
@@ -643,7 +643,7 @@ impl MetalBackend {
         // 1. q4k_ffn_gate_up_8sg — gate and up projections.
         // Geometry pulled from the bound `KernelHandle` so a future
         // pipeline swap can't drift from the dispatched TG shape.
-        let gate_up_kh = &self.q4k_ffn_gate_up_8sg_pipeline;
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_8sg_pipeline;
         let n_rows = inter as u32;
         let k_cols = hidden as u32;
         let n_tgs = (inter as u64).div_ceil(gate_up_kh.rows_per_tg);
@@ -662,7 +662,7 @@ impl MetalBackend {
 
         // 2. geglu_gelu_tanh activation.
         let inter_u32 = inter as u32;
-        enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+        enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
         enc.set_buffer(0, Some(&gate_out), 0);
         enc.set_buffer(1, Some(&up_out), 0);
         enc.set_buffer(2, Some(&act_buf), 0);
@@ -805,7 +805,7 @@ impl MetalBackend {
         // ── 4. q4k_ffn_gate_up over all valid_count experts at once ──────
         // Geometry travels with the `KernelHandle`; no shader-module
         // ROWS_PER_TG/THREADS_PER_TG re-imports.
-        let gate_up_kh = &self.q4k_ffn_gate_up_pipeline;
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_pipeline;
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
         let tgs = (valid_count as u64 * inter as u64).div_ceil(gate_up_kh.rows_per_tg);
@@ -833,7 +833,7 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
-            enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+            enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
             enc.set_buffer(0, Some(&scratch.g_out), g_offset);
             enc.set_buffer(1, Some(&scratch.u_out), u_offset);
             enc.set_buffer(2, Some(&scratch.act_buf), a_offset);

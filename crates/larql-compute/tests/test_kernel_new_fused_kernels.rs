@@ -165,7 +165,7 @@ fn q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_normed_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4k_q6k_qkv_proj_normed_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);
@@ -306,7 +306,7 @@ fn q4k_q6k_qkv_proj_normed_matches_at_production_hidden() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_normed_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4k_q6k_qkv_proj_normed_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);

@@ -12,6 +12,23 @@
   - `kv-cache-benchmark` (criterion comparison vs Standard KV / Graph Walk)
 - Coverage policy: 90 % line coverage per source file (see
   `coverage-policy.json`); CI gate at `make larql-kv-coverage-policy`.
+  Total line coverage is **69.82 %** at extraction time (2026-05-09);
+  10 files carry debt baselines that must ratchet upward, never down.
+
+## Coverage debt (extraction-time, ratchet upward)
+
+| File | Current | Target |
+|---|---:|---:|
+| `engines/markov_residual/q4k.rs` | 0.0 % | 90 % — Metal-only path; needs `cfg(feature = "metal")` test harness or a CPU-side dequant fixture. |
+| `engines/apollo/store.rs` | 17.8 % | 90 % — needs `ApolloStore` round-trip tests against a synthetic constellation. |
+| `engines/unlimited_context/engine.rs` | 47.8 % | 90 % — Q4K Metal entry points + checkpoint reload still uncovered. |
+| `engines/apollo/npy.rs` | 58.2 % | 90 % — npy reader; needs zero-d / mismatched-dtype error paths. |
+| `engines/apollo/engine.rs` | 72.0 % | 90 % — `forward_from_layer` injection + the q4k decode_token branch. |
+| `engines/markov_residual/engine.rs` | 72.0 % | 90 % — Metal entry points and the profiling-disabled fallback. |
+| `engines/markov_residual/compute.rs` | 73.6 % | 90 % — sliding-window eviction edge cases. |
+| `engines/unlimited_context/extend.rs` | 74.6 % | 90 % — checkpoint extend with non-empty prior. |
+| `engines/turbo_quant/engine.rs` | 79.7 % | 90 % — engine wrapper around the bit-clean codec. |
+| `lib.rs` | 84.8 % | 90 % — `EngineKind::build_with_profiling` for the three non-markov engines (markov is the only one that currently consumes the profiling flag). |
 
 ## Open work
 

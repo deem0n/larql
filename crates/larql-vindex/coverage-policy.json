@@ -17,7 +17,6 @@
     "crates/larql-vindex/src/extract/build/down_meta.rs": 66.0,
     "crates/larql-vindex/src/extract/build/index_json.rs": 84.0,
     "crates/larql-vindex/src/extract/build/mod.rs": 89.0,
-    "crates/larql-vindex/src/extract/build_helpers.rs": 22.0,
     "crates/larql-vindex/src/extract/streaming/context.rs": 88.0,
     "crates/larql-vindex/src/extract/streaming/stages/down_meta.rs": 84.0,
     "crates/larql-vindex/src/extract/streaming/stages/router_weights.rs": 87.0,

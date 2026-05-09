@@ -251,24 +251,30 @@ cargo test -p larql-inference
 cargo test -p larql-vindex --test test_hnsw --release
 
 # Individual test suites
-cargo test -p larql-inference --test test_fused_attention   # 23 tests
-cargo test -p larql-inference --test test_backend           # 13 tests
-cargo test -p larql-inference --test test_modules           # 15 tests
-cargo test -p larql-inference --test test_trace             # 14 tests
-cargo test -p larql-inference --test test_walkers           # 12 tests
-cargo test -p larql-inference --test test_walker_utils      # 10 tests
+cargo test -p larql-inference --test test_fused_attention             # 23 tests
+cargo test -p larql-inference --test test_backend                     # 19 tests
+cargo test -p larql-inference --test test_modules                     # 15 tests
+cargo test -p larql-inference --test test_trace                       # 14 tests
+cargo test -p larql-inference --test test_logits_goldens              # 13 tests
+cargo test -p larql-inference --test test_arch_golden                 # 10 tests
+cargo test -p larql-inference --test test_layer_graph_integration     #  7 tests
+cargo test -p larql-inference --test test_decode_consistency          #  5 tests
 ```
+
+Walker tests live in `larql-vindex`; weight-level walkers moved out of this crate.
 
 | Area | Tests | Coverage |
 |------|-------|----------|
 | Generation: EOS / detok / sampling / chat session | 38 | Builtin stops, special-token EOS via tokenizer fallback, leading-space, seed reproducibility, top-k/top-p truncation, whole-turn eviction |
 | Vindex strict loader | 2 | open_inference_vindex error paths |
-| Backend (ComputeBackend) | 13 | Shape, correctness, batch, Metal vs CPU |
+| Backend (ComputeBackend) | 19 | Shape, correctness, batch, Metal vs CPU |
 | Fused attention | 23 | GQA, softcap, capture, reference agreement, edge cases |
 | FFN + modules | 15 | SiLU, GELU, dense, highway, multi-position |
 | Trace stores | 14 | Write/read, tiers, boundaries, additive property |
-| Walkers | 12 | Weight/attention walkers, vector extractor |
-| Utils | 10 | Top-k, rounding, entity sorting |
+| Logits goldens | 13 | LM-head dispatch correctness across Q4_K / f16 / f32 paths |
+| Arch goldens | 10 | Per-arch fingerprint (Gemma 2/3/4, Llama, Mistral, Qwen) |
+| Layer-graph integration | 7 | DenseLayerGraph + WalkLayerGraph + cached graph round-trip |
+| Decode consistency | 5 | CPU-decode equality across batch sizes / KV-cache states |
 | Unit (lib) | total 631 | Core module tests + everything above |
 | Gemma 3 4B smoke (`#[ignore]`) | 1 | First-token regression — gated on `LARQL_VINDEX_PATH` + `CI_INTEGRATION=1` |
 
