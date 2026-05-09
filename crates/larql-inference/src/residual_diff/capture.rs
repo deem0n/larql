@@ -15,7 +15,7 @@
 //! refactor moves to direct callbacks, `run_with_dump_dir` can become a
 //! callback adapter without changing the public surface.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use larql_models::ModelWeights;
 use larql_vindex::{GateIndex, VectorIndex};

@@ -71,13 +71,6 @@ impl GenerationRuntimeConfig {
 /// Built from the tokenizer's `added_tokens` table (everything marked
 /// `special: true`) minus any IDs in the EOS set. Vocab-resident structural
 /// markers like `<unusedN>` and `[multimodal]` are also suppressed.
-pub(crate) fn build_special_suppress_set(
-    tokenizer: &tokenizers::Tokenizer,
-    eos: &EosConfig,
-) -> HashSet<u32> {
-    build_special_suppress_set_with_policy(tokenizer, eos, &TokenSelectionPolicy::from_env())
-}
-
 pub(crate) fn build_special_suppress_set_with_policy(
     tokenizer: &tokenizers::Tokenizer,
     eos: &EosConfig,
@@ -152,25 +145,6 @@ fn is_structural_marker(tok: &str) -> bool {
 }
 
 /// Pick the top-1 vocabulary id from logits, skipping any id in `suppress`.
-pub(crate) fn pick_next_filtered(
-    index: &VectorIndex,
-    weights: &ModelWeights,
-    h: &ndarray::Array1<f32>,
-    backend: &dyn ComputeBackend,
-    suppress: &HashSet<u32>,
-    tokenizer: &tokenizers::Tokenizer,
-) -> u32 {
-    pick_next_filtered_with_policy(
-        index,
-        weights,
-        h,
-        backend,
-        suppress,
-        tokenizer,
-        &TokenSelectionPolicy::from_env(),
-    )
-}
-
 pub(crate) fn pick_next_filtered_with_policy(
     index: &VectorIndex,
     weights: &ModelWeights,

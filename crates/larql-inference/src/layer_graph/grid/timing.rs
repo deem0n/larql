@@ -3,25 +3,11 @@ use crate::ffn::RemoteMoeBackend;
 
 #[derive(Clone, Debug)]
 pub(super) struct LayerTiming {
-    pub layer: usize,
     pub total_ms: f32,
     pub route_fire_ms: f32,
     pub collect_ms: f32,
     /// One entry per shard: `(wall_collect_ms, server_compute_ms)`.
     pub per_shard: Vec<(f32, f32)>,
-}
-
-/// Sum of per-shard wall times — pre-2026-05-02 this matched `collect_ms`
-/// because shards collected sequentially. After the parallel-collect change,
-/// `collect_ms ≈ max(per_shard.wall)` not the sum.
-pub(super) fn shard_wall_sum(t: &LayerTiming) -> f32 {
-    t.per_shard.iter().map(|(w, _)| *w).sum()
-}
-
-/// Max of per-shard wall times — post-2026-05-02 this matches `collect_ms`
-/// to within microseconds.
-pub(super) fn shard_wall_max(t: &LayerTiming) -> f32 {
-    t.per_shard.iter().map(|(w, _)| *w).fold(0.0, f32::max)
 }
 
 fn shard_compute_max(t: &LayerTiming) -> f32 {
@@ -127,7 +113,6 @@ pub(super) fn moe_call_timed(
     let collect_ms = t_collect.elapsed().as_secs_f32() * 1000.0;
     let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
     timing.push(LayerTiming {
-        layer,
         total_ms,
         route_fire_ms,
         collect_ms,

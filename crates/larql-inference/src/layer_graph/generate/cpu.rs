@@ -117,62 +117,6 @@ pub(super) fn generate_via_cpu_q4k(
     }
 }
 
-/// Constrained variant of [`generate_via_cpu_q4k`]. Thin wrapper over
-/// `vindex::q4k_forward::generate_q4k_cpu_constrained` that adapts the
-/// result shape into `GenerateResult`.
-pub(super) fn generate_constrained_via_cpu_q4k<M>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    mask_fn: M,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-{
-    generate_constrained_via_cpu_q4k_streaming(
-        weights,
-        tokenizer,
-        token_ids,
-        max_tokens,
-        index,
-        mask_fn,
-        &EosConfig::builtin(),
-        |_, _, _| {},
-    )
-}
-
-/// Streaming variant of [`generate_constrained_via_cpu_q4k`]. Greedy
-/// under the mask; for sampling under mask see
-/// [`generate_constrained_via_cpu_q4k_streaming_sampled`].
-pub(super) fn generate_constrained_via_cpu_q4k_streaming<M, F>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    mask_fn: M,
-    eos: &EosConfig,
-    on_token: F,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-    F: FnMut(u32, &str, f64),
-{
-    generate_constrained_via_cpu_q4k_streaming_sampled(
-        weights,
-        tokenizer,
-        token_ids,
-        max_tokens,
-        index,
-        mask_fn,
-        on_token,
-        super::sampling::SamplingConfig::greedy(),
-        eos,
-    )
-}
-
 /// Sampling-aware bridge to the CPU Q4_K constrained decoder. Threads
 /// the caller's `SamplingConfig` (temperature/top_p/seed/penalties)
 /// through to token selection over the masked logits.

@@ -609,7 +609,10 @@ where
     let profile_split = runtime.profile_split;
     let mut t_embed = 0.0f64;
     let mut t_gpu = 0.0f64;
+    // mutated only on metal/macos via metal_take_last_split_timings
+    #[allow(unused_mut)]
     let mut t_gate_up = 0.0f64;
+    #[allow(unused_mut)]
     let mut t_down = 0.0f64;
     let mut t_norm = 0.0f64;
     let mut t_lmhead = 0.0f64;

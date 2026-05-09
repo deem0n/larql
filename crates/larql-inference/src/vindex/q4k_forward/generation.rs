@@ -168,8 +168,8 @@ pub fn generate_q4k_cpu_constrained_streaming_sampled<M, F>(
     prompt_ids: &[u32],
     max_tokens: usize,
     index: &VectorIndex,
-    mut mask_fn: M,
-    mut on_token: F,
+    mask_fn: M,
+    on_token: F,
     sampling: crate::layer_graph::SamplingConfig,
 ) -> Vec<(String, u32)>
 where

@@ -9,7 +9,6 @@ pub mod engine;
 pub mod q4k;
 pub mod store;
 
-pub(crate) use compute::rs_decode_step_profiled;
 pub use compute::{
     kv_memory_bytes_for_seq, recompute_kv, rs_decode_step, rs_prefill, RsPrefillResult,
 };

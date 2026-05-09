@@ -276,10 +276,6 @@ impl FfnBackend for LayerShardedBackend {
 
 // ── Parse "START-END=URL,..." ─────────────────────────────────────────────────
 
-fn parse_shard_map(spec: &str, timeout: Duration) -> Result<Vec<LayerShard>, RemoteFfnError> {
-    parse_shard_map_with_wire(spec, timeout, WirePreference::BestAvailable)
-}
-
 fn parse_shard_map_with_wire(
     spec: &str,
     timeout: Duration,

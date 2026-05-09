@@ -1,9 +1,4 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use prost::Message;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 
 use super::config::ShardConfig;
 use super::error::RemoteMoeError;
@@ -13,8 +8,7 @@ use super::multi_layer_wire::{
     MultiLayerResult, MultiLayerTask, MultiLayerTaskQ8K, MULTI_LAYER_BATCH_CONTENT_TYPE,
     MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
 };
-use super::router::{rms_norm, MoeRouterWeights};
-use super::stream::{InflightMoe, ShardStream};
+use super::stream::ShardStream;
 use super::wire::{
     decode_expert_response, decode_layer_batch_response, decode_layer_batch_response_f16,
     encode_expert_request, encode_layer_batch_request, encode_layer_batch_request_f16,
@@ -46,7 +40,7 @@ pub(super) enum ShardTransport {
     Uds(UdsState),
 }
 
-struct UdsState {
+pub(super) struct UdsState {
     /// Filesystem path of the socket.  Used in error messages.
     path: std::path::PathBuf,
     /// Persistent stream behind a mutex.  Reconnect lazily on disconnect.
@@ -153,19 +147,6 @@ impl Shard {
         };
 
         Ok(Self { config, transport })
-    }
-
-    /// Layer-uniform ownership check (legacy `--moe-shards "S-E=URL"` path).
-    /// Used by routing call sites that don't know the layer — keep returning
-    /// `false` for fine-grained shards so the layer-aware `owns_unit` is
-    /// always preferred when the layer is in scope.
-    pub(super) fn owns(&self, expert_id: usize) -> bool {
-        if self.config.unit_set.is_some() {
-            // Fine-grained shards never claim ownership without a layer
-            // context — forces callers to use `owns_unit` instead.
-            return false;
-        }
-        expert_id >= self.config.start && expert_id <= self.config.end
     }
 
     /// Layer-aware ownership check.  When the shard's `unit_set` is set

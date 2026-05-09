@@ -419,21 +419,11 @@ pub fn encode_expert_response(items: &[ExpertResultItem], latency_ms: f32) -> Ve
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct BatchRequest<'a> {
-    requests: &'a [ExpertCallItem],
-}
-
 #[derive(Serialize, Clone)]
 pub struct ExpertCallItem {
     pub layer: usize,
     pub expert_id: usize,
     pub residual: Vec<f32>,
-}
-
-#[derive(Deserialize)]
-struct BatchResponse {
-    results: Vec<ExpertResultItem>,
 }
 
 #[derive(Deserialize)]

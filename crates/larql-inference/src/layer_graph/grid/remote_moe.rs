@@ -74,7 +74,6 @@ pub fn generate_with_remote_moe(
     let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
-    let num_layers = setup.num_layers;
 
     // ── Open gRPC streams (one pair for the entire generation) ───────────────
     //
@@ -342,7 +341,7 @@ pub fn generate_with_remote_moe(
                     }
                 }
             };
-            let mut collect_fn = |layer: usize| -> Vec<f32> {
+            let mut collect_fn = |_layer: usize| -> Vec<f32> {
                 if skip_moe {
                     return vec![0.0f32; hidden];
                 }
@@ -357,7 +356,6 @@ pub fn generate_with_remote_moe(
                         if timing_enabled {
                             let total_ms = t_start.elapsed().as_secs_f32() * 1000.0;
                             tok_timings_cell.borrow_mut().push(LayerTiming {
-                                layer,
                                 total_ms,
                                 route_fire_ms: 0.0,
                                 collect_ms: total_ms,
