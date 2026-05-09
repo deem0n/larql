@@ -416,7 +416,10 @@ mod dispatch_tests {
     use super::*;
     use crate::engines::test_utils::make_test_weights;
     use crate::model::ModelWeights;
-    use larql_vindex::{FeatureMeta, GateIndex, WalkHit, WalkTrace};
+    use larql_vindex::{
+        FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,
+        WalkHit, WalkTrace,
+    };
     use ndarray::{Array1, Array2};
     use std::sync::OnceLock;
 
@@ -434,7 +437,7 @@ mod dispatch_tests {
         hidden: usize,
     }
 
-    impl GateIndex for MockGateIndex {
+    impl GateLookup for MockGateIndex {
         fn gate_knn(
             &self,
             _layer: usize,
@@ -452,6 +455,11 @@ mod dispatch_tests {
             self.n_features
         }
     }
+
+    impl PatchOverrides for MockGateIndex {}
+    impl NativeFfnAccess for MockGateIndex {}
+    impl QuantizedFfnAccess for MockGateIndex {}
+    impl Fp4FfnAccess for MockGateIndex {}
 
     fn mock_index(weights: &ModelWeights) -> MockGateIndex {
         MockGateIndex {

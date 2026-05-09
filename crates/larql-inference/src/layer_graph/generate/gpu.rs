@@ -346,6 +346,15 @@ pub fn generate_streaming<F>(
 where
     F: FnMut(u32, &str, f64),
 {
+    if max_tokens == 0 {
+        return GenerateResult {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            stage_timings: StageTimings::default(),
+        };
+    }
+
     // Backends that don't implement the fused Q4 prefill (today: CpuBackend)
     // delegate to the CPU Q4K per-layer dequant path. It mutates `weights.tensors`
     // per layer and needs &mut; this is the sole reason `generate` itself takes
@@ -629,8 +638,17 @@ where
             weights.arch.final_logit_softcapping(),
         );
         on_token(picked_id, &tok_str, prob);
+        let is_eos = eos.is_eos_with_tokenizer(picked_id, &tok_str, tokenizer);
         generated_ids.push(picked_id);
         tokens.push((tok_str, prob));
+        if is_eos {
+            return GenerateResult {
+                tokens,
+                prefill_ms,
+                decode_ms,
+                stage_timings: StageTimings::default(),
+            };
+        }
     }
 
     // ── Phase 2: GPU decode loop ──
@@ -1021,7 +1039,15 @@ where
     M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
-    let _ = eos; // built-in end-of-turn check still primary; eos extension is a follow-up
+    if max_tokens == 0 {
+        return GenerateResult {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            stage_timings: StageTimings::default(),
+        };
+    }
+
     let mut sampler = Sampler::new(sampling);
     // Same PLE delegation as `generate_streaming` — the Metal pipeline
     // doesn't implement Gemma 4 E2B's per-layer-input gate.
@@ -1180,7 +1206,7 @@ where
     let mut current_token_id = match first {
         Some((tid, _)) => {
             let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
-            let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
+            let is_eos = eos.is_eos_with_tokenizer(tid, &tok_str, tokenizer);
             on_token(tid, &tok_str, 1.0);
             tokens.push((tok_str, 1.0));
             generated.push(tid);
@@ -1253,7 +1279,7 @@ where
         match pick {
             Some((tid, _)) => {
                 let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
-                let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
+                let is_eos = eos.is_eos_with_tokenizer(tid, &tok_str, tokenizer);
                 on_token(tid, &tok_str, 1.0);
                 tokens.push((tok_str, 1.0));
                 generated.push(tid);

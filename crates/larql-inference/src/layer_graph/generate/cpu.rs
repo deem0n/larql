@@ -36,6 +36,15 @@ pub(super) fn generate_via_cpu_q4k(
     max_tokens: usize,
     index: &larql_vindex::VectorIndex,
 ) -> GenerateResult {
+    if max_tokens == 0 {
+        return GenerateResult {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            stage_timings: StageTimings::default(),
+        };
+    }
+
     let prefill_start = std::time::Instant::now();
     // First-token pass covers the prompt — that's our "prefill" here.
     let first = crate::vindex::predict_q4k(weights, tokenizer, token_ids, 5, index);
@@ -180,6 +189,15 @@ where
     M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
+    if max_tokens == 0 {
+        return GenerateResult {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            stage_timings: StageTimings::default(),
+        };
+    }
+
     let prefill_start = std::time::Instant::now();
     let out = crate::vindex::generate_q4k_cpu_constrained_streaming_sampled(
         weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling,

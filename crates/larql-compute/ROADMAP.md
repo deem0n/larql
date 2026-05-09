@@ -359,6 +359,9 @@ without `simdgroup_matrix`.
 | **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | Was estimated 3–4× prefill speedup. **FALSIFIED twice end-to-end.** | **CLOSED 2026-05-09.** Wiring tried at O-proj (2026-04-28: −10% on long prompts), at FFN gate+up (2026-04-28: 2933 → 3268 ms on 340 tokens), and re-validated FFN gate+up under post-defuse state (2026-05-09: 5–7% regression at 10/50/150-token prompts). Diagnosis: the `q4k_matmul` kernel is bandwidth-bound; the [seq_len × hidden] X working set thrashes GPU L1 on long prompts and the dequant amortisation gain is paid back in DRAM↔L1 traffic. See **D-PREFILL-MM2** below for the kernel-rewrite track. The current `q4k_matmul` shader + `MetalBackend::q4k_matmul` method + parity tests stay shipped for re-validation on future hardware; production prefill stays per-position matvec. | (closed) |
 | **D-PREFILL-MM2** | Rewrite `q4k_matmul` using Apple `simdgroup_matrix` intrinsics (mirrors llama.cpp's `kernel_mul_mm_*`) | Closes the 4–14× prefill gap to ollama (per [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §2). | **Open.** Confirmed via dylib-symbol diff that llama.cpp's prefill matmul uses `simdgroup_matrix` 8×8 register-tile fused-multiply-add — the same hardware feature that's load-bearing for their flash-attn. Our scalar-accumulator `q4k_matmul` can't hold the working set in registers on long prompts. M3 Max satisfies the `MTLGPUFamilyMetal3` device-family check; this is purely a kernel-implementation gap. **Multi-day kernel research project.** | New shader `metal/shaders/q4k_matmul_simdgroup.rs`; gated on `LARQL_PREFILL_MATMUL2=1` until verified; existing `q4k_matmul` retained as fallback |
 | **D-RMS-FUSE** | RMS-norm pre-fusion with surrounding scalar mul/add (mirrors llama.cpp's `kernel_rms_norm_mul_f32` / `kernel_rms_norm_mul_add_f32`) | ~0.1 ms decode | Open. Smaller follow-up. Different fusion direction from the `q4k_q6k_qkv_proj_normed` we defused 2026-05-09 (ADR-016) — that one fused norm into matmul (operand-reread loss); this fuses norm into the *next* scalar op, no operand reread. | New shader; ~half day. See [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §3 |
+| **D-GEMMA4-E2B** | Investigate Gemma 4 E2B decode 30× pathology surfaced by 2026-05-09 cross-arch bench | Closes a real per-arch correctness/perf bug | **Open.** Cross-arch bench captured `gemma4-e2b-q4k` at 4205 ms/tok GPU fwd vs Gemma 3 4B at 140 ms/tok under matched contention. E2B has hidden=1536, 35 layers — *should* be faster than Gemma 3 4B (hidden=2560), not 30× slower. Llama 2 7B and Mistral 7B at the same contention bench at 200-220 ms (1.5× Gemma 3 — expected scaling). Possible causes: per-layer head_dim variation (E2B alternates sliding head_dim=256 + global head_dim=512) forcing slow dispatch path, V-norm dispatch in a per-position loop, mixed-format vindex layout. | Profile with `LARQL_PROFILE_SPLIT=1`; bisect by disabling V-norm / per-layer-geometry features. See [architecture-shader-map.md](docs/architecture-shader-map.md) |
+| **D-CROSS-PARITY** | Per-shader cross-model parity tests (Llama 2, Mistral, Gemma 4 31B, ideally StarCoder2 + DeepSeek + Qwen) | Catches model-specific regressions earlier; foundation for the model-agnosticity ADR-017 | **Open.** Currently per-shader tests in `crates/larql-compute/tests/` are mostly Gemma-3-4B-only. Integration tests in `crates/larql-inference/tests/test_logits_goldens.rs` cover 4 families end-to-end but not at per-shader granularity. Without cross-model per-shader tests, future Gemma A/B regressions can't tell us whether a candidate is Gemma-specific-bad or globally-bad. | New parametrised tests in `crates/larql-compute/tests/`. See [shader-inventory.md §D](docs/shader-inventory.md) |
+| **D-ROPE-VARIANTS** | Add `rope_neox` and `rope_multi` shader variants | Coverage for non-split-half RoPE models (GPT-NeoX, Pythia, some Falcon, multi-frequency long-context) | Open. We have one `rope` shader (split-half). llama.cpp ships `kernel_rope_norm_*`, `kernel_rope_neox_*`, `kernel_rope_multi_*`, `kernel_rope_vision_*`. Currently no architectures in `larql-models/architectures/` need NeoX (all use split-half), so this is **deferred until a NeoX-using model is brought into scope**. TODO documented in `metal/shaders/rope.rs`. | `metal/shaders/rope.rs` extension. See [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §3 |
 
 **Sequencing rationale (updated 2026-05-09)**: D-FFN-PROFILE shipped; data
 shows all three buckets roughly equal thirds (~34/36/29%). Gate+up is the
@@ -369,12 +372,33 @@ falsified) and superseded by D-PREFILL-MM2. The 2026-05-09 dylib-symbol
 diff against llama.cpp ([llama-cpp-comparison.md](docs/llama-cpp-comparison.md))
 confirms three concrete kernel-architecture gaps: flash attention (covered
 by D-ATTN-MTG), `simdgroup_matrix` prefill matmul (D-PREFILL-MM2), and
-scalar-op RMS-norm pre-fusion (D-RMS-FUSE). **Open levers ordered by
-leverage**: D-PREFILL-MM2 (closes 4–14× prefill gap, biggest end-to-end
-impact for real chat workloads), D-ATTN-MTG (0.2–0.4 ms decode, +5–8 tok/s),
-D-RMS-FUSE (~0.1 ms decode). All three are kernel-research projects, not
-wiring tasks.
-session-bounded work.
+scalar-op RMS-norm pre-fusion (D-RMS-FUSE).
+
+**Open levers ordered by leverage and risk**:
+
+- **High-impact, multi-day kernel research:** D-PREFILL-MM2 (closes
+  4–14× prefill gap), D-ATTN-MTG (+5–8 tok/s decode).
+- **Concrete agnosticity bug:** D-GEMMA4-E2B (real 30× per-arch slowdown
+  needs investigation).
+- **Smaller perf wins:** D-RMS-FUSE (~0.1 ms decode), D-FFN-FUSE
+  (~0.2 ms but NaN-blocked).
+- **Infrastructure:** D-CROSS-PARITY (per-shader cross-model tests),
+  D-ROPE-VARIANTS (deferred until needed).
+
+**Recommended next pull**: D-GEMMA4-E2B (concrete bug, bounded
+investigation, immediately empirically grounded — the 30× slowdown
+surfaced by the cross-arch bench is the kind of thing that should be
+investigated before more multi-day kernel work goes in). After that,
+D-CROSS-PARITY to harden the test surface, then D-PREFILL-MM2 or
+D-ATTN-MTG as the bigger swing.
+
+**Documentation entry points** for new contributors:
+
+- [docs/shader-inventory.md](docs/shader-inventory.md) — per-shader retention rationale and applicability across model families.
+- [docs/architecture-shader-map.md](docs/architecture-shader-map.md) — which Metal shaders each model architecture dispatches.
+- [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) — kernel-architecture comparison vs llama.cpp; documents the three load-bearing gaps.
+- [docs/adr/017-shader-retention-model-agnosticity.md](docs/adr/017-shader-retention-model-agnosticity.md) — when to add/keep/delete shaders.
+- [docs/adr/018-architecture-shader-routing.md](docs/adr/018-architecture-shader-routing.md) — when to add a new architecture.
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)
 

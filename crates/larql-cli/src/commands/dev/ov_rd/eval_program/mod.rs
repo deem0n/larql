@@ -249,9 +249,11 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
 
         // Pass 1: baseline — Metal if available, CPU fallback.
         let baseline_h = if let Some(ref b) = metal_backend {
-            if let Some(h) = super::metal_backend::try_metal_baseline(
-                &weights, &token_ids, &index, b,
-            ) { h } else {
+            if let Some(h) =
+                super::metal_backend::try_metal_baseline(&weights, &token_ids, &index, b)
+            {
+                h
+            } else {
                 larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None)
             }
         } else {
@@ -270,24 +272,43 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
             ) {
                 // pre_wo: [seq_len × head_dim] f32 captured from attn_outs[target_layer]
                 let head_dim = pre_wo.len() / token_ids.len();
-                (0..token_ids.len()).map(|pos| {
-                    let values = &pre_wo[pos * head_dim .. (pos + 1) * head_dim];
-                    let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
-                    let residual: Vec<f32> = values.iter().zip(base).map(|(yi, bi)| yi - bi).collect();
-                    let z = basis.residual_to_z(&residual);
-                    let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
-                    codebook.quantize_indices_for_stratum(&coords, stratum)
-                }).collect()
+                (0..token_ids.len())
+                    .map(|pos| {
+                        let values = &pre_wo[pos * head_dim..(pos + 1) * head_dim];
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual: Vec<f32> =
+                            values.iter().zip(base).map(|(yi, bi)| yi - bi).collect();
+                        let z = basis.residual_to_z(&residual);
+                        let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
+                        codebook.quantize_indices_for_stratum(&coords, stratum)
+                    })
+                    .collect()
             } else {
                 // Fall back to CPU oracle PQ
                 let (_, _, codes) = forward_q4k_oracle_pq_head(
-                    &mut weights, &token_ids, &index, head, basis, pca_basis, head_means, codebook, stratum,
+                    &mut weights,
+                    &token_ids,
+                    &index,
+                    head,
+                    basis,
+                    pca_basis,
+                    head_means,
+                    codebook,
+                    stratum,
                 )?;
                 codes
             }
         } else {
             let (_, _, codes) = forward_q4k_oracle_pq_head(
-                &mut weights, &token_ids, &index, head, basis, pca_basis, head_means, codebook, stratum,
+                &mut weights,
+                &token_ids,
+                &index,
+                head,
+                basis,
+                pca_basis,
+                head_means,
+                codebook,
+                stratum,
             )?;
             codes
         };
@@ -295,20 +316,37 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
         // Pass 3: oracle Mode D baseline — Metal if available, CPU fallback.
         let oracle_h = if let Some(ref b) = metal_backend {
             let oracle_delta_flat = build_replacement_delta(
-                mode_d_table, &oracle_codes_by_position, stratum, weights.hidden_size,
+                mode_d_table,
+                &oracle_codes_by_position,
+                stratum,
+                weights.hidden_size,
             );
             let oracle_delta = ndarray::Array2::from_shape_vec(
-                (token_ids.len(), weights.hidden_size), oracle_delta_flat,
-            ).ok();
-            oracle_delta.and_then(|d| super::metal_backend::try_metal(
-                &weights, &token_ids, &index, head.layer, head.head, &d, b,
-            ))
-        } else { None };
+                (token_ids.len(), weights.hidden_size),
+                oracle_delta_flat,
+            )
+            .ok();
+            oracle_delta.and_then(|d| {
+                super::metal_backend::try_metal(
+                    &weights, &token_ids, &index, head.layer, head.head, &d, b,
+                )
+            })
+        } else {
+            None
+        };
         let oracle_h = match oracle_h {
             Some(h) => h,
             None => forward_q4k_oracle_pq_mode_d_head(
-                &mut weights, &token_ids, &index, head, basis, pca_basis,
-                head_means, codebook, mode_d_table, stratum,
+                &mut weights,
+                &token_ids,
+                &index,
+                head,
+                basis,
+                pca_basis,
+                head_means,
+                codebook,
+                mode_d_table,
+                stratum,
             )?,
         };
         let oracle_logp = log_softmax(&final_logits(&weights, &oracle_h));

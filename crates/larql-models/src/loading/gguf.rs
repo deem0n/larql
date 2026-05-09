@@ -775,14 +775,10 @@ fn split_fused_qkv(
                     }
                     if kv_dim > 0 {
                         if let Some(kb_key) = arch.attn_k_bias_key(layer) {
-                            vectors
-                                .insert(kb_key, fused_b[q_dim..q_dim + kv_dim].to_vec());
+                            vectors.insert(kb_key, fused_b[q_dim..q_dim + kv_dim].to_vec());
                         }
                         if let Some(vb_key) = arch.attn_v_bias_key(layer) {
-                            vectors.insert(
-                                vb_key,
-                                fused_b[q_dim + kv_dim..total].to_vec(),
-                            );
+                            vectors.insert(vb_key, fused_b[q_dim + kv_dim..total].to_vec());
                         }
                     }
                 } else {
@@ -940,12 +936,9 @@ mod tests {
         let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
         // Inverse layout: stored (cols, rows) when canonical is (rows, cols).
         // Canonical for ffn_down is (hidden, intermediate).
-        let stored = Array2::from_shape_vec(
-            (3, 2),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        )
-        .unwrap()
-        .into_shared();
+        let stored = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .into_shared();
         tensors.insert("layers.0.mlp.down_proj.weight".to_string(), stored);
 
         // Canonical (hidden=2, intermediate=3): expect shape (2, 3) after orient.
@@ -967,12 +960,9 @@ mod tests {
         use ndarray::Array2;
 
         let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
-        let canonical = Array2::from_shape_vec(
-            (2, 3),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        )
-        .unwrap()
-        .into_shared();
+        let canonical = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .into_shared();
         let original_ptr = canonical.as_ptr();
         tensors.insert("layers.0.mlp.down_proj.weight".to_string(), canonical);
 
@@ -988,12 +978,9 @@ mod tests {
         use ndarray::Array2;
 
         let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
-        let square = Array2::from_shape_vec(
-            (4, 4),
-            (0..16).map(|x| x as f32).collect(),
-        )
-        .unwrap()
-        .into_shared();
+        let square = Array2::from_shape_vec((4, 4), (0..16).map(|x| x as f32).collect())
+            .unwrap()
+            .into_shared();
         tensors.insert("layers.0.mlp.up_proj.weight".to_string(), square);
 
         orient_in_place(&mut tensors, "layers.0.mlp.up_proj.weight", 4, 4);

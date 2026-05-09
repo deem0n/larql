@@ -952,8 +952,9 @@ mod tests {
         fs::write(&file_path, "x").unwrap();
 
         let mut cb = SilentPublishCallbacks;
-        let err = publish_vindex_with_opts(&file_path, "org/repo", &PublishOptions::default(), &mut cb)
-            .expect_err("path is a file, not a directory");
+        let err =
+            publish_vindex_with_opts(&file_path, "org/repo", &PublishOptions::default(), &mut cb)
+                .expect_err("path is a file, not a directory");
         assert!(matches!(err, VindexError::NotADirectory(_)));
     }
 
@@ -963,8 +964,9 @@ mod tests {
         // Directory exists but has no index.json — should fail before any
         // network call (no token required to reach this branch).
         let mut cb = SilentPublishCallbacks;
-        let err = publish_vindex_with_opts(dir.path(), "org/repo", &PublishOptions::default(), &mut cb)
-            .expect_err("missing index.json must error");
+        let err =
+            publish_vindex_with_opts(dir.path(), "org/repo", &PublishOptions::default(), &mut cb)
+                .expect_err("missing index.json must error");
         match err {
             VindexError::Parse(msg) => assert!(
                 msg.contains("not a vindex directory"),

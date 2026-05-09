@@ -266,6 +266,12 @@ pub fn build_vindex(
     dtype: StorageDtype,
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
+    // Refuse the extract before any output is created when the requested
+    // tier needs attention tensors that the writer cannot represent
+    // (e.g. MLA on the standard Q/K/V/O manifests). A late failure
+    // inside the writer leaves a half-written vindex on disk.
+    crate::format::weights::ensure_extract_level_supported(&*weights.arch, extract_level)?;
+
     std::fs::create_dir_all(output_dir)?;
     let mut ctx = BuildContext::new(weights, tokenizer, output_dir, callbacks, dtype, down_top_k);
     ctx.write_gate_vectors()?;
@@ -588,5 +594,112 @@ mod tests {
         run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
         let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
         assert_eq!(cfg.num_layers, NUM_LAYERS);
+    }
+
+    // ── architecture capability gate ─────────────────────────────────────
+
+    fn make_mla_weights() -> larql_models::ModelWeights {
+        let arch = larql_models::detect_from_json(&serde_json::json!({
+            "model_type": "deepseek_v2",
+            "hidden_size": HIDDEN,
+            "intermediate_size": INTERMEDIATE,
+            "num_hidden_layers": NUM_LAYERS,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": HIDDEN,
+            "kv_lora_rank": 4,
+            "q_lora_rank": 4,
+            "rope_theta": 10000.0,
+            "vocab_size": VOCAB,
+        }));
+        assert!(arch.uses_mla(), "fixture must produce an MLA architecture");
+
+        let mut embed = ndarray::Array2::<f32>::zeros((VOCAB, HIDDEN));
+        for i in 0..VOCAB {
+            embed[[i, i % HIDDEN]] = 1.0;
+        }
+        let embed = embed.into_shared();
+        let lm_head = embed.clone();
+
+        larql_models::ModelWeights {
+            tensors: HashMap::new(),
+            vectors: HashMap::new(),
+            raw_bytes: HashMap::new(),
+            skipped_tensors: Vec::new(),
+            packed_mmaps: HashMap::new(),
+            packed_byte_ranges: HashMap::new(),
+            embed,
+            lm_head,
+            position_embed: None,
+            num_layers: NUM_LAYERS,
+            hidden_size: HIDDEN,
+            intermediate_size: INTERMEDIATE,
+            vocab_size: VOCAB,
+            head_dim: HIDDEN,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            rope_base: 10000.0,
+            arch,
+        }
+    }
+
+    #[test]
+    fn build_browse_passes_for_mla_arch() {
+        // Browse-level extracts don't need attention; MLA must succeed.
+        let dir = TempDir::new().unwrap();
+        let weights = make_mla_weights();
+        let tok = tokenizer();
+        let mut cb = SilentBuildCallbacks;
+        build_vindex(
+            &weights,
+            &tok,
+            "test/mla",
+            dir.path(),
+            3,
+            ExtractLevel::Browse,
+            StorageDtype::F32,
+            &mut cb,
+        )
+        .expect("Browse-level MLA extract should succeed (no attention written)");
+        // Sanity: gate_vectors / embeddings still got written.
+        assert!(dir.path().join("gate_vectors.bin").exists());
+        assert!(dir.path().join("embeddings.bin").exists());
+    }
+
+    #[test]
+    fn build_inference_rejects_mla_before_writing() {
+        // The capability gate must fire before any output file is created
+        // so a failed extract leaves no half-populated vindex on disk.
+        let dir = TempDir::new().unwrap();
+        let weights = make_mla_weights();
+        let tok = tokenizer();
+        let mut cb = SilentBuildCallbacks;
+        let err = build_vindex(
+            &weights,
+            &tok,
+            "test/mla",
+            dir.path(),
+            3,
+            ExtractLevel::Inference,
+            StorageDtype::F32,
+            &mut cb,
+        )
+        .expect_err("Inference-level MLA extract must be rejected up front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MLA"),
+            "error should mention MLA capability gap: {msg}"
+        );
+
+        let written: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            written.is_empty(),
+            "MLA rejection must happen before any file is written; \
+             found leftovers: {written:?}"
+        );
     }
 }

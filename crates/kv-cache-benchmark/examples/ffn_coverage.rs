@@ -53,7 +53,9 @@ mod ffn_coverage {
     fn parse_args() -> Args {
         let mut raw: Vec<String> = std::env::args().skip(1).collect();
         let mut k: Option<usize> = None;
-        let mut output = String::from("~/chris-source/chris-experiments/routing/25_ffn_coverage/results/factual_narrow.json");
+        let mut output = String::from(
+            "~/chris-source/chris-experiments/routing/25_ffn_coverage/results/factual_narrow.json",
+        );
         let mut limit: Option<usize> = None;
 
         let mut i = 0;

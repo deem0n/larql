@@ -6,8 +6,7 @@
 
 use crate::model::ModelWeights;
 use larql_compute::{
-    FullPipelineLayer, MoeLayerWeights, MoeRoutingPolicy, MoeWeightLayout, QuantFormat,
-    QuantWeight,
+    FullPipelineLayer, MoeLayerWeights, MoeRoutingPolicy, MoeWeightLayout, QuantFormat, QuantWeight,
 };
 
 pub(crate) const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;

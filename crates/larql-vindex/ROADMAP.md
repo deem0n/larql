@@ -164,38 +164,55 @@ RSS 16.6 → 9.7 GB. Disk 58 → 16 GB.
 
 ### Architecture-independent extraction and weight writing
 
-**Status**: Planned.
+**Status**: Closed for current architectures (2026-05-09). Reopen when a
+non-standard attention contract (MLA, MQA-with-shared-rotary, etc.) is
+landed in `larql-models` and needs writer support.
 
-The extraction stack should preserve architecture facts from
-`ModelArchitecture` or explicit source metadata all the way into `index.json`
-and the weight manifests. Avoid accepting a model by family name while silently
-dropping tensors required by that family.
+The extraction stack now preserves architecture facts from
+`ModelArchitecture` end-to-end, and a single capability helper gates
+unsupported attention layouts before any output is written.
 
 Work items:
 
-- [ ] Audit f32/Q4K writer entry points and loader surfaces for implicit
-  standard-attention assumptions. Keep executable support in one capability
-  helper rather than scattered family checks.
-- [ ] Replace `extract/build_from_vectors.rs` model-name heuristics
-  (`contains("gemma")`, `contains("llama")`) with explicit architecture
-  metadata or a validated architecture/config input.
-- [ ] Add an architecture capability check before weight writing. If an
-  architecture uses attention forms not represented by Q/K/V/O manifests
-  (for example MLA), fail with a targeted unsupported-architecture error until
-  that layout is implemented.
-- [ ] Centralise remaining protocol-like tensor/manifest tags used by
-  extraction and weight writers. User-facing text can stay local; schema keys,
-  quant tags, and file-kind strings should be named constants.
+- [x] Audit f32/Q4K writer entry points and loader surfaces for implicit
+  standard-attention assumptions. Both writers (`write_model_weights` and
+  `write_model_weights_q4k`) call `ensure_standard_attention_supported`
+  on entry; the check lives in one place at
+  `format/weights/capabilities.rs`.
+- [x] Replace `extract/build_from_vectors.rs` model-name heuristics —
+  audit (2026-05-09) found no `contains("gemma")` / `contains("llama")`
+  string heuristics remain. The path routes through `arch.family()` and
+  `LayerBands::for_family`.
+- [x] Add an architecture capability check **before any partial write**.
+  Added `ensure_extract_level_supported` (2026-05-09) wired into both
+  `build_vindex` and `build_vindex_streaming`. Browse-level extracts of
+  MLA architectures still succeed (no attention written); Attention /
+  Inference / All tiers fail with a targeted `UnsupportedArchitecture`
+  error before the output directory is created.
+- [x] Centralise remaining protocol-like tensor/manifest tags. Quant tags
+  flow through `quant::registry`; file-kind strings through
+  `format::filenames`; capability surfaces through
+  `SURFACE_F32_WEIGHT_WRITER` / `SURFACE_Q4K_WEIGHT_WRITER` /
+  `SURFACE_EXTRACT_PIPELINE` constants.
 - [ ] Extend f32/Q4K weight writers beyond standard Q/K/V/O when a concrete
-  non-standard architecture contract is added.
-- [ ] Add tests that prove unsupported attention layouts are rejected before
-  any partial vindex write and that missing/unknown manifest tags do not
-  silently fall back to Q4_K or another default.
-- [ ] Add fixture tests that prove unknown/custom families do not inherit
-  Gemma/Llama defaults through string matching.
+  non-standard architecture contract is added. Won't fix until a
+  `larql-models` MLA implementation lands.
+- [x] Tests proving unsupported attention layouts are rejected before any
+  partial vindex write — `build_inference_rejects_mla_before_writing`
+  asserts `read_dir(output_dir).is_empty()` after the failure;
+  `extract_level_*_rejects_mla` cover Attention/Inference/All and
+  `extract_level_browse_passes_for_mla` covers the no-attention path.
+- [x] Fixture tests that prove unknown/custom families do not inherit
+  Gemma/Llama defaults through string matching — extended
+  `unknown_family_does_not_inherit_known_bands_by_string_prefix` in
+  `config::compliance` to compare lookalikes (`gemma3-clone`,
+  `llamafied`) against canonical bands and prove the layer-count
+  fallback is structurally distinct.
 
-Acceptance: vector-only and model-backed extracts should agree on family,
-embedding scale, layer bands, and required tensor coverage for the same model.
+Acceptance bar (met 2026-05-09): vector-only and model-backed extracts
+agree on family, embedding scale, layer bands, and required tensor
+coverage; unsupported attention layouts fail before any file is written;
+no string-prefix inheritance of curated band tables.
 
 ### Perf round-4 (2026-04-25): three concrete wins identified
 

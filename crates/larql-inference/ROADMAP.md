@@ -28,6 +28,43 @@ runtime contracts are stable.
 
 ---
 
+## Open: inference crate hardening — correctness, API boundaries, model agnosticity
+
+**Status**: Started 2026-05-09 after `larql-inference` review.
+
+The crate now carries stable serving/generation paths, mechanistic-interpretability
+research surfaces, Q4K/vindex-backed execution, and remote expert dispatch. The
+review found two classes of work: immediate correctness fixes and longer-term
+cleanup to keep the crate model-agnostic and maintainable.
+
+Work items:
+
+| # | Item | Status |
+|---|------|--------|
+| H1 | Restore `cargo test -p larql-inference` after the `GateIndex` trait split by updating walk-FFN test mocks to implement `GateLookup` / `PatchOverrides` / FFN storage traits | in progress |
+| H2 | Make generation honor `max_tokens == 0` across GPU, CPU fallback, constrained, and streaming paths | in progress |
+| H3 | Check EOS on the first generated token in unconstrained GPU generation, including special-token raw decode via `EosConfig::is_eos_with_tokenizer` | in progress |
+| H4 | Stop discarding `EosConfig` in constrained generation; use caller-supplied EOS IDs and stop strings instead of only `vindex::is_end_of_turn` | in progress |
+| H5 | Convert `optimise_target_delta` invalid inputs (`target_id >= vocab`, empty prompt, unsupported shapes) from panics into early `Err` results | planned |
+| H6 | Harden remote FFN/Q8K wire decoders against untrusted length fields with checked arithmetic and bounded allocation | planned |
+| H7 | Replace ad hoc `Result<_, String>` / silent empty `GenerateResult` failures in generation paths with typed errors where public callers need to distinguish unsupported backend vs. empty output | planned |
+| H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | planned |
+| H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | planned |
+| H10 | Remove backend-name probes and concrete `MetalBackend` downcasts from generic generation dispatch; replace with explicit compute-backend capability methods | planned |
+| H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | planned |
+| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | planned |
+
+Acceptance:
+
+- `cargo test -p larql-inference` compiles and passes in a clean target dir.
+- Public generation APIs obey token budgets and EOS config deterministically.
+- Unsupported model/backend combinations fail with precise errors rather than
+  silent empty output, zero-vector substitution, or process panic.
+- Model-family-specific behavior is expressed through architecture/tokenizer
+  policy, not hardcoded in generic decode loops.
+
+---
+
 ## Open: Model architecture independence hardening
 
 **Status**: Planned as of 2026-05-02.

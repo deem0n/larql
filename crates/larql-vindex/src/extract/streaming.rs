@@ -54,11 +54,15 @@ pub fn build_vindex_streaming(
             "--drop-gate-vectors requires --quant q4k (the loader rebuilds gate from Q4K)".into(),
         ));
     }
-    std::fs::create_dir_all(output_dir)?;
-
     // Detect architecture
     let arch = larql_models::detect_architecture_validated(model_dir)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
+    // Reject unsupported attention layouts (e.g. MLA on standard Q/K/V/O
+    // manifests) before any output directory or checkpoint is created.
+    crate::format::weights::ensure_extract_level_supported(&*arch, extract_level)?;
+
+    std::fs::create_dir_all(output_dir)?;
+
     let prefixes = arch.key_prefixes_to_strip();
     let cfg = arch.config();
 

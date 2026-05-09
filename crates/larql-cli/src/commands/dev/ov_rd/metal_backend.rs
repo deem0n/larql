@@ -45,9 +45,7 @@ pub(super) fn try_metal_baseline(
     index: &larql_vindex::VectorIndex,
     backend: &Backend,
 ) -> Option<ndarray::Array2<f32>> {
-    larql_inference::vindex::predict_q4k_metal_hidden(
-        weights, token_ids, index, backend.as_ref(),
-    )
+    larql_inference::vindex::predict_q4k_metal_hidden(weights, token_ids, index, backend.as_ref())
 }
 
 /// Capture the target head's pre-W_O output at `target_layer` using GPU,
@@ -63,7 +61,12 @@ pub(super) fn try_metal_capture_pre_wo(
     backend: &Backend,
 ) -> Option<Vec<f32>> {
     larql_inference::vindex::predict_q4k_metal_capture_pre_wo(
-        weights, token_ids, index, backend.as_ref(), target_layer, target_head,
+        weights,
+        token_ids,
+        index,
+        backend.as_ref(),
+        target_layer,
+        target_head,
     )
 }
 

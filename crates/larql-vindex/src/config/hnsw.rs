@@ -42,9 +42,8 @@ impl HnswBuildConfig {
 // Layer- and per-expert tunings must differ. If they collapse, either
 // the size-class assumption changed or the constants got copy-pasted.
 const _: () = assert!(HnswBuildConfig::LAYER.m > HnswBuildConfig::EXPERT.m);
-const _: () = assert!(
-    HnswBuildConfig::LAYER.ef_construction > HnswBuildConfig::EXPERT.ef_construction
-);
+const _: () =
+    assert!(HnswBuildConfig::LAYER.ef_construction > HnswBuildConfig::EXPERT.ef_construction);
 
 // HNSW recall degrades badly when ef_construction <= m. Pin the
 // invariant on both sides so a future tweak can't violate it silently.
