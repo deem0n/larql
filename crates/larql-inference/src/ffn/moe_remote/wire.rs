@@ -143,79 +143,16 @@ pub fn decode_layer_batch_response(bytes: &[u8]) -> Option<Vec<f32>> {
 }
 
 // ── f16 wire helpers ──────────────────────────────────────────────────────────
-// IEEE-754 binary16 conversion.  Round-to-nearest-even for finite values;
-// saturates on overflow; preserves NaN.  Same behaviour as the `half` crate
-// but kept inline here so the wire layer doesn't take a new dep.
+// IEEE-754 binary16 conversion via the `half` crate (already a workspace dep).
 
 #[inline(always)]
 pub(super) fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let mant = bits & 0x7F_FFFF;
-    if exp == 0xFF {
-        // Inf or NaN.
-        if mant == 0 {
-            return sign | 0x7C00;
-        }
-        return sign | 0x7C00 | ((mant >> 13) as u16) | 0x0001; // canonical NaN
-    }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 0x1F {
-        // Overflow → ±Inf.
-        return sign | 0x7C00;
-    }
-    if new_exp <= 0 {
-        // Subnormal or zero.
-        if new_exp < -10 {
-            return sign;
-        }
-        let mant_full = mant | 0x80_0000; // implicit leading 1
-        let shift = (14 - new_exp) as u32;
-        let new_mant = (mant_full >> shift) as u16;
-        // Round-to-nearest-even on the dropped bit.
-        let round_bit = (mant_full >> (shift - 1)) & 1;
-        let sticky = mant_full & ((1u32 << (shift - 1)) - 1);
-        let mut out = new_mant;
-        if round_bit != 0 && (sticky != 0 || (new_mant & 1) != 0) {
-            out += 1;
-        }
-        return sign | out;
-    }
-    // Normal.
-    let new_mant = (mant >> 13) as u16;
-    let round_bit = (mant >> 12) & 1;
-    let sticky = mant & 0xFFF;
-    let mut combined = ((new_exp as u16) << 10) | new_mant;
-    if round_bit != 0 && (sticky != 0 || (new_mant & 1) != 0) {
-        combined += 1; // may carry into exponent — that's fine, IEEE-correct
-    }
-    sign | combined
+    half::f16::from_f32(v).to_bits()
 }
 
 #[inline(always)]
 pub(super) fn f16_bits_to_f32(bits: u16) -> f32 {
-    // Mirrors `larql_compute::cpu::ops::q4_common::f16_to_f32` (kept inline
-    // so the wire layer stays dependency-free).  Bit-exact for all 65536
-    // f16 inputs vs the powi reference.
-    let bits = bits as u32;
-    let sign = (bits & 0x8000) << 16;
-    let exp = (bits >> 10) & 0x1F;
-    let mant = bits & 0x3FF;
-    if exp == 0 {
-        if mant == 0 {
-            return f32::from_bits(sign);
-        }
-        let lz = (mant as u16).leading_zeros() - 6;
-        let new_mant = (mant << (lz + 14)) & 0x7F_FFFF;
-        let new_exp = (127u32 - 14 - lz) << 23;
-        return f32::from_bits(sign | new_exp | new_mant);
-    }
-    if exp == 31 {
-        return f32::from_bits(sign | 0x7F80_0000 | (mant << 13));
-    }
-    let new_exp = (exp + (127 - 15)) << 23;
-    f32::from_bits(sign | new_exp | (mant << 13))
+    half::f16::from_bits(bits).to_f32()
 }
 
 /// Encode a layer-batch request with f16 residual.  Same shape as the f32

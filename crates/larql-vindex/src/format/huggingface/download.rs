@@ -501,3 +501,228 @@ where
         ))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure helpers in this module — `strip_etag_quoting`,
+    //! `want_model_file`, and `hf_cache_repo_dir`. The hf_hub-bound functions
+    //! (`resolve_hf_vindex`, `download_hf_weights`, the *_with_progress
+    //! variants) need an HF_ENDPOINT-mocking harness; that's tracked as a
+    //! separate follow-up because the routing path in
+    //! `head_etag_and_size` currently hardcodes `https://huggingface.co`.
+    use super::*;
+    use serial_test::serial;
+
+    // ─── strip_etag_quoting ────────────────────────────────────────────
+
+    #[test]
+    fn strip_etag_quoting_unquotes_strong_etag() {
+        assert_eq!(strip_etag_quoting("\"abc123\""), "abc123");
+    }
+
+    #[test]
+    fn strip_etag_quoting_handles_weak_etag() {
+        // `W/"abc123"` — weak prefix dropped, inner quoted hash returned.
+        assert_eq!(strip_etag_quoting("W/\"abc123\""), "abc123");
+    }
+
+    #[test]
+    fn strip_etag_quoting_trims_surrounding_whitespace() {
+        assert_eq!(strip_etag_quoting("  \"abc\"  "), "abc");
+    }
+
+    #[test]
+    fn strip_etag_quoting_handles_unquoted_input() {
+        // Defensive: HF should always quote, but if it doesn't, return
+        // the input unchanged after trimming.
+        assert_eq!(strip_etag_quoting("plainhash"), "plainhash");
+    }
+
+    #[test]
+    fn strip_etag_quoting_handles_empty_string() {
+        assert_eq!(strip_etag_quoting(""), "");
+    }
+
+    #[test]
+    fn strip_etag_quoting_handles_weak_unquoted() {
+        // Edge case: weak prefix without quotes — strip the prefix only.
+        assert_eq!(strip_etag_quoting("W/abc"), "abc");
+    }
+
+    // ─── want_model_file ───────────────────────────────────────────────
+
+    #[test]
+    fn want_model_file_accepts_safetensors() {
+        assert!(want_model_file("model.safetensors"));
+        assert!(want_model_file("model-00001-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn want_model_file_accepts_config_and_tokenizer() {
+        assert!(want_model_file("config.json"));
+        assert!(want_model_file("tokenizer.json"));
+        assert!(want_model_file("tokenizer_config.json"));
+        assert!(want_model_file("special_tokens_map.json"));
+    }
+
+    #[test]
+    fn want_model_file_rejects_pickle_torch_shards() {
+        // We always go through safetensors; .bin/.pt/.pth would double
+        // download size on the typical HF mirror.
+        assert!(!want_model_file("pytorch_model.bin"));
+        assert!(!want_model_file("pytorch_model-00001-of-00002.bin"));
+        assert!(!want_model_file("model.pt"));
+        assert!(!want_model_file("model.pth"));
+    }
+
+    #[test]
+    fn want_model_file_rejects_repo_metadata_and_media() {
+        for name in [
+            "README.md",
+            "README",
+            "readme.txt",
+            "LICENSE",
+            "license.txt",
+            ".gitattributes",
+            "preview.png",
+            "logo.JPG",
+            "banner.jpeg",
+            "demo.gif",
+            "diagram.svg",
+            "model.onnx",
+            "weights.gguf",
+        ] {
+            assert!(!want_model_file(name), "should reject {name}");
+        }
+    }
+
+    #[test]
+    fn want_model_file_case_insensitive() {
+        // The lowercase pre-pass means uppercased extensions also reject.
+        assert!(!want_model_file("LOGO.PNG"));
+        assert!(!want_model_file("Model.GGUF"));
+    }
+
+    #[test]
+    fn want_model_file_accepts_unknown_supporting_files() {
+        // Anything that isn't on the reject list is kept — the wanted
+        // set is open-ended (model configs vary by family).
+        assert!(want_model_file("generation_config.json"));
+        assert!(want_model_file("chat_template.jinja"));
+    }
+
+    // ─── hf_cache_repo_dir ─────────────────────────────────────────────
+    //
+    // Env-var driven; serialised to avoid races on HUGGINGFACE_HUB_CACHE /
+    // HF_HOME / HOME between parallel test threads.
+
+    /// RAII guard for `(key, value)` pairs in std::env. Restores the
+    /// original values on drop so neighbouring tests aren't affected.
+    struct EnvSet {
+        keys: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvSet {
+        fn new(pairs: &[(&str, Option<&str>)]) -> Self {
+            let mut keys = Vec::new();
+            for (k, v) in pairs {
+                let prev = std::env::var(*k).ok();
+                match v {
+                    Some(val) => std::env::set_var(*k, val),
+                    None => std::env::remove_var(*k),
+                }
+                keys.push((k.to_string(), prev));
+            }
+            Self { keys }
+        }
+    }
+
+    impl Drop for EnvSet {
+        fn drop(&mut self) {
+            for (k, prev) in self.keys.drain(..) {
+                match prev {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn hf_cache_repo_dir_uses_huggingface_hub_cache_when_set() {
+        let _e = EnvSet::new(&[
+            ("HUGGINGFACE_HUB_CACHE", Some("/tmp/test-hub")),
+            ("HF_HOME", None),
+        ]);
+        let dir = hf_cache_repo_dir(RepoKind::Dataset, "owner/name").unwrap();
+        assert_eq!(dir.to_string_lossy(), "/tmp/test-hub/datasets--owner--name");
+    }
+
+    #[test]
+    #[serial]
+    fn hf_cache_repo_dir_uses_hf_home_when_hub_unset() {
+        let _e = EnvSet::new(&[
+            ("HUGGINGFACE_HUB_CACHE", None),
+            ("HF_HOME", Some("/tmp/hf-home")),
+        ]);
+        let dir = hf_cache_repo_dir(RepoKind::Model, "owner/name").unwrap();
+        assert_eq!(
+            dir.to_string_lossy(),
+            "/tmp/hf-home/hub/models--owner--name"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hf_cache_repo_dir_falls_back_to_home_default() {
+        let _e = EnvSet::new(&[
+            ("HUGGINGFACE_HUB_CACHE", None),
+            ("HF_HOME", None),
+            ("HOME", Some("/tmp/fallback-home")),
+        ]);
+        let dir = hf_cache_repo_dir(RepoKind::Dataset, "owner/repo").unwrap();
+        assert_eq!(
+            dir.to_string_lossy(),
+            "/tmp/fallback-home/.cache/huggingface/hub/datasets--owner--repo"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hf_cache_repo_dir_returns_none_when_home_missing() {
+        let _e = EnvSet::new(&[
+            ("HUGGINGFACE_HUB_CACHE", None),
+            ("HF_HOME", None),
+            ("HOME", None),
+        ]);
+        assert!(hf_cache_repo_dir(RepoKind::Model, "owner/name").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn hf_cache_repo_dir_replaces_slash_in_repo_id() {
+        // HF cache uses `--` as the path separator; every `/` in the
+        // repo ID maps to a literal `--` in the cache directory name.
+        let _e = EnvSet::new(&[
+            ("HUGGINGFACE_HUB_CACHE", Some("/tmp/x")),
+            ("HF_HOME", None),
+        ]);
+        let dir = hf_cache_repo_dir(RepoKind::Model, "complex/owner/name").unwrap();
+        assert!(dir.to_string_lossy().ends_with("models--complex--owner--name"));
+    }
+
+    #[test]
+    #[serial]
+    fn hf_cache_repo_dir_distinguishes_dataset_from_model() {
+        let _e = EnvSet::new(&[
+            ("HUGGINGFACE_HUB_CACHE", Some("/tmp/y")),
+            ("HF_HOME", None),
+        ]);
+        let ds = hf_cache_repo_dir(RepoKind::Dataset, "x/y").unwrap();
+        let md = hf_cache_repo_dir(RepoKind::Model, "x/y").unwrap();
+        assert_ne!(ds, md, "RepoKind must produce distinct cache dirs");
+        assert!(ds.to_string_lossy().contains("datasets--"));
+        assert!(md.to_string_lossy().contains("models--"));
+    }
+}

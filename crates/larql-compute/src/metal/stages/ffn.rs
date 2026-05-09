@@ -18,11 +18,99 @@ use std::ffi::c_void;
 
 use super::quant_matvec;
 
-/// Activation variant for this layer.
-#[derive(Clone, Copy)]
-pub enum Activation {
-    SiLU,
-    GeluTanh,
+pub use crate::pipeline::Activation;
+
+/// Whether the Metal backend ships a shader for `act`. SiLU and
+/// GELU-tanh are wired today; GeluExact and ReLU have no kernels.
+///
+/// Pure function — independent of any Metal pipeline. Used by the
+/// dispatch helpers below and exposed so callers (and tests) can
+/// validate a layer before opening a command encoder.
+pub fn metal_supports_activation(act: Activation) -> bool {
+    matches!(act, Activation::Silu | Activation::GeluTanh)
+}
+
+/// Panic with a clear message when `act` has no Metal shader.
+/// Production decode call sites use this to fail loud rather than
+/// silently routing GeluExact / ReLU layers to SiLU (the prior
+/// behaviour, which produced wrong logits with no signal).
+pub fn assert_metal_activation_supported(act: Activation, site: &'static str) {
+    if !metal_supports_activation(act) {
+        panic!(
+            "{site}: no shader for {act:?}. \
+             Add a kernel and pipeline before routing this activation, or \
+             route the layer through CPU. Silently falling back to SiLU is \
+             no longer supported."
+        );
+    }
+}
+
+/// Pick the GEGLU-style "act(gate) * up" kernel for this activation.
+fn geglu_pipeline_for<'a>(
+    activation: Activation,
+    silu: &'a ComputePipelineState,
+    gelu_tanh: &'a ComputePipelineState,
+) -> &'a ComputePipelineState {
+    assert_metal_activation_supported(activation, "metal::stages::ffn::geglu_pipeline_for");
+    match activation {
+        Activation::Silu => silu,
+        Activation::GeluTanh => gelu_tanh,
+        // assert above prevents reaching here.
+        Activation::GeluExact | Activation::ReLU => unreachable!(),
+    }
+}
+
+/// Pick the in-place activation kernel (Standard / non-gated FFN path).
+fn activation_pipeline_for<'a>(
+    activation: Activation,
+    silu: &'a ComputePipelineState,
+    gelu_tanh: &'a ComputePipelineState,
+) -> &'a ComputePipelineState {
+    assert_metal_activation_supported(activation, "metal::stages::ffn::activation_pipeline_for");
+    match activation {
+        Activation::Silu => silu,
+        Activation::GeluTanh => gelu_tanh,
+        Activation::GeluExact | Activation::ReLU => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod activation_support_tests {
+    use super::*;
+
+    #[test]
+    fn metal_supports_silu_and_gelu_tanh() {
+        assert!(metal_supports_activation(Activation::Silu));
+        assert!(metal_supports_activation(Activation::GeluTanh));
+    }
+
+    #[test]
+    fn metal_does_not_support_gelu_exact_or_relu() {
+        assert!(!metal_supports_activation(Activation::GeluExact));
+        assert!(!metal_supports_activation(Activation::ReLU));
+    }
+
+    /// Pin the panic message — production decode reads this string when
+    /// a malformed model lands on Metal. Same message must mention the
+    /// activation variant (so logs are actionable) and the site (so
+    /// the reader knows where to look).
+    #[test]
+    #[should_panic(expected = "no shader for ReLU")]
+    fn assert_panics_on_relu_with_clear_message() {
+        assert_metal_activation_supported(Activation::ReLU, "test_site");
+    }
+
+    #[test]
+    #[should_panic(expected = "no shader for GeluExact")]
+    fn assert_panics_on_gelu_exact_with_clear_message() {
+        assert_metal_activation_supported(Activation::GeluExact, "test_site");
+    }
+
+    #[test]
+    fn assert_is_a_noop_on_supported() {
+        assert_metal_activation_supported(Activation::Silu, "test");
+        assert_metal_activation_supported(Activation::GeluTanh, "test");
+    }
 }
 
 /// Optional fused activation+down kernels. When `down_format` matches
@@ -150,8 +238,12 @@ pub fn encode_gated(
     // path for benchmarking once the kernel is fixed.
     let use_fused = crate::options::env_flag(crate::options::ENV_FUSED_DOWN);
     let fused_kernel = if use_fused {
+        // Q6_K + non-tanh combos return None deliberately (no fused
+        // kernel exists). GeluExact / ReLU also return None — they
+        // hit the explicit panic in `geglu_pipeline_for` below if the
+        // separated path also reaches them.
         match (down_format, activation) {
-            (crate::QuantFormat::Q4_K, Activation::SiLU) => fused_down.q4k_silu,
+            (crate::QuantFormat::Q4_K, Activation::Silu) => fused_down.q4k_silu,
             (crate::QuantFormat::Q4_K, Activation::GeluTanh) => fused_down.q4k_gelu_tanh,
             _ => None,
         }
@@ -186,10 +278,8 @@ pub fn encode_gated(
     {
         let total_inter = (seq_len * inter) as u64;
         let total_inter_val = (seq_len * inter) as u32;
-        let geglu_pipe = match activation {
-            Activation::GeluTanh => geglu_gelu_tanh_pipeline,
-            Activation::SiLU => geglu_silu_pipeline,
-        };
+        let geglu_pipe =
+            geglu_pipeline_for(activation, geglu_silu_pipeline, geglu_gelu_tanh_pipeline);
         enc.set_compute_pipeline_state(geglu_pipe);
         enc.set_buffer(0, Some(gate_scratch), 0);
         enc.set_buffer(1, Some(up_scratch), 0);
@@ -274,10 +364,7 @@ pub fn encode_standard(
     {
         let total_inter = (seq_len * inter) as u64;
         let total_inter_val = (seq_len * inter) as u32;
-        let act_pipe = match activation {
-            Activation::GeluTanh => gelu_tanh_pipeline,
-            Activation::SiLU => silu_pipeline,
-        };
+        let act_pipe = activation_pipeline_for(activation, silu_pipeline, gelu_tanh_pipeline);
         enc.set_compute_pipeline_state(act_pipe);
         enc.set_buffer(0, Some(up_scratch), 0);
         enc.set_buffer(1, Some(act_scratch), 0);

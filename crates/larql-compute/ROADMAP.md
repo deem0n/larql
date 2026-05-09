@@ -51,6 +51,11 @@ Findings now tracked here so follow-up work does not live only in review notes:
 - [ ] Replace hard-coded QKV quant-format branches with a descriptor/table keyed
   by `(q_format, k_format, v_format)` so new model-format combinations do not
   add another inline conditional.
+- [ ] Fix the trait-level `QuantMatVec` dispatch for `QuantFormat::Q8_0`.
+  `backend/quant_matvec.rs` currently routes Q8_0 through the Q4_0 kernel path,
+  but GGML Q8_0 blocks are 34 bytes per 32 values while Q4_0 blocks are 18
+  bytes. Add a real Q8_0 backend path or make the generic trait return `None`
+  for Q8_0 instead of silently interpreting Q8 bytes as Q4.
 - [ ] Align Metal FFN activation handling with public `pipeline::Activation`;
   unsupported activations should fail explicitly or use a known fallback.
 - [ ] Name and validate remaining format/kernel constants (`256`, `144`, `210`,

@@ -605,10 +605,11 @@ pub fn dispatch_full_pipeline(
         // ── 7-9. FFN: gate+up → activation → down. Format-aware per position. ──
         {
             use crate::metal::stages::ffn;
-            let act = match layers[l].activation {
-                crate::Activation::GeluTanh => ffn::Activation::GeluTanh,
-                _ => ffn::Activation::SiLU,
-            };
+            // `ffn::Activation` is now a re-export of `crate::Activation`; the
+            // FFN dispatch panics on activations the Metal backend doesn't have
+            // a shader for (GeluExact, ReLU). The previous translation silently
+            // routed all unknown variants to SiLU and produced wrong output.
+            let act: ffn::Activation = layers[l].activation;
             let h_stride = (hidden * 4) as u64;
             let inter_stride = (inter * 4) as u64;
             let q8_stride = hidden as u64;

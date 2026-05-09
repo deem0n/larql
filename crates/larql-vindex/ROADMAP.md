@@ -85,6 +85,20 @@
 
 ## P0: Active
 
+### Review follow-ups from 2026-05-09
+
+- [ ] Harden attention weight manifest accessors in
+  `index/storage/attn.rs`. `attn_q8_layer_data`,
+  `attn_q4k_layer_data`, and `attn_q4_layer_slices` should validate
+  `offset + length <= mmap.len()` with checked arithmetic before slicing,
+  matching the defensive behavior already used by FFN Q4K accessors. A stale
+  or corrupt attention manifest should return `None` or a typed load error,
+  not panic during query/decode.
+- [ ] Replace `walker/utils.rs::current_date()` with a real calendar-date
+  implementation or remove the date from walker metadata. The current helper
+  approximates years as 365 days and months as 30 days, so extraction metadata
+  can be wrong even though the format looks valid.
+
 ### Modularity + magic-literal debt
 
 **Status**: Mostly closed. Only the large-file decomposition bullet

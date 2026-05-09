@@ -302,14 +302,38 @@ fn project_to_vocab(
 }
 
 fn current_date() -> String {
-    let now = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let days = now / 86400;
-    let year = 1970 + (days / 365);
-    let remaining = days % 365;
-    let month = remaining / 30 + 1;
-    let day = remaining % 30 + 1;
+    let mut days = (secs / 86400) as i64;
+    let mut year: i64 = 1970;
+    loop {
+        let n = if is_leap_year(year) { 366 } else { 365 };
+        if days < n {
+            break;
+        }
+        days -= n;
+        year += 1;
+    }
+    let month_lens: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1;
+    for n in month_lens {
+        if days < n {
+            break;
+        }
+        days -= n;
+        month += 1;
+    }
+    let day = days + 1;
     format!("{year}-{month:02}-{day:02}")
+}
+
+#[inline]
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }

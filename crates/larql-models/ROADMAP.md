@@ -24,6 +24,17 @@ Recommended next sequence:
 
 `larql-models` now exposes validated APIs. Update downstream inference, vindex extraction, CLI, and server entry points to use `detect_*_validated` or `load_*_validated` where invalid configs should fail fast.
 
+### Deterministic HuggingFace cache resolution
+**Effort**: Low
+**Status**: Not started
+
+`loading/safetensors.rs::resolve_model_path` scans cached snapshot
+directories and returns the first snapshot with safetensors. `read_dir` order
+is not stable and the resolver ignores `refs/main`, so the same model ID can
+resolve to an old or arbitrary cached revision. Prefer the commit recorded in
+`models--.../refs/main` when no explicit revision is provided, then fall back
+to a deterministic snapshot ordering.
+
 ### Architecture capability contracts
 **Effort**: Medium  
 **Status**: Not started

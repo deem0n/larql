@@ -493,9 +493,15 @@ impl MetalBackend {
         inter_val: u32,
         inter_threads: u64,
     ) {
+        crate::metal::stages::ffn::assert_metal_activation_supported(
+            layer.activation,
+            "metal::decode::encode_geglu",
+        );
         let geglu = match layer.activation {
+            crate::Activation::Silu => &self.geglu_pipeline,
             crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,
-            _ => &self.geglu_pipeline,
+            // assert above prevents reaching here.
+            crate::Activation::GeluExact | crate::Activation::ReLU => unreachable!(),
         };
         enc.set_compute_pipeline_state(geglu);
         enc.set_buffer(0, Some(bufs.gate_out_scratch), 0);
@@ -523,9 +529,14 @@ impl MetalBackend {
         hidden_val: u32,
         inter_padded_val: u32,
     ) {
+        crate::metal::stages::ffn::assert_metal_activation_supported(
+            layer.activation,
+            "metal::decode::encode_q4k_fused_geglu_down",
+        );
         let kernel = match layer.activation {
+            crate::Activation::Silu => &self.q4k_geglu_silu_down_pipeline,
             crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
-            _ => &self.q4k_geglu_silu_down_pipeline,
+            crate::Activation::GeluExact | crate::Activation::ReLU => unreachable!(),
         };
         Self::dispatch_fused_geglu_down(enc, kernel, bufs, hidden, hidden_val, inter_padded_val);
     }
@@ -815,9 +826,14 @@ impl MetalBackend {
         inter_val: u32,
         inter_threads: u64,
     ) {
+        crate::metal::stages::ffn::assert_metal_activation_supported(
+            layer.activation,
+            "metal::decode::encode_activation",
+        );
         let pipe = match layer.activation {
+            crate::Activation::Silu => &self.silu_pipeline,
             crate::Activation::GeluTanh => &self.gelu_tanh_pipeline,
-            _ => &self.silu_pipeline,
+            crate::Activation::GeluExact | crate::Activation::ReLU => unreachable!(),
         };
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(in_buf), 0);
