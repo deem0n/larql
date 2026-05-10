@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::ast::{Component, ExtractLevel, Range};
 use crate::error::LqlError;
 use crate::executor::helpers::format_number;
+use crate::executor::memit_persist::load_memit_store;
 use crate::executor::{Backend, Session};
 use crate::relations::RelationClassifier;
 use larql_vindex::format::filenames::KNN_STORE_BIN;
@@ -86,13 +87,25 @@ impl Session {
             }
         }
 
+        // Rehydrate the L2 MEMIT store if a snapshot already exists at
+        // the extract destination (overwriting an extracted vindex
+        // re-runs build but should preserve prior compaction history).
+        let memit_store = match load_memit_store(&output_dir) {
+            Ok(Some(store)) => store,
+            Ok(None) => larql_vindex::MemitStore::new(),
+            Err(e) => {
+                eprintln!("warning: failed to load memit_store.json: {e}");
+                larql_vindex::MemitStore::new()
+            }
+        };
+
         self.backend = Backend::Vindex {
             path: output_dir,
             config,
             patched,
             relation_classifier,
             router,
-            memit_store: larql_vindex::MemitStore::new(),
+            memit_store,
         };
 
         Ok(out)

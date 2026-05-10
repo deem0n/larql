@@ -10,7 +10,7 @@ use super::super::error::RemoteMoeError;
 use super::super::metrics;
 use super::super::wire::{
     decode_expert_response, encode_expert_request, ExpertCallItem, ExpertResultItem,
-    EXPERT_BINARY_CONTENT_TYPE,
+    EXPERT_BATCH_PATH, EXPERT_BINARY_CONTENT_TYPE,
 };
 use super::{uds_call, Shard, ShardTransport};
 
@@ -86,7 +86,7 @@ impl Shard {
 
             ShardTransport::Http(client) => {
                 // Binary HTTP fallback (application/x-larql-expert).
-                let url = format!("{}/v1/expert/batch", self.config.url);
+                let url = format!("{}{EXPERT_BATCH_PATH}", self.config.url);
                 let body = encode_expert_request(requests);
                 let request_bytes = body.len();
                 let resp = client
@@ -120,7 +120,7 @@ impl Shard {
                 let body = encode_expert_request(requests);
                 let request_bytes = body.len();
                 let resp_bytes =
-                    uds_call(uds, "/v1/expert/batch", EXPERT_BINARY_CONTENT_TYPE, &body)?;
+                    uds_call(uds, EXPERT_BATCH_PATH, EXPERT_BINARY_CONTENT_TYPE, &body)?;
                 metrics::record_call(
                     &self.config.url,
                     request_bytes,

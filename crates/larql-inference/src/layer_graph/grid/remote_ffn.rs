@@ -117,7 +117,7 @@ pub fn generate_with_remote_ffn(
         let step_ffn_cell = std::cell::Cell::new(0.0f64);
         let mut moe_fn = |layer: usize, h_post_attn: &[f32]| -> Vec<f32> {
             let t_ffn = std::time::Instant::now();
-            let result = if hidden % 256 == 0 {
+            let result = if hidden % crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS == 0 {
                 let h_ffn = apply_norm_for_ffn(weights, h_post_attn, layer);
                 let q8k = quantize_x_to_q8k(&h_ffn);
                 remote.forward_single_q8k(layer, &q8k).unwrap_or_else(|| {
@@ -215,7 +215,7 @@ fn dispatch_ffn_with_q8k_fallback(
     h_capture: &[Vec<f32>],
 ) -> Vec<Vec<f32>> {
     let hidden = h_capture.first().map(|v| v.len()).unwrap_or(0);
-    if hidden == 0 || hidden % 256 != 0 {
+    if hidden == 0 || hidden % crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS != 0 {
         return remote.forward_predispatch_all(h_capture);
     }
 

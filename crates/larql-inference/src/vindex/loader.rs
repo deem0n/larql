@@ -42,6 +42,12 @@ use larql_vindex::format::filenames::{
 };
 use larql_vindex::{SilentLoadCallbacks, VectorIndex, VindexError};
 
+/// Env var pointing at a real `*.vindex` directory. Real-model
+/// integration tests (`#[ignore]` in `layer_graph::generate::tests` and
+/// `forward::memit::tests`) honour this; if unset they no-op. Single
+/// source of truth so the literal isn't repeated across test fixtures.
+pub const ENV_VINDEX_PATH: &str = "LARQL_VINDEX_PATH";
+
 /// Open a vindex for inference: load core, lm_head (best-effort),
 /// attention weights (strict), FFN weights (strict).
 ///

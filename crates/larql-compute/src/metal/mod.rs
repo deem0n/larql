@@ -120,6 +120,18 @@ pub struct MetalBackend {
     /// pulled inside the backend so the local decode path benefits
     /// without each caller threading a cache through.
     moe_scratch: std::sync::Mutex<Option<moe_dispatch::MoeScratch>>,
+    /// Per-Layer Embeddings precomputed input table (Gemma 4 E2B).
+    ///
+    /// Set by [`prepare_ple_inputs`](Self::prepare_ple_inputs) before each
+    /// `decode_token*` / prefill call when the active arch needs PLE; the
+    /// per-layer Metal dispatch reads this buffer + offset for the active
+    /// (layer, position). `None` for non-PLE archs.
+    ///
+    /// Carried on the backend (rather than threaded through every decode
+    /// call) so the Metal-side trait surface and the per-layer dispatch
+    /// signatures don't grow an extra arg for a feature only Gemma 4 E2B
+    /// uses today.
+    ple_inputs: std::sync::Mutex<Option<PleInputBuffer>>,
     // (rms_norm_q8 / residual_norm{,_q8,_store} — moved into
     //  `NormKernels` (the `norms` field).)
     /// Dedicated row-per-simdgroup f32 gemv for the LM head. Used in
@@ -252,6 +264,7 @@ impl MetalBackend {
             ffn,
             kv_cache: std::sync::Mutex::new(None),
             moe_scratch: std::sync::Mutex::new(None),
+            ple_inputs: std::sync::Mutex::new(None),
             f32_gemv_pipeline,
             f32_argmax_partial_pipeline,
             f32_topk_partial_pipeline,
@@ -322,5 +335,69 @@ impl MetalBackend {
         let mut guard = self.kv_cache.lock().unwrap();
         self.ensure_kv_cache_for_shapes(&mut guard, shapes, decode::DEFAULT_KV_CACHE_MAX_SEQ);
         guard
+    }
+
+    /// Upload the precomputed Per-Layer Embeddings table for the next
+    /// decode / prefill call. `data` is `[positions × num_layers × ple_dim]`
+    /// f32 in position-major order — for one-token decode `positions = 1`,
+    /// for prefill `positions = seq_len`.
+    ///
+    /// Layout (offset for the (position, layer) row):
+    /// `((position * num_layers) + layer) * ple_dim` f32 elements from
+    /// the start of `data`. The decode loop computes the byte offset and
+    /// passes it through to the per-layer PLE dispatch.
+    ///
+    /// Set once before generation begins (decode reuses the same `[1 × num_layers × ple_dim]`
+    /// upload across positions if the inference layer is responsible for
+    /// re-computing per-token).  Call [`clear_ple_inputs`](Self::clear_ple_inputs)
+    /// when generation finishes.
+    pub fn prepare_ple_inputs(&self, data: &[f32], num_layers: usize, ple_dim: usize) {
+        debug_assert!(
+            data.len() % (num_layers * ple_dim) == 0,
+            "PLE input table size {} must be a multiple of num_layers * ple_dim ({} * {})",
+            data.len(),
+            num_layers,
+            ple_dim,
+        );
+        let positions = data.len() / (num_layers * ple_dim);
+        let buffer = self.bufs.transient_from_f32(data);
+        *self.ple_inputs.lock().unwrap() = Some(PleInputBuffer {
+            buffer,
+            num_layers,
+            ple_dim,
+            positions,
+        });
+    }
+
+    /// Drop the PLE input table.  No-op if none was set.
+    pub fn clear_ple_inputs(&self) {
+        *self.ple_inputs.lock().unwrap() = None;
+    }
+
+    /// Internal: snapshot the current PLE inputs (cloned `Buffer` handle —
+    /// Metal `Buffer` is refcounted) so the per-layer decode loop can
+    /// release the mutex while still holding a stable reference.
+    pub(crate) fn ple_inputs_snapshot(&self) -> Option<PleInputBuffer> {
+        self.ple_inputs.lock().unwrap().clone()
+    }
+}
+
+/// Precomputed Per-Layer Embeddings input table held on the Metal
+/// backend.  See [`MetalBackend::prepare_ple_inputs`].
+#[derive(Clone)]
+pub(crate) struct PleInputBuffer {
+    pub buffer: metal::Buffer,
+    pub num_layers: usize,
+    pub ple_dim: usize,
+    pub positions: usize,
+}
+
+impl PleInputBuffer {
+    /// Byte offset into [`Self::buffer`] for the `[ple_dim]` row at
+    /// `(position, layer)`. Position-major layout.
+    pub fn row_offset_bytes(&self, position: usize, layer: usize) -> u64 {
+        debug_assert!(position < self.positions);
+        debug_assert!(layer < self.num_layers);
+        ((position * self.num_layers + layer) * self.ple_dim * 4) as u64
     }
 }

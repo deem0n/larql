@@ -24,6 +24,9 @@
 
 pub const MULTI_LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-multi-layer";
 
+/// HTTP path served by the multi-layer batch endpoint.
+pub const MULTI_LAYER_BATCH_PATH: &str = "/v1/experts/multi-layer-batch";
+
 /// Q8K-prenormed variant: client sends `h_norm` pre-quantised to Q8_K
 /// (already computed during routing — zero extra client compute).  Server
 /// skips `pre_experts_norm` + `quantize_h_norm_for_q4k` and calls the
@@ -41,6 +44,9 @@ pub const MULTI_LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-mu
 ///     u32[num_experts]  expert_ids
 ///     f32[num_experts]  weights
 pub const MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE: &str = "application/x-larql-experts-multi-layer-q8k";
+
+/// HTTP path served by the Q8K-prenormed multi-layer batch endpoint.
+pub const MULTI_LAYER_BATCH_Q8K_PATH: &str = "/v1/experts/multi-layer-batch-q8k";
 
 pub struct MultiLayerTask {
     pub layer: usize,
@@ -149,7 +155,7 @@ pub fn decode_multi_layer_response(bytes: &[u8]) -> Option<Vec<MultiLayerResult>
 
 // ── Q8K-prenormed wire ────────────────────────────────────────────────────────
 
-const ELEMS_PER_Q8K_BLOCK: usize = 256;
+use crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS as ELEMS_PER_Q8K_BLOCK;
 const SUMS_PER_Q8K_BLOCK: usize = 8;
 
 pub fn encode_multi_layer_request_q8k(tasks: &[MultiLayerTaskQ8K]) -> Vec<u8> {

@@ -519,6 +519,16 @@ pub struct FullPipelineLayer<'a> {
     /// distinct from the `_1` dense-branch norm stored in `post_ffn_norm`).
     /// `None` → fall back to `post_ffn_norm` (legacy behavior).
     pub moe_outer_post_norm: Option<&'a [f32]>,
+
+    // ── Per-Layer Embeddings (Gemma 4 E2B) ──
+    /// Per-layer input gate matrix `[ple_dim, hidden]` row-major, f32.
+    /// `None` for non-PLE archs.
+    pub ple_input_gate: Option<&'a [f32]>,
+    /// Per-layer output projection matrix `[hidden, ple_dim]` row-major, f32.
+    /// `None` for non-PLE archs.
+    pub ple_projection: Option<&'a [f32]>,
+    /// Post-PLE RMSNorm weight `[hidden]`, f32. `None` for non-PLE archs.
+    pub ple_post_norm: Option<&'a [f32]>,
 }
 
 impl<'a> FullPipelineLayer<'a> {
@@ -607,6 +617,30 @@ impl<'a> FullPipelineLayer<'a> {
     pub fn is_hybrid_moe(&self) -> bool {
         self.moe.is_some()
     }
+
+    /// Per-Layer Embeddings spec for this layer, if active. Returns `None`
+    /// unless all three required weights are present (gate, projection, post-norm).
+    pub fn ple_spec(&self) -> Option<PleSpec<'a>> {
+        Some(PleSpec {
+            input_gate: self.ple_input_gate?,
+            projection: self.ple_projection?,
+            post_norm: self.ple_post_norm?,
+        })
+    }
+}
+
+/// Per-Layer Embeddings (Gemma 4 E2B) per-layer weights view.
+///
+/// Returned by [`FullPipelineLayer::ple_spec`] only when all three required
+/// weights are present.  All slices are row-major f32.
+#[derive(Clone, Copy)]
+pub struct PleSpec<'a> {
+    /// `[ple_dim, hidden]` — projects hidden state down to `ple_dim` for gating.
+    pub input_gate: &'a [f32],
+    /// `[hidden, ple_dim]` — projects gated PLE signal back up to hidden state.
+    pub projection: &'a [f32],
+    /// `[hidden]` — RMSNorm applied to the projection output before residual add.
+    pub post_norm: &'a [f32],
 }
 
 // ── Defaults ──
@@ -670,6 +704,9 @@ impl Default for FullPipelineLayer<'_> {
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
             ffn_is_remote: false,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
         }
     }
 }

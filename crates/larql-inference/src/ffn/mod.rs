@@ -18,6 +18,13 @@ pub mod weight;
 
 use ndarray::Array2;
 
+/// Number of elements in one Q4_K / Q8_K super-block (the block size both
+/// formats share). Hidden sizes that are not a multiple of this value
+/// can't use the block-quantised wire formats — `walk_ffn` and
+/// `grid::remote_ffn` use this for their dispatch checks. Mirrors
+/// llama.cpp's `QK_K`.
+pub const Q4K_Q8K_SUPERBLOCK_ELEMS: usize = 256;
+
 // ── Trait ──
 
 /// FFN backend trait. Defines how a single layer's FFN is computed.

@@ -35,6 +35,12 @@ base64 = "0.22"
 safetensors = "0.5"
 memmap2 = "0.9"
 
+# Refcounted, slice-cheap byte handle returned by the `VindexStorage`
+# trait. `Bytes::from_owner(Arc<Mmap>)` is zero-copy from the existing
+# mmap path and Redis / S3 backends can return owned bytes without
+# lifetime contortions. Already transitive via reqwest / hf-hub.
+bytes = "1"
+
 # OS-level mmap hints (madvise)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

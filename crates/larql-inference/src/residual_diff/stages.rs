@@ -45,6 +45,10 @@ use larql_models::ModelWeights;
 use larql_vindex::VectorIndex;
 
 use super::compare::{LayerStat, ParityThreshold};
+use crate::forward::dump_config::{
+    cpu_stage_prefix, decode_layer_prefix, metal_layer_prefix, ENV_CPU_STAGE_DUMP,
+    ENV_DECODE_DUMP_LAYERS, ENV_METAL_DUMP_LAYERS, ENV_STAGE_DUMP_LAYER,
+};
 use crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 
 /// In-memory representation of one backend's per-stage dump for one
@@ -133,14 +137,14 @@ impl StageCapture {
         layer: usize,
     ) -> Result<Self, String> {
         let dir = run_with_two_env_vars(
-            "LARQL_CPU_STAGE_DUMP",
-            "LARQL_STAGE_DUMP_LAYER",
+            ENV_CPU_STAGE_DUMP,
+            ENV_STAGE_DUMP_LAYER,
             &layer.to_string(),
             || {
                 let _ = crate::vindex::predict_q4k_hidden(weights, ids, index, None);
             },
         )?;
-        let prefix = format!("cpu_L{layer}_");
+        let prefix = cpu_stage_prefix(layer);
         Ok(Self {
             stages: read_stage_dir(dir.path(), &prefix)?,
             layer,
@@ -165,8 +169,8 @@ impl StageCapture {
         layer: usize,
     ) -> Result<Self, String> {
         let dir = run_with_two_env_vars(
-            "LARQL_METAL_DUMP_LAYERS",
-            "LARQL_STAGE_DUMP_LAYER",
+            ENV_METAL_DUMP_LAYERS,
+            ENV_STAGE_DUMP_LAYER,
             &layer.to_string(),
             || {
                 let cached = crate::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
@@ -184,7 +188,7 @@ impl StageCapture {
                 );
             },
         )?;
-        let prefix = format!("metal_layer_{layer:02}_");
+        let prefix = metal_layer_prefix(layer);
         Ok(Self {
             stages: read_stage_dir(dir.path(), &prefix)?,
             layer,
@@ -276,8 +280,8 @@ impl StageCapture {
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[new_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
         let dir = run_with_two_env_vars(
-            "LARQL_DECODE_DUMP_LAYERS",
-            "LARQL_STAGE_DUMP_LAYER",
+            ENV_DECODE_DUMP_LAYERS,
+            ENV_STAGE_DUMP_LAYER,
             &layer.to_string(),
             || {
                 let _ = backend.decode_token(
@@ -294,7 +298,7 @@ impl StageCapture {
                 );
             },
         )?;
-        let prefix = format!("decode_layer_{layer:02}_");
+        let prefix = decode_layer_prefix(layer);
         Ok(Self {
             stages: read_stage_dir(dir.path(), &prefix)?,
             layer,

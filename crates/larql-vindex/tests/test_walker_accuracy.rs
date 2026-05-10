@@ -80,8 +80,11 @@ const GOLDEN_WEIGHT_WALKER_LAYER0: &str =
     "53bbb2110e2767a9683a872067ae4eb8253ee040db91cd4ba95d91e8540487dd";
 const GOLDEN_ATTENTION_WALKER_LAYER0: &str =
     "c3f76f8f6dd590534eda2193786459f178c3af7a44ee8862ec11a69e09ca1905";
+// Regenerated 2026-05-10: the canonicalisation now strips the `_header`
+// record so the wall-clock `extraction_date` field doesn't make the
+// golden drift every day. The hash covers only walker content rows.
 const GOLDEN_VECTOR_EXTRACTOR_FFN_DOWN_LAYER0: &str =
-    "3dfe941ac3e39222516939d92fe19461608d53c74c3fb4df32be27e2dabe0a70";
+    "8b5e221b150147ed40b0cfa67fdfc264e0628ab6cd6c59c2f9419e9350589b83";
 
 fn check_or_print(label: &str, actual: &str, golden: &str) {
     if std::env::var("LARQL_PRINT_GOLDEN").is_ok() {
@@ -154,8 +157,13 @@ fn vector_extractor_ffn_down_byte_identical() {
     let path = out.join("ffn_down.vectors.jsonl");
     let text = std::fs::read_to_string(&path).unwrap();
     // Sort lines so re-ordering of feature loops doesn't break the
-    // golden — content is what we care about.
-    let mut lines: Vec<&str> = text.lines().collect();
+    // golden — content is what we care about. Skip the `_header`
+    // record: it carries `extraction_date` (today's date), which would
+    // otherwise drift the hash every wall-clock day.
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.contains("\"_header\":true"))
+        .collect();
     lines.sort();
     let canonical = lines.join("\n");
     let hex = sha256_hex(canonical.as_bytes());

@@ -142,6 +142,9 @@ mod tests {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
         }
     }
 

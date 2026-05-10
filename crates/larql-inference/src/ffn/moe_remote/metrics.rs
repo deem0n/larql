@@ -1,10 +1,14 @@
 //! Lightweight transport-byte accounting for remote MoE dispatch.
 //!
 //! Enabled by `LARQL_MOE_BYTES=1`; also enabled when `LARQL_MOE_TIMING=1` so
-//! timing runs get byte/shard accounting without another flag.
+//! timing runs get byte/shard accounting without another flag. Both reads
+//! go through [`RemoteMoeRuntime`] so [`record_call`] / [`record_skip`]
+//! pay no per-call env-var cost.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
+
+use super::runtime::RemoteMoeRuntime;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShardTransportTotals {
@@ -63,11 +67,11 @@ fn state() -> &'static Mutex<BTreeMap<String, ShardTransportTotals>> {
 }
 
 pub fn enabled() -> bool {
-    std::env::var("LARQL_MOE_BYTES").is_ok() || std::env::var("LARQL_MOE_TIMING").is_ok()
+    RemoteMoeRuntime::get().moe_bytes_enabled
 }
 
 pub fn shard_timing_enabled() -> bool {
-    std::env::var("LARQL_MOE_SHARD_TIMING").is_ok()
+    RemoteMoeRuntime::get().moe_shard_timing
 }
 
 pub fn snapshot() -> TransportSnapshot {

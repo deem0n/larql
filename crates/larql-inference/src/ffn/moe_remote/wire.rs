@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 pub const EXPERT_BINARY_CONTENT_TYPE: &str = "application/x-larql-expert";
 
+/// HTTP path served by the single-expert / batched-expert binary
+/// endpoint matched to [`EXPERT_BINARY_CONTENT_TYPE`].
+pub const EXPERT_BATCH_PATH: &str = "/v1/expert/batch";
+
 /// Content type for the `/v1/experts/layer-batch` endpoint — the layer-batched
 /// MoE wire format that ships one residual + K (expert_id, weight) pairs and
 /// receives back ONE weighted-sum vector.  Eliminates the K-1 redundant
@@ -19,6 +23,9 @@ pub const EXPERT_BINARY_CONTENT_TYPE: &str = "application/x-larql-expert";
 /// and the K-1 redundant `pre_experts_norm` + Q8_K quantisations on the
 /// server (~10-20 µs per layer of CPU work).
 pub const LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-layer";
+
+/// HTTP path for the f32 layer-batch endpoint.
+pub const LAYER_BATCH_PATH: &str = "/v1/experts/layer-batch";
 
 /// f16 variant of the layer-batch wire format.  Halves the per-call wire
 /// bytes (residual + weighted-sum response): 11 KB → 5.5 KB at hidden=2816.
@@ -28,6 +35,9 @@ pub const LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-layer";
 /// ~0.05% which is negligible).  Mathematically identical when both sides
 /// dequantise to f32 before compute.
 pub const LAYER_BATCH_F16_CONTENT_TYPE: &str = "application/x-larql-experts-layer-f16";
+
+/// HTTP path for the f16 layer-batch endpoint.
+pub const LAYER_BATCH_F16_PATH: &str = "/v1/experts/layer-batch-f16";
 
 fn checked_mul(a: usize, b: usize) -> Option<usize> {
     a.checked_mul(b)

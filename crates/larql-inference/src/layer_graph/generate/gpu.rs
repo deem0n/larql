@@ -397,16 +397,21 @@ where
     // per layer and needs &mut; this is the sole reason `generate` itself takes
     // &mut. Metal backends pass straight through and never touch the map here.
     //
-    // Per-Layer Embeddings (Gemma 4 E2B `hidden_size_per_layer_input`) are
-    // also routed to the CPU path: the `per_layer_input_gate` /
-    // `per_layer_projection` / `post_per_layer_input_norm` mechanism is
-    // implemented in `q4k_forward.rs` but not in the Metal pipeline, so the
-    // residual stream would be missing a per-layer per-position contribution
-    // on every layer. Without this routing the model produces multilingual
-    // gibberish ("ened retainingcB variations 유doucara…"); on CPU the same
-    // weights produce coherent reasoning text.
+    // Per-Layer Embeddings (Gemma 4 E2B `hidden_size_per_layer_input`):
+    // when `LARQL_METAL_PLE=1`, route through the Metal decode loop with
+    // PLE applied per layer (see `metal/decode/encode_ple.rs`).  Otherwise
+    // fall back to the CPU `q4k_forward.rs` path — without PLE applied,
+    // the residual stream would be missing a per-layer per-position
+    // contribution on every layer and the model produces multilingual
+    // gibberish ("ened retainingcB variations 유doucara…"); the CPU path
+    // produces coherent reasoning text.
     let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
-    if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
+    let metal_ple_enabled = needs_per_layer_embed
+        && std::env::var("LARQL_METAL_PLE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if !backend_supports_fused_q4_pipeline(backend) || (needs_per_layer_embed && !metal_ple_enabled)
+    {
         return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index, eos);
     }
 
@@ -443,11 +448,94 @@ where
     let softcap_val = arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
+    // Per-Layer Embeddings (Gemma 4 E2B): downcast to MetalBackend so we
+    // can call `prepare_ple_inputs` between decode steps. None unless the
+    // env flag is set AND backend is Metal. The `metal_ple` machinery is
+    // only meaningful with `--features metal`; without that feature the
+    // backend cannot be a `MetalBackend` and the PLE path is unreachable.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let metal_ple = if metal_ple_enabled {
+        backend
+            .as_any()
+            .downcast_ref::<larql_compute::metal::MetalBackend>()
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let metal_ple: Option<()> = {
+        let _ = metal_ple_enabled;
+        None
+    };
+    let ple_dim = if metal_ple.is_some() {
+        weights.arch.per_layer_embed_dim()
+    } else {
+        0
+    };
+    // Helper: precompute the per-layer-input table for one token and upload
+    // it onto the Metal backend. Mirrors `precompute_per_layer_inputs` for
+    // a single position; the full computation is identical, just over a
+    // 1-row embed.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let upload_ple = |metal: &larql_compute::metal::MetalBackend, token_id: u32, embed_row: &[f32]| {
+        let embed_arr =
+            ndarray::Array2::from_shape_vec((1, hidden), embed_row.to_vec()).unwrap_or_else(|_| {
+                ndarray::Array2::<f32>::zeros((1, hidden))
+            });
+        let per_layer_inputs =
+            crate::forward::ple::precompute_per_layer_inputs(weights, &embed_arr, &[token_id]);
+        let num_layers = weights.num_layers;
+        let mut flat: Vec<f32> = Vec::with_capacity(num_layers * ple_dim);
+        for layer_arr in &per_layer_inputs {
+            // Each layer_arr has shape `[1, ple_dim]` for single-token input.
+            for v in layer_arr.row(0).iter() {
+                flat.push(*v);
+            }
+        }
+        metal.prepare_ple_inputs(&flat, num_layers, ple_dim);
+    };
+
     // For per-layer Q4K expert format: prefill using token-by-token GPU expert dispatch.
     // The standard prefill_q4 path calls cpu_moe_forward which expects BF16 blobs;
     // that would panic on Q4K expert bytes. Token-by-token is correct and builds the
     // KV cache identically to the batched prefill.
-    let h_vec = if weights.has_per_layer_ffn() {
+    //
+    // PLE archs (Gemma 4 E2B) take the same per-token prefill path: the
+    // batched `prefill_q4_prompt` runs through `dispatch_full_pipeline`
+    // which doesn't yet apply PLE per layer, so we step token-by-token
+    // through `decode_token` (which does apply PLE inside the decode loop).
+    // Metal-only PLE branch: only compiled when `--features metal`. Without
+    // metal we always skip to the q4k_moe / standard prefill paths.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let h_vec_ple: Option<Vec<f32>> = metal_ple.map(|metal| {
+        let mut last_h = vec![0.0f32; hidden];
+        for pos in 0..seq_len {
+            let x_pos: Vec<f32> = x[pos * hidden..(pos + 1) * hidden].to_vec();
+            upload_ple(metal, token_ids[pos], &x_pos);
+            last_h = backend
+                .decode_token(
+                    &layers,
+                    &x_pos,
+                    hidden,
+                    intermediate,
+                    attention.q_dim,
+                    attention.kv_dim,
+                    attention.num_q_heads,
+                    attention.num_kv_heads,
+                    attention.head_dim,
+                    attention.rope_base,
+                )
+                .unwrap_or_else(|| vec![0.0f32; hidden]);
+        }
+        let mut out = vec![0.0f32; seq_len * hidden];
+        out[(seq_len - 1) * hidden..].copy_from_slice(&last_h);
+        out
+    });
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let h_vec_ple: Option<Vec<f32>> = None;
+
+    let h_vec = if let Some(out) = h_vec_ple {
+        out
+    } else if weights.has_per_layer_ffn() {
         if !backend.supports(Capability::DecodeQ4KMoe) {
             return GenerateResult::empty_error(GenerateError::unsupported_backend(
                 "per-layer Q4K expert generation requires backend Q4K MoE decode support",
@@ -644,6 +732,15 @@ where
         }
 
         let t1 = std::time::Instant::now();
+        // Per-Layer Embeddings: upload the precomputed input table for
+        // the new token before the GPU dispatch. The Metal decode loop
+        // reads it inside the per-layer block via
+        // `MetalBackend::ple_inputs_snapshot`. Only meaningful with
+        // `--features metal`.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(metal) = metal_ple {
+            upload_ple(metal, current_token_id, &x_dec);
+        }
         let result = if profile_split && _step == 2 {
             // Step 2 is post-JIT warm — run split profiling once and print.
             let (r, _ta, _tgu, _td) = backend.decode_token_split_profile(

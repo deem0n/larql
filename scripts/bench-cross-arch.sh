@@ -43,9 +43,15 @@ TOK_THRESHOLD="${LARQL_TOK_PER_S_THRESHOLD:-0.05}"
 
 # Architecture matrix: (vindex-shorthand, family, hidden, layers, note).
 # vindex resolves to ${LOCAL_CACHE}/${shorthand}.vindex; missing files are skipped.
+#
+# Gemma 4 E2B is a Per-Layer-Embeddings (PLE) arch.  D-METAL-PLE wired
+# the PLE block onto Metal behind `LARQL_METAL_PLE=1`; with the env var
+# unset, the bench still exercises the CPU fallback path so regressions
+# in either backend surface here.
 ARCH_MATRIX=(
   "gemma3-4b-q4k-v2|gemma3|2560|34|Gemma 3 4B (canonical Q4_K)"
   "gemma4-31b-q4k|gemma4|5376|60|Gemma 4 31B dense"
+  "gemma4-e2b-q4k|gemma4|1536|35|Gemma 4 E2B (PLE — LARQL_METAL_PLE=1 for Metal)"
   "llama2-7b-q4k|llama|4096|32|Llama 2 7B"
   "mistral-7b-v0.1-q4k|mistral|4096|32|Mistral 7B v0.1 base"
 )

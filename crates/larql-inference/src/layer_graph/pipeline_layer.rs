@@ -183,6 +183,18 @@ pub fn build_arch_params<'a>(
             .moe_post_outer_norm_key(layer)
             .and_then(|k| weights.vectors.get(&k))
             .map(|v| v.as_slice()),
+        ple_input_gate: arch
+            .per_layer_input_gate_key(layer)
+            .and_then(|k| weights.tensors.get(&k))
+            .and_then(|t| t.as_slice()),
+        ple_projection: arch
+            .per_layer_projection_key(layer)
+            .and_then(|k| weights.tensors.get(&k))
+            .and_then(|t| t.as_slice()),
+        ple_post_norm: arch
+            .post_per_layer_input_norm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
     }
 }
 

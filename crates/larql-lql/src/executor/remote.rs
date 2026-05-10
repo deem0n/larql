@@ -5,6 +5,40 @@ use super::Session;
 use crate::ast::*;
 use crate::error::LqlError;
 
+/// Require an explicit `layer = N AND feature = M` predicate from a
+/// remote DELETE / UPDATE WHERE clause.
+///
+/// The previous shape silently defaulted missing fields to `0`, so a
+/// malformed `DELETE FROM EDGES WHERE foo = 1` would delete `L0 F0` on
+/// the remote vindex. We require both keys, both as positive integers,
+/// and error otherwise.
+fn require_layer_feature(
+    conditions: &[Condition],
+    verb: &str,
+) -> Result<(usize, usize), LqlError> {
+    let layer = lookup_usize_condition(conditions, "layer").ok_or_else(|| {
+        LqlError::Execution(format!(
+            "remote {verb} requires `layer = <int>` in WHERE clause"
+        ))
+    })?;
+    let feature = lookup_usize_condition(conditions, "feature").ok_or_else(|| {
+        LqlError::Execution(format!(
+            "remote {verb} requires `feature = <int>` in WHERE clause"
+        ))
+    })?;
+    Ok((layer, feature))
+}
+
+fn lookup_usize_condition(conditions: &[Condition], field: &str) -> Option<usize> {
+    conditions
+        .iter()
+        .find(|c| c.field == field)
+        .and_then(|c| match &c.value {
+            Value::Integer(n) if *n >= 0 => Some(*n as usize),
+            _ => None,
+        })
+}
+
 impl Session {
     /// Connect to a remote larql-server.
     pub(crate) fn exec_use_remote(&mut self, url: &str) -> Result<Vec<String>, LqlError> {
@@ -20,7 +54,7 @@ impl Session {
         let resp = client
             .get(&stats_url)
             .send()
-            .map_err(|e| LqlError::exec("failed to connect to {url}", e))?;
+            .map_err(|e| LqlError::exec(format!("failed to connect to {url}"), e))?;
 
         if !resp.status().is_success() {
             return Err(LqlError::Execution(format!(
@@ -699,30 +733,13 @@ impl Session {
         &self,
         conditions: &[crate::ast::Condition],
     ) -> Result<Vec<String>, LqlError> {
-        // Build delete operations from conditions.
-        let mut ops = Vec::new();
-        let layer = conditions
-            .iter()
-            .find(|c| c.field == "layer")
-            .and_then(|c| match &c.value {
-                crate::ast::Value::Integer(n) => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let feature = conditions
-            .iter()
-            .find(|c| c.field == "feature")
-            .and_then(|c| match &c.value {
-                crate::ast::Value::Integer(n) => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let (layer, feature) = require_layer_feature(conditions, "DELETE")?;
 
-        ops.push(larql_vindex::PatchOp::Delete {
+        let ops = vec![larql_vindex::PatchOp::Delete {
             layer,
             feature,
             reason: Some("remote DELETE".into()),
-        });
+        }];
 
         let patch = larql_vindex::VindexPatch {
             version: 1,
@@ -751,22 +768,7 @@ impl Session {
         set: &[crate::ast::Assignment],
         conditions: &[crate::ast::Condition],
     ) -> Result<Vec<String>, LqlError> {
-        let layer = conditions
-            .iter()
-            .find(|c| c.field == "layer")
-            .and_then(|c| match &c.value {
-                crate::ast::Value::Integer(n) => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let feature = conditions
-            .iter()
-            .find(|c| c.field == "feature")
-            .and_then(|c| match &c.value {
-                crate::ast::Value::Integer(n) => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let (layer, feature) = require_layer_feature(conditions, "UPDATE")?;
 
         // Build down_meta from SET assignments.
         let target = set
@@ -1028,4 +1030,73 @@ fn remote_knn_override_summary(
         summary.push_str(&format!(", model_top1={} ({:.2}%)", tok, prob * 100.0));
     }
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{CompareOp, Condition, Value};
+
+    fn cond(field: &str, value: Value) -> Condition {
+        Condition {
+            field: field.into(),
+            op: CompareOp::Eq,
+            value,
+        }
+    }
+
+    #[test]
+    fn require_layer_feature_accepts_explicit_pair() {
+        let conds = vec![
+            cond("layer", Value::Integer(7)),
+            cond("feature", Value::Integer(42)),
+        ];
+        let (l, f) = require_layer_feature(&conds, "DELETE").unwrap();
+        assert_eq!((l, f), (7, 42));
+    }
+
+    #[test]
+    fn require_layer_feature_errors_when_layer_missing() {
+        // Regression: prior shape silently coerced missing fields to 0,
+        // turning `WHERE foo = 1` into a destructive `DELETE L0 F0`.
+        let conds = vec![cond("feature", Value::Integer(1))];
+        let err = require_layer_feature(&conds, "DELETE").unwrap_err();
+        assert!(err.to_string().contains("layer"));
+        assert!(err.to_string().contains("DELETE"));
+    }
+
+    #[test]
+    fn require_layer_feature_errors_when_feature_missing() {
+        let conds = vec![cond("layer", Value::Integer(0))];
+        let err = require_layer_feature(&conds, "UPDATE").unwrap_err();
+        assert!(err.to_string().contains("feature"));
+        assert!(err.to_string().contains("UPDATE"));
+    }
+
+    #[test]
+    fn require_layer_feature_rejects_non_integer_value() {
+        let conds = vec![
+            cond("layer", Value::String("oops".into())),
+            cond("feature", Value::Integer(1)),
+        ];
+        let err = require_layer_feature(&conds, "DELETE").unwrap_err();
+        assert!(err.to_string().contains("layer"));
+    }
+
+    #[test]
+    fn require_layer_feature_rejects_negative_value() {
+        let conds = vec![
+            cond("layer", Value::Integer(-1)),
+            cond("feature", Value::Integer(0)),
+        ];
+        let err = require_layer_feature(&conds, "DELETE").unwrap_err();
+        assert!(err.to_string().contains("layer"));
+    }
+
+    #[test]
+    fn lookup_usize_condition_finds_field() {
+        let conds = vec![cond("layer", Value::Integer(3))];
+        assert_eq!(lookup_usize_condition(&conds, "layer"), Some(3));
+        assert_eq!(lookup_usize_condition(&conds, "feature"), None);
+    }
 }

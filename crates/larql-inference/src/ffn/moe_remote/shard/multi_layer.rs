@@ -11,7 +11,7 @@ use super::super::metrics;
 use super::super::multi_layer_wire::{
     decode_multi_layer_response, encode_multi_layer_request, encode_multi_layer_request_q8k,
     MultiLayerResult, MultiLayerTask, MultiLayerTaskQ8K, MULTI_LAYER_BATCH_CONTENT_TYPE,
-    MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
+    MULTI_LAYER_BATCH_PATH, MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE, MULTI_LAYER_BATCH_Q8K_PATH,
 };
 use super::{uds_call, Shard, ShardTransport};
 
@@ -28,7 +28,7 @@ impl Shard {
         let active_experts: usize = tasks.iter().map(|t| t.expert_ids.len()).sum();
         match &self.transport {
             ShardTransport::Http(client) => {
-                let url = format!("{}/v1/experts/multi-layer-batch", self.config.url);
+                let url = format!("{}{MULTI_LAYER_BATCH_PATH}", self.config.url);
                 let resp = client
                     .post(&url)
                     .header("Content-Type", MULTI_LAYER_BATCH_CONTENT_TYPE)
@@ -56,7 +56,7 @@ impl Shard {
             ShardTransport::Uds(uds) => {
                 let resp_bytes = uds_call(
                     uds,
-                    "/v1/experts/multi-layer-batch",
+                    MULTI_LAYER_BATCH_PATH,
                     MULTI_LAYER_BATCH_CONTENT_TYPE,
                     &body,
                 )?;
@@ -88,7 +88,7 @@ impl Shard {
         let active_experts: usize = tasks.iter().map(|t| t.expert_ids.len()).sum();
         match &self.transport {
             ShardTransport::Http(client) => {
-                let url = format!("{}/v1/experts/multi-layer-batch-q8k", self.config.url);
+                let url = format!("{}{MULTI_LAYER_BATCH_Q8K_PATH}", self.config.url);
                 let resp = client
                     .post(&url)
                     .header("Content-Type", MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE)
@@ -116,7 +116,7 @@ impl Shard {
             ShardTransport::Uds(uds) => {
                 let resp_bytes = uds_call(
                     uds,
-                    "/v1/experts/multi-layer-batch-q8k",
+                    MULTI_LAYER_BATCH_Q8K_PATH,
                     MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
                     &body,
                 )?;

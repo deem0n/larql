@@ -2,7 +2,7 @@
 
 ## Current state (as of 2026-05-10)
 
-- **857 lib tests** on `larql-vindex` (`cargo test -p larql-vindex
+- **866 lib tests** on `larql-vindex` (`cargo test -p larql-vindex
   --lib`). Crate-local checks are wired through `make larql-vindex-ci`:
   fmt, clippy `-D warnings`, tests, example compile checks, bench
   compile/tests, and coverage policy. All four self-contained examples
@@ -87,20 +87,6 @@
 
 ## P0: Active
 
-### Review follow-ups from 2026-05-09
-
-- [ ] Harden attention weight manifest accessors in
-  `index/storage/attn.rs`. `attn_q8_layer_data`,
-  `attn_q4k_layer_data`, and `attn_q4_layer_slices` should validate
-  `offset + length <= mmap.len()` with checked arithmetic before slicing,
-  matching the defensive behavior already used by FFN Q4K accessors. A stale
-  or corrupt attention manifest should return `None` or a typed load error,
-  not panic during query/decode.
-- [ ] Replace `walker/utils.rs::current_date()` with a real calendar-date
-  implementation or remove the date from walker metadata. The current helper
-  approximates years as 365 days and months as 30 days, so extraction metadata
-  can be wrong even though the format looks valid.
-
 ### Modularity + magic-literal debt
 
 **Status**: Mostly closed. Only the large-file decomposition bullet
@@ -145,138 +131,40 @@ agnostic (met — see P1), `GateIndex` split into narrower capability
 traits (met), and no new module grows past the current large-file
 debt without a split plan.
 
-### Per-layer FFN weight format (`layers/`) — unified dense + MoE
+### `VindexStorage` trait abstraction
+**Impact**: Lets Redis / S3 / GPU-residency backends plug in
+**Effort**: Medium
+**Status**: Active — promoted from P2 on 2026-05-10 after Phase 2
+closed (per-layer FFN cool-machine rerun reproduced both 88.1 / 19.4
+baselines).
 
-**Status**: Phase 1 shipped 2026-04-26. **Phase 2 cache machinery is
-shipped in code** (`MetalBackend::moe_scratch` Mutex +
-`AppState::moe_scratches` HashMap, both shape-keyed). The cold/warm
-split measured 2026-05-09 confirms the cache is doing its job
-(first-token overhead is paid once, not per token), **but the warm
-steady-state is 2.4× slower than the 19.4 tok/s baseline reported on
-2026-05-02 (see `crates/larql-compute/ROADMAP.md` Phase 2 entry).**
-Treat as a regression-investigation, not a closed entry.
+The substore extraction (`GateStore`, `FfnStore`, `ProjectionStore`,
+`MetadataStore`) got most of the way there. Formalise a sealed
+`VindexStorage` trait (mmap-agnostic row accessor) so Q4_K row reads
+can route through Redis-cached or S3-buffered backends without
+walk-kernel changes.
 
-**Measured 2026-05-09 (Gemma 4 26B A4B, M3 Max):**
+**Why now**: the per-layer FFN format (Phase 2, closed today) made
+"give me the bytes for layer L, component C, feature F" the canonical
+addressing contract. That's exactly the right granularity for a
+storage trait — every concrete backend can satisfy it. The current
+mmap path becomes one impl among several.
 
-| Run | ms/tok | tok/s | Notes |
-|---|---|---|---|
-| 2026-05-02 ROADMAP claim | 51 | 19.4 | After dispatch-geometry + Phase 2 fix |
-| `larql bench --warmup 3 -n 30` | 89.4 | 11.2 | Mean over 29 measured tokens |
-| `bench_generate --warmup 0 -n 10` warm | 118.5 | 8 | Mean of tokens 2-9 |
-| `bench_generate --warmup 0` cold | 265.2 | 4 | Token 1 only |
+**Acceptance bar**:
+- A sealed `VindexStorage` trait whose surface is defined by the
+  current walk-kernel and decode hot-paths (`q4k_ffn_row_*`,
+  `gate_*`, `down_features_*`, `attn_*_layer_data`).
+- One impl: `MmapStorage` reproducing today's behavior bit-for-bit
+  (no measurable decode regression on the cool-machine 4B/26B
+  baselines).
+- Walk kernels and Metal dispatch consume only the trait, not
+  concrete `Mmap` types.
+- Coverage: every trait method has a test against `MmapStorage`;
+  the trait-object boxing path has at least one round-trip test.
 
-Per-stage breakdown from `larql bench`:
-- GPU forward: 83.6 ms (93.8%)
-- lm_head: 5.4 ms (6.1%)
-- everything else: <0.1 ms
-
-**Two findings:**
-
-1. **The cache works.** First-token overhead 146.7 ms (cold/warm =
-   2.24×) on `bench_generate` matches the original ~120 ms allocation
-   claim — the `MetalBackend::moe_scratch` Mutex amortises it as
-   designed.
-
-2. **Both dense and MoE regressed under hot-machine conditions —
-   thermal throttling is the load-bearing hypothesis.** The same-day
-   Gemma 3 4B follow-up bench landed at 30.4 tok/s vs the 88.1 tok/s
-   baseline (2.9× drop on the dense path). Both decode flows can't
-   plausibly regress at the same time from a single cleanup commit;
-   they share the attention / KV / lm_head plumbing, but those are
-   small fractions of decode time. The simpler explanation is the
-   precedent from the 2026-04-28 `Q4_K f16 accumulator` memory entry:
-   on this M3 Max, sustained GPU load + back-to-back release compiles
-   produce thermal artifacts in the 20-200 % range. Today's session
-   ran three release builds, two 26B model loads, and two full
-   decode runs back-to-back before measurement. Cool-machine rerun is
-   the cheap gate before any bisect.
-
-**2026-05-09 follow-up bench: Gemma 3 4B (dense, hot machine):**
-`larql bench --warmup 3 -n 30 output/gemma3-4b-q4k-v2.vindex`
-landed at **30.4 tok/s** vs the same-day post-QKV-defuse baseline of
-88.1 tok/s — a 2.9× drop on the dense path. Both dense and MoE are
-regressed, dense more severely. Per-stage breakdown is the same shape
-as the 26B run: GPU forward dominates (86% of decode time), lm_head
-~14%.
-
-**Two paths regressed at the same time on a heavily-thermally-loaded
-machine** points at thermal throttling as the likely confound. The
-2026-04-28 `Q4_K f16 accumulator` memory entry is the precedent —
-that "+23% kernel speedup" was also a thermal artifact. The 88.1 and
-19.4 baselines were each measured in single short runs on cool
-machines; the 2026-05-09 measurements ran after three back-to-back
-release compiles plus two 26B model loads.
-
-**Open follow-ups (do in this order):**
-
-- [ ] **Cool-machine rerun first.** 5+ min idle, no concurrent
-      compile / model load. Run `larql bench --warmup 3 -n 30` on
-      both Gemma 3 4B and Gemma 4 26B A4B, in that order (smallest
-      model first so the package isn't hot from the larger one).
-      Acceptance: 4B ≥ 80 tok/s and 26B ≥ 17 tok/s reproduces both
-      baselines and closes this entry; anything below is a real
-      regression.
-- [ ] **Only if cool-machine numbers stay low**: bisect against the
-      candidate commit list (`8ec6914`, `902683f`, `82c2655`,
-      `27b1870`, `f84a465`, `430f320`, `ad53c75`, `03429d2`,
-      `8956ed8`).
-- [ ] **Standardise the steady-state headline** on `larql bench
-      --warmup 3` (matches the 2026-05-02 / 2026-05-09 baseline
-      harness) so future ROADMAPs can't drift between harnesses.
-- [ ] **Capture thermal state during benches.** `powermetrics
-      --samplers smc -i 1000` in a side terminal during the run, or a
-      lightweight wrapper that records ambient + package temp before
-      and after. Without that, single-run numbers are an unreliable
-      signal.
-
-**Spec doc:** `crates/larql-vindex/docs/per-layer-ffn-phase2-research.md`
-captures the cache-machinery audit and bench interpretation matrix.
-
-**Phase 1 shipped:** Q4K per-layer format (`layers/layer_{L:02}.weights`), conversion tool (`convert_moe_to_per_layer` example), GPU dispatch via `MetalBackend::gpu_moe_dispatch` + `decode_token_q4k_moe`. Expert bytes written directly to Metal shared-memory buffers (one copy, no intermediate Vec). 59s conversion for 26B A4B (43 GB BF16 → 24 GB Q4K).
-
-**SKIP_MOE baseline**: SKIP_MOE baseline = 15ms/tok (56.8 tok/s). With BF16 blob = 241ms/tok. **93.7% of decode time was CPU MoE.**
-
-**Design (see `docs/format-spec.md §5.12` for binary layout):**
-
-One file per transformer layer, for both dense and MoE models. Dense layers have `num_entries=1`; MoE layers have `num_entries=num_experts`. The file header declares the quantization format — all entries in the file use it uniformly. No mixing formats within a file.
-
-```
-layers/
-  layer_00.weights   ← header (magic, quant_format, num_entries, inter, hidden)
-  layer_01.weights      offset table (num_entries × 4 × u64)
-  ...                   entry data in declared quant_format
-```
-
-**Key properties:**
-- **Structure ⊥ quantization**: `layers/` is the layout; the quant (Q4_K, Q6_K, Q8, FP4, …) lives in the file header. Re-quantizing = replacing one file.
-- **Unified path**: dense and MoE share identical file format and GPU dispatch code. Dense is `num_entries=1`.
-- **Native OS addressability**: `--layers 0-14` maps 15 files; `--experts 0-31` reads only those entry byte ranges per file.
-- **Replaces both** `interleaved_q4k.bin` (dense flat file) and `experts_packed.bin` (43 GB BF16 blob).
-
-**Why old formats fail:**
-- `experts_packed.bin`: BF16 incompatible with GPU shaders → CPU dequant at ~2.9 GB/token; 30 GPU syncs per decode step; no per-expert mmap slicing.
-- `interleaved_q4k.bin`: OS faults in full virtual range for `--layers` shards; layer replacement requires full-file rewrite.
-
-**Expected outcome (MoE, 26B A4B):**
-- GPU command buffer per decode step: 1 (not 30)
-- Projected decode: ~16ms/tok → **~62 tok/s (15× vs current 4.1 tok/s)**
-
-**Work items:**
-
-- [x] Add `layers/` writer to extraction pipeline — `format/weights/write_layers.rs`, called from `format/weights/write_q4k/mod.rs`. Dense: `num_entries=1`. MoE: `num_entries=num_experts`.
-- [x] Add `"ffn_layout": "per_layer"` to `VindexConfig` / `index.json`.
-- [x] Loader (`load.rs:614`): detect `ffn_layout == "per_layer"`, mmap each `layers/layer_{L}.weights`, parse headers + offset tables, populate `packed_byte_ranges` keyed `"layers/{L}/{e}/gate_up"` / `"layers/{L}/{e}/down"`.
-- [x] Extend `ModelWeights::get_layer_entry_bytes(layer, entry)` for per-expert byte access.
-- [x] `build_moe_weights` (`larql-inference/src/layer_graph/pipeline_layer.rs`) builds per-expert `Vec<&[u8]>` tables from either `get_layer_entry_bytes` (per-layer Q4_K) or BF16 monolith strides (legacy). 2026-04-26.
-- [x] CPU consumer migration — `cpu_moe_forward` and `run_single_expert{,_with_norm}` now take per-expert byte tables; `cached_dequant` dispatches BF16 / Q4_K. `expert_byte_slice` arithmetic removed. 2026-04-26.
-- [x] `routes/expert.rs::run_expert` (larql-server) resolves per-expert via either path. 2026-04-26.
-- [x] Convert + strip + delete on the existing 26B-A4B vindex (manifest stripped of `packed_bf16` expert rows, `experts_packed.bin` deleted, 43 GB freed). 2026-04-26.
-- [x] GPU dispatch in `decode_token_with_moe_fn`: per-layer Q4_K slices gathered into staging buffer, single GPU command buffer per decode token.
-- [x] Phase 2 — cache machinery is shipped (`MetalBackend::moe_scratch` Mutex + server-side `AppState::moe_scratches` HashMap by shape). Cold/warm split measured 2026-05-09 confirms the cache amortises the ~120 ms allocation cost. The hot-machine measurements (26B 11.2 tok/s, 4B 30.4 tok/s vs 19.4 / 88.1 baselines) are believed thermal — both paths regressed at the same time after sustained GPU load, matching the 2026-04-28 thermal-artifact precedent. Cool-machine rerun is captured as a follow-up checklist item, not a blocker on Phase 2 closure.
-
-**Result on Gemma 4 26B A4B (M3 Max, single-shard `bench_expert_server`):**
-`forward_moe` warm 4.86 → 1.91 ms (2.5×). 30-layer sweep 866 → 56 ms (15×).
-RSS 16.6 → 9.7 GB. Disk 58 → 16 GB.
+**Out of scope for this round**: Redis / S3 backends (those land on
+top of the trait once it's stable). Same for GPU-resident storage —
+the trait surface should leave room for it but we don't implement.
 
 ## P1: Active
 
@@ -349,16 +237,6 @@ truncation to the last clean layer boundary, which is more delicate
 than the phase flag.
 
 ## P2: Forward-looking
-
-### `VindexStorage` trait abstraction
-**Impact**: Lets Redis / S3 / GPU-residency backends plug in
-**Effort**: Medium
-**Status**: Forward-looking
-
-The substore extraction got most of the way there. Formalise a
-sealed `VindexStorage` trait (mmap-agnostic row accessor) so Q4K row
-reads can route through Redis-cached or S3-buffered backends without
-walk-kernel changes.
 
 ### Expert-level sharding protocol
 **Impact**: Unlocks > 256-expert MoE sharding-within-layer

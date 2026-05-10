@@ -71,8 +71,7 @@ impl Session {
         // LQL INSERT surface supports canonical-form relations only.
         // Non-canonical facts can be installed via the Python pipeline
         // in `experiments/14_vindex_compilation` for now.
-        let rel_words = relation.replace(['-', '_'], " ");
-        let prompt = format!("The {rel_words} of {entity} is");
+        let prompt = crate::executor::tuning::canonical_prompt(relation, entity);
 
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let weights = larql_vindex::load_model_weights(path, &mut cb)
@@ -163,7 +162,7 @@ impl Session {
                     && word.chars().all(|c| c.is_alphabetic())
                     && !word.eq_ignore_ascii_case(entity)
                 {
-                    let decoy = format!("The {rel_words} of {word} is");
+                    let decoy = crate::executor::tuning::canonical_prompt(relation, word);
                     decoy_prompts.push(decoy);
                     template_decoys_added += 1;
                 }

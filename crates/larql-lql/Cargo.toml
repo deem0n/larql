@@ -19,6 +19,13 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+default = []
+# Enable Metal-accelerated paths in `larql-compute` / `larql-inference`.
+# Mirrors the features in those crates so workspace tests can be built
+# with `--features metal` from this package.
+metal = ["larql-compute/metal", "larql-inference/metal", "larql-vindex/metal"]
+
 [dev-dependencies]
 criterion = "0.5"
 

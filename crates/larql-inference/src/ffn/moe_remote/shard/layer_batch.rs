@@ -12,7 +12,7 @@ use super::super::metrics;
 use super::super::wire::{
     decode_layer_batch_response, decode_layer_batch_response_f16, encode_layer_batch_request,
     encode_layer_batch_request_f16, ExpertCallItem, LAYER_BATCH_CONTENT_TYPE,
-    LAYER_BATCH_F16_CONTENT_TYPE,
+    LAYER_BATCH_F16_CONTENT_TYPE, LAYER_BATCH_F16_PATH, LAYER_BATCH_PATH,
 };
 use super::{uds_call, Shard, ShardTransport};
 
@@ -70,9 +70,9 @@ impl Shard {
                 let use_f16 = runtime.wire_f16;
 
                 let url = if use_f16 {
-                    format!("{}/v1/experts/layer-batch-f16", self.config.url)
+                    format!("{}{LAYER_BATCH_F16_PATH}", self.config.url)
                 } else {
-                    format!("{}/v1/experts/layer-batch", self.config.url)
+                    format!("{}{LAYER_BATCH_PATH}", self.config.url)
                 };
                 let ct = if use_f16 {
                     LAYER_BATCH_F16_CONTENT_TYPE
@@ -157,9 +157,9 @@ impl Shard {
                 let use_f16 = runtime.wire_f16;
 
                 let path = if use_f16 {
-                    "/v1/experts/layer-batch-f16"
+                    LAYER_BATCH_F16_PATH
                 } else {
-                    "/v1/experts/layer-batch"
+                    LAYER_BATCH_PATH
                 };
                 let ct = if use_f16 {
                     LAYER_BATCH_F16_CONTENT_TYPE

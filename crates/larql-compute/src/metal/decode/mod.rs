@@ -3,6 +3,7 @@ use super::*;
 mod diag;
 mod encode_attn;
 mod encode_ffn;
+mod encode_ple;
 mod encode_post_ffn;
 mod encode_qkv;
 pub mod gpu_timing;
@@ -232,6 +233,10 @@ impl MetalBackend {
             g
         };
         let mut h_buf = &h_init;
+        // Per-Layer Embeddings precomputed table (Gemma 4 E2B): snapshot
+        // once per token so the per-layer loop can read it without
+        // re-locking the mutex on every iteration. `None` for non-PLE archs.
+        let ple_inputs = self.ple_inputs_snapshot();
         // Split mode: when a fire+collect callback pair is present, defer
         // FFN encoding for MoE layers until *after* the remote MoE call has
         // been fired, so dense FFN runs on the GPU in parallel with the
@@ -471,6 +476,38 @@ impl MetalBackend {
                         use_fused_post_ffn,
                         prelayer_fusion.as_ref(),
                     );
+                }
+
+                // ── Step 8: Per-Layer Embeddings (Gemma 4 E2B) ──
+                // Mirrors `crates/larql-inference/src/forward/ple.rs::apply_per_layer_embedding`.
+                // Activates only when (a) the layer has the three PLE
+                // weights wired and (b) the inference layer uploaded a
+                // precomputed per-layer-input table via
+                // `MetalBackend::prepare_ple_inputs` for this generation.
+                if let Some(pli) = ple_inputs.as_ref() {
+                    if layer.ple_spec().is_some() {
+                        // Reuse two scratches that are dead after the
+                        // post-FFN residual completes:
+                        //   - `gate_out_scratch` (`inter` f32) holds the
+                        //     `[ple_dim]` gate (ple_dim ≪ inter);
+                        //   - `down_out` (`hidden` f32) holds the projection
+                        //     output (`[hidden]`).
+                        // Both buffers' previous data is consumed by
+                        // `encode_post_ffn_residual` above.
+                        self.encode_per_layer_embed(
+                            &enc,
+                            layer,
+                            encode_ple::PleBufs {
+                                h: new_h,
+                                per_layer_input: &pli.buffer,
+                                per_layer_input_offset: pli.row_offset_bytes(0, l),
+                                gate_scratch: &gate_out_scratch,
+                                contrib_scratch: &down_out,
+                            },
+                            hidden,
+                            pli.ple_dim,
+                        );
+                    }
                 }
             }
 

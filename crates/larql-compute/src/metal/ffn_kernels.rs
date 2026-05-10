@@ -57,6 +57,11 @@ pub struct FfnKernels {
     /// Cached-activation Q6_K + GELU-tanh — `LARQL_FUSED_Q6K_DOWN=1`
     /// opt-in. Currently no-op until kernel-level parity work lands.
     pub q6k_geglu_gelu_tanh_down_cached_pipeline: KernelHandle,
+
+    /// Per-Layer Embeddings gate-apply (Gemma 4 E2B): fused
+    /// `gate = gelu_tanh(gate) * per_layer_input`. Wired by the PLE
+    /// dispatch helper between the two PLE matvecs (gate proj → up proj).
+    pub ple_gate_apply_pipeline: ComputePipelineState,
 }
 
 impl FfnKernels {
@@ -105,6 +110,10 @@ impl FfnKernels {
             >(device, library)?,
             q6k_geglu_gelu_tanh_down_cached_pipeline: KernelHandle::from_kernel::<
                 shaders::q6k_geglu_gelu_tanh_down_cached::Kernel,
+            >(device, library)?,
+
+            ple_gate_apply_pipeline: get_shader_pipeline::<
+                shaders::per_layer_embed::GateApplyKernel,
             >(device, library)?,
         })
     }

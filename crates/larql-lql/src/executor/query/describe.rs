@@ -158,24 +158,10 @@ impl Session {
         let tokenizer = larql_vindex::load_vindex_tokenizer(path)
             .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
 
-        let encoding = tokenizer
-            .encode(entity, false)
-            .map_err(|e| LqlError::exec("tokenize error", e))?;
-        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-        if token_ids.is_empty() {
+        let Some(query) =
+            crate::executor::helpers::entity_query_vec(&tokenizer, &embed, embed_scale, entity)?
+        else {
             return Ok(Some(vec![format!("{entity}\n  (not found)")]));
-        }
-
-        let hidden = embed.shape()[1];
-        let query = if token_ids.len() == 1 {
-            embed.row(token_ids[0] as usize).mapv(|v| v * embed_scale)
-        } else {
-            let mut avg = larql_vindex::ndarray::Array1::<f32>::zeros(hidden);
-            for &tok in &token_ids {
-                avg += &embed.row(tok as usize).mapv(|v| v * embed_scale);
-            }
-            avg /= token_ids.len() as f32;
-            avg
         };
 
         let last = config.num_layers.saturating_sub(1);
@@ -302,9 +288,8 @@ impl Session {
 // of the main function so the orchestration reads top-down.
 
 /// Tokenise `entity` and build a query vector by averaging its token
-/// embeddings (single tokens get their embed row directly). Returns
-/// `Ok(None)` when the entity tokenises to nothing — the caller emits
-/// the "(not found)" line.
+/// embeddings. Returns `Ok(None)` when the entity tokenises to nothing
+/// — the caller emits the "(not found)" line.
 fn describe_build_query(
     entity: &str,
     path: &std::path::Path,
@@ -313,30 +298,7 @@ fn describe_build_query(
         .map_err(|e| LqlError::exec("failed to load embeddings", e))?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(path)
         .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
-
-    let encoding = tokenizer
-        .encode(entity, false)
-        .map_err(|e| LqlError::exec("tokenize error", e))?;
-    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-
-    if token_ids.is_empty() {
-        return Ok(None);
-    }
-
-    let hidden = embed.shape()[1];
-    let query = if token_ids.len() == 1 {
-        let tok = token_ids[0];
-        embed.row(tok as usize).mapv(|v| v * embed_scale)
-    } else {
-        let mut avg = larql_vindex::ndarray::Array1::<f32>::zeros(hidden);
-        for &tok in &token_ids {
-            let row = embed.row(tok as usize);
-            avg += &row.mapv(|v| v * embed_scale);
-        }
-        avg /= token_ids.len() as f32;
-        avg
-    };
-    Ok(Some(query))
+    crate::executor::helpers::entity_query_vec(&tokenizer, &embed, embed_scale, entity)
 }
 
 /// Filter `all_layers` down to those covered by the requested band /
@@ -409,7 +371,7 @@ struct DescribeBands {
 /// content / coherence filters. The output is sorted descending by gate.
 fn describe_collect_edges(trace: &larql_vindex::WalkTrace, entity: &str) -> Vec<DescribeEdge> {
     let entity_lower = entity.to_lowercase();
-    let gate_threshold = 5.0_f32;
+    let gate_threshold = crate::executor::tuning::DESCRIBE_GATE_THRESHOLD;
     let mut edges: HashMap<String, DescribeEdge> = HashMap::new();
 
     for (layer_idx, hits) in &trace.layers {

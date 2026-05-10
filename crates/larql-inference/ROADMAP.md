@@ -23,13 +23,11 @@ detail.
    `DumpConfig` + `RemoteMoeRuntime` for env toggles, root surface trimmed
    by 24 names with `research` re-sourced from subpaths, no hardcoded
    family branches remain in generic generation paths). H12 partial:
-   `layer_graph/predict.rs` (881) split into `predict/` directory
-   2026-05-10. Two orchestration files still > 800 LOC remain — each is a
-   focused split:
+   `layer_graph/predict.rs` and `ffn/moe_remote/shard.rs` both split into
+   directories. One orchestration file still > 800 LOC remains:
    - `layer_graph/generate/gpu.rs` (902) — `generate_streaming` is a single
      497-LOC fn; cleavable into prefill / decode-loop / sampling-step.
-   - `ffn/moe_remote/shard.rs` (924) — Http/Uds/Grpc transport branches
-     can each move to a per-transport submodule. See "Open: inference crate hardening".
+     See "Open: inference crate hardening".
 
 4. **R4 — research trace export contract** — only remaining R-item from the
    mech-interp engine surface; unblocks MI4 onwards. See "Open: Mechanistic
@@ -96,7 +94,7 @@ Work items:
 | H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | shipped 2026-05-10 — dropped 17 `forward::*` + 7 `layer_graph::*` root re-exports with zero external use AND zero in-crate example/test use; `research` module rewritten to source from subpaths (survives further root trims). Earlier 2026-05-09 work added `prelude` and `research` grouped surfaces |
 | H10 | Remove backend-name probes and concrete `MetalBackend` downcasts from generic generation dispatch; replace with explicit compute-backend capability methods | shipped 2026-05-09 for generation dispatch |
 | H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | shipped 2026-05-10 — verified no hardcoded `family() == "..."` branches remain in generic generation/decode/forward paths. The single remaining family-named match (`pipeline_layer.rs::moe_routing_policy`) reads the architecture trait's `router_type` metadata, which is the policy-object pattern this item asks for |
-| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial — 2026-05-09 extracted token selection policy, GPU setup/prefill helpers, constrained generation, and grid config/timing/setup/remote-MoE/remote-FFN modules. 2026-05-10 split `layer_graph/predict.rs` (881) → `predict/` directory (mod.rs 376 + split.rs 285 + honest.rs 261; no file > 400 LOC). Two files still > 800 LOC: `layer_graph/generate/gpu.rs` (902 — `generate_streaming` is a single 497-LOC fn, splittable into prefill/decode-loop/sampling-step), `ffn/moe_remote/shard.rs` (924 — Http/Uds/Grpc transport branches splittable per transport). Each is one focused session |
+| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial — 2026-05-09 extracted token selection policy, GPU setup/prefill helpers, constrained generation, and grid config/timing/setup/remote-MoE/remote-FFN modules. 2026-05-10 split `layer_graph/predict.rs` (881) → `predict/` directory (mod.rs 376 + split.rs 285 + honest.rs 261). `ffn/moe_remote/shard.rs` (924) → `shard/` directory (mod.rs 376 + layer_batch 215 + multi_layer 140 + expert_batch 136 + stream 123). One file still > 800 LOC: `layer_graph/generate/gpu.rs` (902 — `generate_streaming` is a single 497-LOC fn, splittable into prefill/decode-loop/sampling-step) |
 
 Acceptance:
 
@@ -1072,9 +1070,15 @@ skip. Defaults configurable via `LARQL_SMOKE_PROMPT` / `LARQL_SMOKE_EXPECTED`.
 ## P0: MoE inference completions
 
 ### MoE-aware CPU forward pass
-**Status**: Not started  
-`predict_q4k` / `WeightFfn::forward` has no MoE branch. Wire `cpu_moe_forward`
-(already in `larql-compute/src/cpu/ops/moe.rs`) into `forward/layer.rs`.
+**Status**: Partial — vindex Q4K hidden-forward path shipped; dense `WeightFfn` path not started
+**Files**: `vindex/q4k_forward/hidden.rs:169` (shipped), `forward/layer.rs` (open)
+The Q4K vindex hidden-forward path already calls
+`larql_compute::cpu::ops::moe::cpu_moe_forward`, so any MoE model loaded
+through the vindex path has a working CPU MoE branch (this is what the
+gRPC grid loopback and `M-CPU-1..6` were measured against). What's still
+missing is the dense `WeightFfn::forward` path: non-vindex MoE forward
+panics or no-ops. Wire `cpu_moe_forward` into `forward/layer.rs` so dense
+loaders also work.
 
 ### Wire `RouterIndex` client-side
 **Status**: Not started  
@@ -1492,9 +1496,9 @@ architecturally tied to `mod.rs` as the parent. Requires changing visibility to
 `pub(in crate::vindex::walk_ffn)` across 6 files — low risk/reward compared to
 other P1 items. Backlog.
 
-**`layer_graph/predict.rs` (700 LOC) — split**  
-Five `predict_*` variant functions sharing a shell. Extract to `predict/base.rs`
-(shared embed→loop→logits shell) + `predict/variants.rs` (per-strategy overloads).
+**`layer_graph/predict.rs` (881 LOC) — split** ✅ Done 2026-05-10 (H12)
+Split into `predict/{mod.rs 376, split.rs 285, honest.rs 261}`. See
+CHANGELOG.md `[2026-05-10] — Hardening pass`.
 
 **`residual.rs` at crate root → `forward/norm.rs`**  
 It's a collection of norm primitives used exclusively by the forward pass. Moving
@@ -1676,134 +1680,16 @@ bottleneck.
 
 ---
 
-## Completed
+## Completed work
 
-| Item | Date | Impact |
-|------|------|--------|
-| Forward pass (CPU BLAS) | 2026-03 | Foundation |
-| BLAS-fused attention | 2026-04-03 | Online softmax, O(seq) memory |
-| WalkFfn (sparse FFN via vindex) | 2026-04-03 | Gate KNN + top-K |
-| CachedLayerGraph | 2026-04-04 | Skip L0-12, 0.999 cosine |
-| LayerGraph trait | 2026-04-04 | Pluggable per-layer routing |
-| predict_honest | 2026-04-06 | Production path, GPU+CPU hybrid |
-| GPU prefill pipeline | 2026-04-06 | seq>1 on GPU (pre-norm models) |
-| Q4_K FFN format wiring | 2026-04-07 | Vindex Q4_K FFN → FullPipelineLayer |
-| GELU-tanh activation | 2026-04-07 | Gemma3 correct on GPU |
-| Post-norm guard | 2026-04-07 | Gemma3 falls to CPU correctly |
-| KvEngine trait + EngineKind | 2026-04-25 | Pluggable engine selector + CLI params |
-| MarkovResidualEngine | 2026-04-25 | Residual-based KV (exact, 287×) |
-| UnlimitedContextEngine | 2026-04-25 | Window checkpoints (exact within window, 254×) |
-| BackendFfn (Q4K FFN dispatch) | 2026-04-25 | WalkFfn + Metal for FFN in all engines |
-| cold_kv cache (MarkovRS) | 2026-04-25 | Skip cold-tier recompute; 8.5× decode speedup |
-| Profiler (per-stage timing) | 2026-04-25 | `larql bench --engine --profile` breakdown |
-| TurboQuantEngine | 2026-04-26 | 4-bit WHT+Lloyd-Max K/V compression (4×, cos≈0.991) |
-| ApolloEngine | 2026-04-26 | Retrieval+injection (20,000×, compressed path) |
-| `forward_from_layer` | 2026-04-26 | Start forward at crystal_layer; 8.5× Apollo speedup |
-| Metal Q4K path for all engines | 2026-04-26 | ~95 tok/s across all 4 engines |
-| `generate/` split (cpu/gpu/lm_head/types) | 2026-04-26 | Structured generation directory |
-| `markov_residual/` split (store/engine/compute/q4k) | 2026-04-26 | Structured engine directory |
-| `forward/predict/` split (types/raw/dense/ffn) | 2026-04-26 | Forward predict directory |
-| `forward/ops.rs` extracted | 2026-04-26 | Shared math primitives |
-| `graph_ffn.rs` → `ffn/graph_backend.rs` | 2026-04-26 | Correct placement in ffn/ |
-| 400+ unit tests | 2026-04-26 | Synthetic weights, no disk I/O |
-| 49% line coverage (llvm-cov) | 2026-04-26 | Baseline measured |
-| Code quality review (3-agent) | 2026-04-26 | Unsafe removed, LCG fixed, OnceLock added |
-| P1 code quality fixes (magic strings, duplication) | 2026-04-25 | env-var names, GELU constants |
-| `ffn/remote.rs` → `remote/codec.rs` + `remote/http.rs` | 2026-04-26 | No magic strings; codec/HTTP separation |
-| `turbo_quant/mod.rs` → `engine.rs` | 2026-04-26 | Consistent engine layout; thin mod.rs |
-| Tests: `markov_residual/` (store, engine, compute) | 2026-04-26 | 0 → 15 tests; prefill/decode/clip coverage |
-| Tests: `ffn/sparse_compute.rs` + `ffn/sparse.rs` | 2026-04-26 | 0 → 14 tests; sparse FFN validated |
-| Tests: `ffn/graph_backend.rs` | 2026-04-26 | 0 → 10 tests; GateIndex build/lookup/save |
-| Tests: `forward/ops.rs` | 2026-04-26 | 0 → 8 tests; dot_proj/add_bias/apply_norm |
-| 457 unit tests total | 2026-04-26 | +~50 tests vs previous session |
-| Bug: `eos_id = 1` in grid.rs | 2026-04-26 | Correct EOS on all models, not just Gemma |
-| Softmax unified to `forward/ops.rs` | 2026-04-26 | 2 duplicate impls removed |
-| `forward/ple.rs` norm_eps fixed | 2026-04-26 | Uses `arch.norm_eps()` not hardcoded 1e-6 |
-| Tests: `unlimited_context/extend.rs` | 2026-04-26 | 0 → 8 tests; checkpoint, RoPE, chained extends |
-| Tests: `layer_graph/dense.rs` | 2026-04-26 | 0 → 8 tests; shape, capture, PerLayerGraph bounds |
-| Tests: `layer_graph/walk.rs` | 2026-04-26 | 0 → 7 tests; Walk + Pipelined layer range |
-| Tests: `layer_graph/mod.rs` | 2026-04-26 | 0 → 3 tests; trait dispatch, name distinctness |
-| Tests: `forward/ple.rs` | 2026-04-26 | 0 → 6 tests; guard paths + softmax |
-| Tests: GQA reps>1 | 2026-04-26 | 3 tests; shape, finiteness, KV-head sharing |
-| Tests: RoPE property tests | 2026-04-26 | 4 tests; base sensitivity, offset=position, fractions |
-| 499 unit tests total | 2026-04-26 | +42 tests; all passing |
-| Tests: `layer_graph/prefill.rs` | 2026-04-26 | 6 tests; CPU path shape/finiteness/logits |
-| Tests: `layer_graph/template.rs` | 2026-04-26 | 12 tests; detect_template + TemplateUniverse + GuidedWalk |
-| Tests: `layer_graph/pipeline_layer.rs` | 2026-04-26 | 6 tests; arch params, attn weights, FFN stride |
-| Tests: `layer_graph/grid.rs` | 2026-04-26 | 1 test; error path for missing Q4K mmap |
-| Integration tests: `test_layer_graph_integration.rs` | 2026-04-26 | 7 ignored tests; real vindex prefill/pipeline/template |
-| Fix: `residual_diff/capture.rs` missing PathBuf import | 2026-04-26 | Pre-existing bug; broke lib test compilation |
-| 525 unit tests total | 2026-04-26 | All passing |
-| `generate/eos.rs` — `EosConfig` | 2026-04-26 | Built-in stops + `generation_config.json`; fixes Gemma 4 `<end_of_turn>` bug |
-| `generate/detok.rs` — `Detokenizer` | 2026-04-26 | Cumulative-decode delta; preserves HF `▁` leading-space across SP and BPE |
-| `generate/sampling.rs` — `Sampler` + `SamplingConfig` | 2026-04-26 | Greedy / temp / top-k / top-p + seed; <2µs/call sparse path |
-| `generate_with_sampling` wired into GPU path | 2026-04-26 | Greedy `generate` is a thin wrapper; backward compatible |
-| Examples: `sampling_demo`, `eos_demo`, `detok_demo` | 2026-04-26 | End-to-end demos; detok runs without a model |
-| `bench_sampling` benchmark | 2026-04-26 | Per-call cost across 4 configs × 3 vocab sizes; results in PERFORMANCE.md |
-| 35 sampling/eos/detok tests | 2026-04-26 | All passing; 613 lib tests total |
-| `generate_streaming(... on_token)` callback | 2026-04-26 | Per-token streaming; `generate_with_sampling` is thin no-op wrapper |
-| `chat_session.rs` — `ChatSession` + `TurnRenderer` | 2026-04-26 | Multi-turn buffer with whole-turn eviction; Gemma/ChatML/Llama-3 renderers |
-| Examples: `streaming_demo`, `chat_demo` | 2026-04-26 | Live token streaming + 3-turn chat over `ChatSession` |
-| Smoke test: `test_gemma3_smoke.rs` | 2026-04-26 | One-token greedy regression; CI_INTEGRATION fail-loud mode |
-| 13 ChatSession tests + streaming integration | 2026-04-26 | All passing; 626 lib tests total |
-| Q4_K stride validation in `load_attn_q4k` | 2026-04-27 | Catches stale 148-byte vindexes; clear "rebuild" error vs silent NaN |
-| `QuantFormatInfo::expected_bytes(&shape)` helper | 2026-04-27 | Single source of truth for stride math; used by loader validation |
-| 11 stride-validation tests (registry + loader) | 2026-04-27 | 144 vs 148-byte stride; arbitrary lengths; Q4_K & Q6_K shapes |
-| Q4_K vs Q4_KF kernel routing fix in `quant_matvec::encode` | 2026-04-27 | Q4_K weights now dispatch the Q4_K kernel; `FusedQkvKernel` enum carries TG geometry |
-| `vindex::open_inference_vindex` strict loader | 2026-04-27 | Single entry point; propagates stride errors instead of silently degrading |
-| Demos switched to `open_inference_vindex` | 2026-04-27 | sampling/streaming/eos/chat now error loudly with rebuild guidance on stale vindexes |
+Dated entries live in [`CHANGELOG.md`](CHANGELOG.md). Headline milestones:
 
-### 2026-04-30 — gRPC grid accuracy + dense Metal chat template + Gemma 4 model coverage
-
-End-to-end accuracy work across Gemma 4's three production variants (26B-A4B
-MoE via gRPC grid, 31B dense via Metal, E2B with PLE). Started from the gRPC
-grid producing semantically wrong text ("not specified in the text") and
-ended with all four Gemma 4 vindexes producing correct answers. Per-layer
-CPU vs Metal residual parity (cos ≥ 0.9999 across all 60 layers of the 31B)
-confirmed the inference math itself was always correct — every remaining
-gap was somewhere in the wrapping, sampling, or routing logic.
-
-| What | Date | Notes |
-|------|------|-------|
-| `grid.rs` uses `Detokenizer` + `EosConfig::from_vindex_dir` | 2026-04-30 | Was per-token decode losing SP `▁` leading-space + falling back to `<{id}>` for special tokens; output looked like "Thecapital of France is**not specified...**" |
-| Special-token suppression in grid `pick_next_filtered` | 2026-04-30 | Built from `tokenizer.get_added_tokens_decoder()` + structural-marker scan (`<unused…>`, HTML tags, `[multimodal]`). Top-K=256 fallback finds a real word when many candidates are markers. Q4_K quantisation noise was lifting `<mask>` (id 4) over the intended next word at the first answer position |
-| `chat::render_user_prompt` shared helper | 2026-04-30 | Centralises `LARQL_RAW_PROMPT` / `LARQL_THINKING` / `LARQL_SYSTEM` / `LARQL_NO_DEFAULT_SYSTEM` + auto Gemma 4 default system prompt. Used by both `run_with_moe_shards` (gRPC) and `walk_cmd::run_predict_q4k` (dense Metal) |
-| Built-in Gemma 4 fallback chat template | 2026-04-30 | Vindexes extracted before `chat_template.jinja` was snapshotted (early 31B and E2B) silently sent raw prompts and looped "The answer is:". `family_default_template("gemma4")` plugs the gap |
-| Dense Metal path now applies chat templates | 2026-04-30 | `walk_cmd::run_predict_q4k` was sending the raw user string to `encode_prompt`; the chat-template machinery only ran for gRPC. Both paths now go through `render_user_prompt` |
-| `lm_head_topk` falls back to backend GEMV when KNN is all-zero | 2026-04-30 | At the prefill→decode boundary the Metal `q4k_matvec` for lm_head occasionally returned 256/256 zero scores while h_1d was healthy (rms ≈ 4, max_abs ≈ 60). Detect + retry via `backend_lm_head_topk` recovers a non-zero distribution immediately |
-| PLE auto-route for Gemma 4 E2B | 2026-04-30 | E2B has `hidden_size_per_layer_input=256` (per-layer-input gate + projection + norm + global PLE embedding). The CPU dense path implements PLE; Metal does not. `generate_streaming` now checks `arch.has_per_layer_embeddings()` and delegates to `generate_via_cpu_q4k` for those models so the residual stream gets the per-layer per-position contribution. Without this E2B emitted multilingual gibberish; with it, "The capital of France is Paris" |
-| Diagnostic env vars: `LARQL_DEBUG_TOKEN_IDS`, `LARQL_DEBUG_TOPK` | 2026-04-30 | Per-step token-id + raw top-K scores in both `grid.rs` (gRPC) and `gpu.rs` (dense). Surfaced the "all logits == 0.000" smoking gun that localised the lm_head KNN bug |
-| `larql parity --component layer` extended to dense | 2026-04-30 | Was MoE-only (`LARQL_DUMP_RESIDUALS`). Now uses `LARQL_METAL_DUMP_LAYERS` for dense models — wrote per-layer `metal_layer_NN_h_out.f32` and CPU dump files. Gave us the cos ≥ 0.9999 confirmation across 60 layers that ruled out the inference math as the bug source |
-| `larql parity --component lm-head` works on dense | 2026-04-30 | Dropped the MoE-only gate for `lm-head` (Q4_K vs f32 reference is backend-agnostic) |
-| `test_logits_goldens.rs` compile fix + 5 new entries | 2026-04-30 | Added missing `None` for `predict_q4k_hidden`'s `Option<&RemoteMoeBackend>`; refreshed stale 5 goldens to match current kernel state; added `gemma3-4b-q4k-downq4k` (Q4_K-down regression test), `gemma4-31b-q4k-q6kdown` (Q6_K-down dense), `gemma4-e2b-q4k` (PLE auto-route) — 13/13 passing |
-| Discovered: in-process Metal MoE path (`gpu_moe_dispatch_with_scratch`) shares the bug | 2026-04-30 | Until now nobody had run `larql run --metal` on Gemma 4 26B-A4B (the gRPC grid was the only tested path). It produces the same wrong text as the server's Metal expert dispatch ("answer is in the context" instead of "Paris"). The gRPC-with-CPU-experts path has been the only working route all along — the in-process Metal MoE was always broken for this model. See `larql-compute/ROADMAP.md` "Open: Metal MoE expert kernel — accuracy bug at inter=704" for the kernel-side fix plan |
-
-### 2026-05-09 — Cleanup pass: blanket allows, f16 codec, raw.rs dedup, coverage lift
-
-Source surgery + targeted test work that doesn't change behaviour. All public APIs preserved.
-
-| Item | Date | Impact |
-|------|------|--------|
-| Drop `lib.rs` blanket `#![allow(...)]` (28 lints) | 2026-05-09 | Surfaced 31 real warnings hidden behind `dead_code` / `unused_imports` / `private_interfaces` / `deprecated` / etc. All fixed (deleted dead helpers + structs, cleaned imports, fixed `into_shape` deprecation, fixed `UdsState` privacy, fixed dead V cosine in turbo_quant test) |
-| `ffn/moe_remote/wire.rs` f16 codec → `half` crate | 2026-05-09 | Removed ~85 lines of hand-rolled IEEE-754 binary16 conversion; replaced with `half::f16::from_f32().to_bits()` / `from_bits().to_f32()`. All 6 existing f16 round-trip tests still pass bit-for-bit |
-| `capture.rs::current_date` Gregorian leap-year fix | 2026-05-09 | Old impl divided days by 365 / months by 30 — drifted weeks per year. Rewrote with proper leap-year arithmetic; `extraction_date` field in every `VectorFileHeader` now correct. 7 new date tests (epoch zero, 2024 leap boundaries, century rule for 2000, format guards) |
-| `forward/predict/raw.rs` dedup | 2026-05-09 | `forward_raw_logits_with_prefix` and `forward_from_layer` were ~70% identical; collapsed into a private `forward_layer_range(prefix, layer_range)` core. Three copies of the softcap reduction → single `apply_logits_transform`. ~120 dup lines gone |
-| `lib.rs` re-exports trimmed | 2026-05-09 | Dropped 8 `larql_compute::*` proxies with no external consumers via `larql_inference::*`: `cpu_moe_forward`, `ComputeActivation`, `CpuBackend`, `MoeLayerWeights`, `dot_proj_gpu`, `matmul_gpu`, `MatMulOp`, `MetalBackend`. Callers `use larql_compute::*` directly |
-| Chat-template stack cross-references | 2026-05-09 | `prompt.rs` (heuristic enum), `chat/` (Jinja+vindex), `chat_session::TurnRenderer` (incremental) are complementary, not redundant — added module-level docs cross-referencing each so the boundary is discoverable. Original review's "collapse" recommendation was incorrect (3 external consumers depend on `prompt::ChatTemplate`) |
-| Coverage: 80-89% bucket → ≥90% | 2026-05-09 | 8 files lifted across the per-file 90% floor: `chat/render.rs` 82.64→99.44%, `experts/session.rs` 85.15→95.22%, `ffn/moe_remote/config.rs` 86.90→100%, `ffn/moe_remote/wire.rs` 81.76→99.75%, `forward/patching.rs` 83.77→89.96% (last gap is unreachable defensive guard), `layer_graph/logits.rs` 82.52→96.83% (inline tempfile fixture for `lm_head.bin`), `trace/capture.rs` 89.87→90.55%, `trace/store.rs` 85.22→98.37%. +56 tests, 575→631 lib tests |
-
-### 2026-05-10 — Hardening pass: H8/H9/H11 shipped, H12 deferred
-
-Continued the inference crate hardening from 2026-05-09. Three of four
-remaining H-items now shipped; H12 (file splits) deferred as too invasive
-for an incremental pass.
-
-| Item | Date | Impact |
-|------|------|--------|
-| H8: `forward::dump_config::DumpConfig` | 2026-05-10 | New `OnceLock`-backed typed config consolidates 7 inline `LARQL_CPU_DUMP_LAYERS` / `LARQL_CPU_STAGE_DUMP` / `LARQL_STAGE_DUMP_LAYER` env reads (in `attention/block.rs`, `forward/layer.rs`, `forward/layer_interventions.rs`, `vindex/q4k_forward/hidden.rs`) into a single read at first access. 5 new tests pinning `from_env`, `stage_dir(layer)`, `layer_dir`, singleton stability, default fallback |
-| H8: `ffn::moe_remote::runtime::RemoteMoeRuntime` | 2026-05-10 | New `OnceLock`-backed runtime config consolidates 6 inline reads (`LARQL_HTTP_TIMING`, `LARQL_MOE_WIRE_F16`, `LARQL_DISABLE_Q8K_WIRE`, `LARQL_VERBOSE`) across `moe_remote/shard.rs` (HTTP + UDS transports) and `moe_remote/backend.rs`. Replaces two `thread_local!` block caches that fragmented the toggle state per worker thread. 3 new tests |
-| H9: trim crate-root re-exports | 2026-05-10 | Dropped 17 `forward::*` (e.g. `RawForward`, `LayerMode`, `forward_raw_logits`, `infer_patched_q4k`, `KNN_COSINE_THRESHOLD`) + 7 `layer_graph::*` (`GridGenerateResult`, `ChatMLRenderer`, `GemmaRenderer`, `LayerOutput`, `Llama3Renderer`, `PerLayerGraph`, `TurnRenderer`) re-exports with zero external consumers AND zero in-crate example/test usage. `research` module rewritten to source from full subpaths (`crate::forward::*`, `crate::layer_graph::*`, `crate::trace::*`) so it survives further root trims. Crate-root surface narrowed from ~120 to ~96 names |
-| H11: verified — no hardcoded family branches | 2026-05-10 | Audit found one remaining `match router_type { "gemma4_top_k_softmax" => ... }` at `pipeline_layer.rs:546`. That's the architecture trait's `router_type` metadata signal — the policy-object pattern this item asks for, not a hardcoded family check. H11 done |
-| H12: split `layer_graph/predict.rs` | 2026-05-10 | 881-LOC single file → `predict/` directory: `mod.rs` 376 (entry + small variants `predict_with_graph`, `predict_with_graph_vindex_logits`, `predict_pipeline`, `trace_with_graph` + tests), `split.rs` 285 (`predict_split_pass` 3-pass approximate-attention pipeline + `predict_split_cached` logits-only fast path), `honest.rs` 261 (`predict_honest` production GPU+CPU hybrid). All 9 predict tests pass; no public API change |
-| H12: remaining files documented | 2026-05-10 | Two orchestration files still > 800 LOC: `layer_graph/generate/gpu.rs` (902 — `generate_streaming` is a single 497-LOC fn, splittable into prefill/decode-loop/sampling-step), `ffn/moe_remote/shard.rs` (924 — Http/Uds/Grpc transport branches splittable per transport). Each is one focused follow-up session |
-| Lib tests: 631 → 639 | 2026-05-10 | 8 new tests for the two new typed configs (5 DumpConfig + 3 RemoteMoeRuntime); split of predict.rs preserved all existing tests; all 639 lib tests pass clean |
+- **2026-05-10** — Hardening pass H8/H9/H11 shipped; H12 down to one file (`generate/gpu.rs`); 639 lib tests.
+- **2026-05-09** — Cleanup pass: blanket allows dropped, f16 codec via `half`, `forward/predict/raw.rs` dedup, 8 files crossed 90% coverage floor.
+- **2026-05-02** — Mechanistic interpretability engine surface MI0–MI3 + dense/custom-backend MI4 parity.
+- **2026-04-30** — gRPC grid + dense Metal chat templates + Gemma 4 four-variant accuracy.
+- **2026-04-27** — Q4_K stride validation, strict vindex loader.
+- **2026-04-26** — Generation quality (EOS, detok, sampling, streaming, ChatSession) + structural splits + ~100 new tests.
+- **2026-04-25** — `KvEngine` trait, MarkovResidual, UnlimitedContext, BackendFfn, profiler.
+- **2026-04** — `WalkFfn`, `LayerGraph` trait, `predict_honest`, GPU prefill, Q4_K FFN format wiring, TurboQuant, Apollo, Metal Q4K parity.
+- **2026-03** — Forward pass (CPU BLAS) foundation.

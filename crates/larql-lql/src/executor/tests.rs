@@ -1828,6 +1828,56 @@ fn memit_store_mut_returns_empty_store_on_fresh_vindex() {
 }
 
 #[test]
+fn show_compact_status_reflects_live_memit_store() {
+    // Regression: prior implementation hardcoded "0 facts across 0
+    // cycles" regardless of session state. After we add a synthetic
+    // cycle, SHOW COMPACT STATUS should report it.
+    let (mut session, dir) = vindex_session("compact_status_live");
+
+    // Synthetic vindex has hidden_dim = 4 → MEMIT-supported branch is
+    // disabled (requires ≥ 1024). We don't run the live-count check
+    // when the L2 line is gated. Skip cleanly in that case.
+    let initial = session
+        .execute(&parser::parse("SHOW COMPACT STATUS;").unwrap())
+        .expect("show compact status");
+    let initial_joined = initial.join("\n");
+    if initial_joined.contains("not available") {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // Push a cycle directly through the backend accessor.
+    {
+        let store = session.memit_store_mut().expect("vindex backend");
+        store.add_cycle(
+            7,
+            vec![larql_vindex::MemitFact {
+                entity: "X".into(),
+                relation: "y".into(),
+                target: "Z".into(),
+                key: larql_vindex::ndarray::Array1::zeros(4),
+                decomposed_down: larql_vindex::ndarray::Array1::zeros(4),
+                reconstruction_cos: 1.0,
+            }],
+            0.0,
+            1.0,
+            0.0,
+        );
+    }
+
+    let after = session
+        .execute(&parser::parse("SHOW COMPACT STATUS;").unwrap())
+        .expect("show compact status");
+    let joined = after.join("\n");
+    assert!(
+        joined.contains("1 fact(s) across 1 cycle(s)"),
+        "expected live MEMIT counts, got: {joined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn memit_store_persists_added_cycles() {
     // Verifies the wiring change from item #5: facts pushed into the
     // session-level MemitStore survive subsequent accesses. The
@@ -2093,6 +2143,117 @@ fn pipe_concatenates_both_sides_output() {
         out.len(),
         single_out.len(),
         out,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Returns the integer count parsed from a "Deleted N features ..." or
+/// "Updated N features ..." confirmation line. Used by feature-only
+/// regression tests to assert exact match counts rather than "any match".
+fn parse_mutation_count(out: &[String]) -> usize {
+    let joined = out.join("\n");
+    for line in joined.lines() {
+        for word in line.split_ascii_whitespace() {
+            if let Ok(n) = word.parse::<usize>() {
+                return n;
+            }
+        }
+    }
+    panic!("no integer count found in mutation output: {joined}");
+}
+
+#[test]
+fn delete_with_feature_only_targets_only_that_feature() {
+    // Regression: prior implementation passed (None, None, layer_filter) to
+    // find_features when the user specified only `feature`, which returned
+    // every feature in every layer. The fixture has 2 layers × 3 features
+    // (one feature is `None` in layer 1 → skipped), so deleting `feature = 0`
+    // should hit at most 2 slots, not all 5.
+    let (mut session, dir) = vindex_session("delete_feature_only");
+    let stmt = parser::parse(r#"DELETE FROM EDGES WHERE feature = 0;"#).unwrap();
+    let out = session.execute(&stmt).expect("DELETE should succeed");
+    let count = parse_mutation_count(&out);
+    assert!(
+        count <= 2,
+        "feature-only DELETE should target at most one column across layers, got {count}: {out:?}"
+    );
+    assert!(count >= 1, "fixture has feature 0 populated in both layers");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn update_with_feature_only_targets_only_that_feature() {
+    let (mut session, dir) = vindex_session("update_feature_only");
+    let stmt = parser::parse(
+        r#"UPDATE EDGES SET target = "Madrid" WHERE feature = 2;"#,
+    )
+    .unwrap();
+    let out = session.execute(&stmt).expect("UPDATE should succeed");
+    let count = parse_mutation_count(&out);
+    assert!(
+        count <= 2,
+        "feature-only UPDATE should target at most one column across layers, got {count}: {out:?}"
+    );
+    assert!(count >= 1, "fixture has feature 2 populated in both layers");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_skips_memit_fact_with_no_relation() {
+    // Regression: prior implementation substituted the literal string
+    // `"relation"` for a missing PatchOp::Insert.relation, baking junk
+    // into the canonical MEMIT prompt. We now skip and warn.
+    let (mut session, dir) = vindex_session("compile_skip_no_relation");
+
+    // Inject a patch recording with a relation-less insert directly.
+    session.patch_recording = Some(PatchRecording {
+        path: "synthetic.vlp".into(),
+        operations: vec![larql_vindex::PatchOp::Insert {
+            layer: 0,
+            feature: 0,
+            relation: None,
+            entity: "Atlantis".into(),
+            target: "Poseidon".into(),
+            confidence: Some(0.9),
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
+            down_meta: None,
+        }],
+    });
+
+    let out_dir = dir.join("compiled.vindex");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO VINDEX "{}";"#,
+        out_dir.display()
+    ))
+    .unwrap();
+    let lines = session.execute(&stmt).expect("compile should succeed");
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("skipping MEMIT fact"),
+        "expected a 'skipping MEMIT fact' warning, got: {joined}"
+    );
+    assert!(
+        joined.contains("no relation"),
+        "warning should mention missing relation: {joined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn delete_with_negative_layer_matches_nothing() {
+    // Negative integers are kept as a usize::MAX sentinel rather than
+    // widened to "no filter" — so they match nothing instead of matching
+    // everything.
+    let (mut session, dir) = vindex_session("delete_negative_layer");
+    let stmt = parser::parse(r#"DELETE FROM EDGES WHERE layer = -1;"#).unwrap();
+    let out = session.execute(&stmt).expect("DELETE should not error");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("no matching"),
+        "negative layer should match nothing: {joined}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

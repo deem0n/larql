@@ -112,24 +112,9 @@ impl Session {
             let tokenizer = larql_vindex::load_vindex_tokenizer(path)
                 .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
 
-            let encoding = tokenizer
-                .encode(entity, false)
-                .map_err(|e| LqlError::exec("tokenize error", e))?;
-            let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-
-            if !token_ids.is_empty() {
-                let hidden = embed.shape()[1];
-                let query = if token_ids.len() == 1 {
-                    embed.row(token_ids[0] as usize).mapv(|v| v * embed_scale)
-                } else {
-                    let mut avg = larql_vindex::ndarray::Array1::<f32>::zeros(hidden);
-                    for &tok in &token_ids {
-                        avg += &embed.row(tok as usize).mapv(|v| v * embed_scale);
-                    }
-                    avg /= token_ids.len() as f32;
-                    avg
-                };
-
+            if let Some(query) =
+                crate::executor::helpers::entity_query_vec(&tokenizer, &embed, embed_scale, entity)?
+            {
                 // Use a large top_k because the raw embedding query
                 // has low cosine with deep-layer gate directions (the
                 // residual stream has been transformed by N layers of
@@ -364,26 +349,14 @@ impl Session {
         let tokenizer = larql_vindex::load_vindex_tokenizer(path)
             .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
 
-        let encoding = tokenizer
-            .encode(nc.entity.as_str(), false)
-            .map_err(|e| LqlError::exec("tokenize error", e))?;
-        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-
-        if token_ids.is_empty() {
+        let Some(query) = crate::executor::helpers::entity_query_vec(
+            &tokenizer,
+            &embed,
+            embed_scale,
+            nc.entity.as_str(),
+        )?
+        else {
             return Ok(vec!["  (entity not found)".into()]);
-        }
-
-        // Build query from entity embedding
-        let hidden = embed.shape()[1];
-        let query = if token_ids.len() == 1 {
-            embed.row(token_ids[0] as usize).mapv(|v| v * embed_scale)
-        } else {
-            let mut avg = larql_vindex::ndarray::Array1::<f32>::zeros(hidden);
-            for &tok in &token_ids {
-                avg += &embed.row(tok as usize).mapv(|v| v * embed_scale);
-            }
-            avg /= token_ids.len() as f32;
-            avg
         };
 
         // KNN at the specified layer

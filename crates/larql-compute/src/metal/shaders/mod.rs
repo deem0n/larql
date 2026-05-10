@@ -49,6 +49,7 @@ pub mod q6k_geglu_down;
 pub mod q6k_geglu_gelu_tanh_down_cached;
 pub mod q6k_matvec;
 pub mod q6k_matvec_8sg;
+pub mod per_layer_embed;
 pub mod q8_attn_proj;
 pub mod q8_matvec;
 pub mod qk_norm;
@@ -125,6 +126,8 @@ pub fn all_shaders() -> String {
     src.push_str(qk_norm_rope_fused::SHADER);
     src.push_str(post_attn_residual_norm_store::SHADER);
     src.push_str(post_ffn_norm_residual_add::SHADER);
+    // Per-Layer Embeddings (Gemma 4 E2B)
+    src.push_str(per_layer_embed::SHADER);
     // TurboQuant (KV cache compression)
     src.push_str(turboquant_encode::SHADER);
     src.push_str(turboquant_decode::SHADER);

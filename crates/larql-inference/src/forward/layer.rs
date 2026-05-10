@@ -80,7 +80,7 @@ pub fn run_ffn(
         if let Some(dir) = stage_dump_dir {
             let slice = arr.as_slice().unwrap_or(&[]);
             let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = std::fs::write(format!("{dir}/cpu_L0_{name}.f32"), &bytes);
+            let _ = std::fs::write(super::dump_config::cpu_stage_path(dir, name), &bytes);
         }
     };
     dump_f32("h_post_attn", h_post_attn);
@@ -175,7 +175,7 @@ pub fn run_layer_with_ffn(
     if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
+        let path = crate::forward::dump_config::cpu_layer_h_post_attn_path(dir, layer);
         let _ = std::fs::write(&path, &bytes);
     }
     let (h_post_ffn, activation) = run_ffn(weights, &h_post_attn, layer, ffn, capture_activation);

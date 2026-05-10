@@ -6,6 +6,82 @@ The format follows the conventions of [Keep a Changelog](https://keepachangelog.
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-10] — Per-layer FFN Phase 2 closed
+
+Cool-machine bench rerun reproduced both baselines (4B ≥ 80 tok/s,
+26B ≥ 17 tok/s), confirming that the 2026-05-09 hot-machine
+measurements (4B 30.4, 26B 11.2) were thermal artifacts from
+back-to-back release compiles + 26B model loads — same precedent as
+the 2026-04-28 `Q4_K f16 accumulator` entry.
+
+**Phase 2 closure** — `MetalBackend::moe_scratch` Mutex +
+`AppState::moe_scratches` HashMap (both shape-keyed) amortise the
+~120 ms first-token allocation as designed. Cache machinery shipped,
+baselines hold, no bisect needed. `larql-compute/ROADMAP.md` Phase 2
+entry can land alongside.
+
+**Standardised steady-state headline**: `larql bench --warmup 3 -n 30`.
+Earlier ROADMAPs sometimes drifted between `bench`, `bench_generate`,
+and `--warmup 0` numbers — those are not comparable.
+
+**Spec doc**: `crates/larql-vindex/docs/per-layer-ffn-phase2-research.md`
+captures the cache-machinery audit + thermal-confound analysis.
+
+## [2026-05-10] — P0 review follow-ups + magic-number sweep
+
+Closes the two outstanding 2026-05-09 review follow-ups in the ROADMAP
+P0 section, plus a focused magic-number sweep prompted by the audit.
+
+### Closed
+
+- **Hardened attention manifest accessors** (`index/storage/attn.rs`).
+  `attn_q8_layer_data`, `attn_q4k_layer_data`, and `attn_q4_layer_slices`
+  now validate `offset + length <= mmap.len()` (with `checked_add` for
+  overflow safety) before slicing — matching the defensive behavior
+  already in `down_features_q4k_layer_data` /
+  `interleaved_q4k_layer_data`. A stale or corrupt attention manifest
+  now returns `None` (caller can fall back) instead of a slice-bounds
+  panic on query/decode. Added 3 inline tests, one per accessor, that
+  load a clean vindex, mutate the manifest to point past the mmap, and
+  assert `None`.
+
+- **Replaced `walker/utils.rs::current_date()` 365/30-day approximation**
+  with a Gregorian implementation mirroring `larql-inference/src/capture.rs`.
+  Pulled out a `date_from_epoch_secs(secs: u64)` helper for deterministic
+  tests; kept `current_date()` as the wall-clock convenience wrapper used
+  by walker `extraction_date` metadata. Added 6 leap-year / boundary
+  tests (1970-01-01, 2024 leap-year transitions, century boundaries).
+
+### Magic-number sweep (related)
+
+- **`ATTN_TENSORS_PER_LAYER = 4`** lifted on `index/storage/attn.rs`.
+  Replaces three `* 4` / `+ 3 >=` patterns across the Q8 / Q4_K / Q4
+  accessors. Self-documents the Q/K/V/O layout convention.
+- **`FFN_COMPONENTS_PER_LAYER = 3`** + **`FFN_DOWN = 2`** lifted on
+  `index/storage/ffn_store/mod.rs`. Replaces bare `* 3` and `== 2`
+  literals across `ffn_store/interleaved_q4k.rs`, `ffn_store/q4k_cache.rs`
+  (×2), `index/types/ffn_row.rs`, `quant/convert_q4k.rs`, and
+  `format/load.rs`. Down (`FFN_DOWN`) is the special case — it's stored
+  row-major `[hidden, intermediate]` and needs the transpose path.
+
+### Tests
+
+- Lib tests **857 → 866** (+9: 3 attn bounds, 6 calendar).
+- `cargo clippy -p larql-vindex --all-targets -- -D warnings`: clean.
+- `cargo fmt -p larql-vindex`: clean.
+- Golden hash drift fix: `vector_extractor_ffn_down_byte_identical`
+  now strips the `_header` record (which carries `extraction_date`)
+  before sort+hash. Without it the golden would drift every day now
+  that `current_date()` returns a real wall-clock date instead of the
+  buggy 365/30-day approximation that drifted ~30× slower. Regenerated
+  golden once and locked it in.
+
+### Open in P0
+
+- Phase 2 cool-machine bench rerun. Hot-machine numbers (4B 30.4 vs 88.1
+  baseline, 26B 11.2 vs 19.4) suspected thermal — runbook in
+  `ROADMAP.md`. Cannot be automated.
+
 ## [2026-05-10] — Coverage push (round-6)
 
 The day after round-5's large-file decomp. Closed all five 2026-05-09

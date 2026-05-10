@@ -109,7 +109,7 @@ mod tests {
     //   cargo test -p larql-inference --lib layer_graph::generate::tests -- --ignored --nocapture
 
     fn load_test_vindex() -> Option<(larql_vindex::VectorIndex, larql_models::ModelWeights)> {
-        let vpath = std::env::var("LARQL_VINDEX_PATH").ok()?;
+        let vpath = std::env::var(crate::vindex::ENV_VINDEX_PATH).ok()?;
         let path = std::path::Path::new(&vpath);
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut index = larql_vindex::VectorIndex::load_vindex(path, &mut cb).ok()?;
@@ -125,7 +125,7 @@ mod tests {
         let (index, mut weights) =
             load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .expect("tokenizer load failed");
 
@@ -163,7 +163,7 @@ mod tests {
         let (index, mut weights) =
             load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .expect("tokenizer load failed");
 
@@ -207,7 +207,7 @@ mod tests {
     fn generate_prefill_ms_positive() {
         let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .unwrap();
         let prompt = "Hello";

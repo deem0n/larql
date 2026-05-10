@@ -1,3 +1,4 @@
+use crate::ffn::moe_remote::runtime::{ENV_MOE_NO_SPLIT, ENV_MOE_TIMING, ENV_MOE_TOP_K, ENV_SKIP_MOE};
 use crate::layer_graph::generate::policy::TokenSelectionPolicy;
 
 #[derive(Clone, Debug)]
@@ -12,12 +13,12 @@ pub(super) struct GridRuntimeConfig {
 impl GridRuntimeConfig {
     pub fn from_env() -> Self {
         Self {
-            moe_top_k_override: std::env::var("LARQL_MOE_TOP_K")
+            moe_top_k_override: std::env::var(ENV_MOE_TOP_K)
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok()),
-            skip_moe: std::env::var("SKIP_MOE").is_ok(),
-            timing_enabled: std::env::var("LARQL_MOE_TIMING").is_ok(),
-            split_disabled: std::env::var("LARQL_MOE_NO_SPLIT").is_ok(),
+            skip_moe: std::env::var(ENV_SKIP_MOE).is_ok(),
+            timing_enabled: std::env::var(ENV_MOE_TIMING).is_ok(),
+            split_disabled: std::env::var(ENV_MOE_NO_SPLIT).is_ok(),
             token_policy: TokenSelectionPolicy::from_env(),
         }
     }
