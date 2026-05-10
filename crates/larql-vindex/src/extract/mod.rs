@@ -7,6 +7,7 @@ pub mod callbacks;
 pub mod checkpoint;
 pub mod constants;
 pub mod metadata;
+pub mod moe_svd;
 pub mod stage_labels;
 pub mod streaming;
 

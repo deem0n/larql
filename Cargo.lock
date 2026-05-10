@@ -2324,6 +2324,7 @@ dependencies = [
  "memmap2",
  "mockito",
  "ndarray",
+ "rand 0.8.6",
  "rayon",
  "reqwest",
  "safetensors",
