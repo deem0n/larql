@@ -600,29 +600,53 @@ the file today. Severity tags: **P0** = correctness/security ship-blocker,
 
 ### REV1. Panic on NaN in gRPC sort *(P0)*
 
-**Files**: `src/grpc.rs:311`, `src/grpc.rs:432`.
+**Status**: ✅ **Shipped 2026-05-10.**
 
-`edges.sort_by(|a, b| b.gate_score.partial_cmp(&a.gate_score).unwrap())`
-panics when any score is NaN. Same pattern at `:432` for `c_score`.
-A corrupted vindex or a future patched-scoring path that produces NaN
-takes the gRPC worker down.
+Both sort sites in `src/grpc.rs` (the `describe` handler at line ~311 and the
+`select` handler at line ~432) used `partial_cmp(...).unwrap()`, which
+panics on NaN. Replaced with a shared `cmp_score_desc(a, b)` helper that
+returns `Ordering::Equal` on NaN, removing the panic path. New
+`#[cfg(test)] mod tests` in `grpc.rs` covers: descending order, NaN→Equal,
+sort-with-NaN no-panic + length-preservation, sort-with-infinities
+ordering, and all-finite descending sort. Five new unit tests, all green;
+`cargo test -p larql-server --test test_grpc` (28 integration tests) still
+green.
 
-**Acceptance**: replace with `.unwrap_or(std::cmp::Ordering::Equal)`;
-add a unit test that injects NaN into the score vector and asserts the
-handler returns a clean response (NaN entries pushed to tail or filtered).
+**Files touched**: `src/grpc.rs` (one new helper, two call sites, one new
+test module).
+
+**Note on the strict-weak-ordering trade-off**: NaN-as-Equal violates strict
+weak ordering, so `sort_by` cannot guarantee that finite values around
+NaN are globally descending — only that the call doesn't panic and that
+finite/NaN counts are preserved. Acceptable for a defensive change against
+upstream data corruption; downstream `truncate(limit)` still picks
+finite values when present, which is the property production cared about.
 
 ### REV2. Non-constant-time API key comparison *(P0 security)*
 
-**Files**: `src/auth.rs:38`.
+**Status**: ✅ **Shipped 2026-05-10.**
 
-`if token == required_key` on `&str` is bytewise short-circuit — a real
-timing channel against any deployed key. Use `subtle::ConstantTimeEq`
-on the byte slices, or hash both sides (e.g. SHA-256) and compare the
-fixed-length digests.
+`auth.rs` now hashes both the provided token and the configured key with
+SHA-256 and compares the 32-byte digests via `subtle::ConstantTimeEq`.
+The hash step removes the length-leak; the constant-time compare removes
+the bytewise short-circuit leak. Module-level doc comment names the
+threat model so the next reader doesn't accidentally regress to `==`.
 
-**Acceptance**: timing-equality used in production path; a unit test that
-verifies wrong-key still produces 401 (existing) plus a doc comment naming
-the threat model.
+**Files touched**:
+- `Cargo.toml`: added `subtle = "2.6"` as a direct dep (already in the
+  lockfile via rustls — declaring it directly makes the threat-model
+  rationale visible at the crate boundary).
+- `src/auth.rs`: rewritten with module docs, a private
+  `tokens_match(provided, expected) -> bool` helper, and a
+  `#[cfg(test)] mod tests` covering equal/unequal/empty/length-different/
+  single-byte-difference cases (6 unit tests).
+
+**Verification**:
+- 6 new auth unit tests pass.
+- All 6 existing `http_auth_*` integration tests in `test_http_core.rs`
+  still pass (no behavioural regression).
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
 
 ### REV3. `blocking_read` on tokio RwLock inside async path *(P0)*
 

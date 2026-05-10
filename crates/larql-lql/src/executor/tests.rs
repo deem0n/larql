@@ -104,6 +104,62 @@ fn use_model_fails_on_nonexistent() {
 }
 
 #[test]
+fn use_with_corrupt_index_json_errors() {
+    // load_vindex_config maps malformed JSON into VindexError::Parse;
+    // use_cmd wraps it as LqlError::Execution. Exercises the error
+    // branch on line 32-33 of use_cmd.rs.
+    let dir = std::env::temp_dir().join(format!("larql_use_corrupt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("index.json"), "{ this is not valid json").unwrap();
+
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("vindex config") || msg.contains("config") || msg.contains("Parse"),
+        "expected config-load error, got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn use_with_corrupt_knn_store_warns_and_continues() {
+    // Build a valid vindex, then drop a corrupt knn_store.bin into
+    // the dir. USE should not fail — the load failure is logged to
+    // stderr and the session keeps going with an empty store.
+    let dir = make_test_vindex_dir("use_corrupt_knn");
+    std::fs::write(
+        dir.join(larql_vindex::format::filenames::KNN_STORE_BIN),
+        b"this is not a valid knn store",
+    )
+    .unwrap();
+
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    let _ = session.execute(&stmt).expect("USE should tolerate corrupt knn_store.bin");
+    assert!(matches!(session.backend, Backend::Vindex { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn use_with_corrupt_memit_store_warns_and_continues() {
+    // Same shape as the knn_store case: a malformed memit_store.json
+    // shouldn't block USE — the session falls back to MemitStore::new().
+    let dir = make_test_vindex_dir("use_corrupt_memit");
+    std::fs::write(dir.join("memit_store.json"), "not valid json {{{{").unwrap();
+
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("USE should tolerate corrupt memit_store.json");
+    assert!(matches!(session.backend, Backend::Vindex { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn use_model_auto_extract_parses() {
     // Verify AUTO_EXTRACT parses correctly (loading will fail for nonexistent model)
     let mut session = Session::new();
@@ -3729,6 +3785,32 @@ fn insert_compose_against_full_fixture_runs() {
 }
 
 #[test]
+fn three_compose_inserts_drive_cross_fact_regression_loop() {
+    // After two prior compose installs, the third INSERT runs
+    // `cross_fact_regression_check` with `priors_to_check` populated
+    // (rev().take(MAX_PRIORS_CHECKED) yields 2 entries). Random
+    // weights make the priors regress → shrink-and-retry loop runs
+    // until CROSS_ITERS exhausts.
+    let (mut session, dir) = full_vindex_session("compose_cross_fact");
+
+    for (e, r, t) in &[
+        ("[1]", "[2]", "[5]"),
+        ("[3]", "[2]", "[6]"),
+        ("[7]", "[2]", "[9]"),
+    ] {
+        let sql = format!(
+            r#"INSERT INTO EDGES (entity, relation, target)
+               VALUES ("{e}", "{r}", "{t}") AT LAYER 0 MODE COMPOSE;"#,
+        );
+        let stmt = parser::parse(&sql).unwrap();
+        // Random weights mean some installs may fail; accept either
+        // outcome but exercise the cross-fact regression path.
+        let _ = session.execute(&stmt);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn insert_compose_with_explicit_alpha_and_confidence() {
     let (mut session, dir) = full_vindex_session("insert_compose_alpha");
     let stmt = parser::parse(
@@ -3816,6 +3898,218 @@ fn explain_infer_against_synthetic_vindex_errors_without_model_weights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Build a `Session` with `Backend::Weight` populated from the
+/// synthetic test fixtures — no on-disk model required. This unlocks
+/// the dense INFER / EXPLAIN INFER paths that short-circuit before
+/// the vindex branch.
+fn weight_backend_session(model_id: &str) -> Session {
+    use larql_inference::ndarray::Array2;
+
+    let mut weights = larql_inference::test_utils::make_test_weights();
+    // make_test_weights produces vocab_size=32 with embed [32, 16]; the
+    // companion tokenizer puts [UNK] at id 32 — out of bounds. Extend
+    // embed + lm_head by one row so any UNK token resolves to a valid
+    // embedding (mirrors the trick in make_full_test_vindex_dir).
+    let new_vocab = weights.vocab_size + 1;
+    let hidden = weights.hidden_size;
+    let mut extended = Array2::<f32>::zeros((new_vocab, hidden));
+    for (i, row) in weights.embed.rows().into_iter().enumerate() {
+        for (j, v) in row.iter().enumerate() {
+            extended[[i, j]] = *v;
+        }
+    }
+    for j in 0..hidden {
+        extended[[weights.vocab_size, j]] = 0.01_f32 * (j as f32 + 1.0);
+    }
+    weights.embed = extended.into_shared();
+    let mut lm_extended = Array2::<f32>::zeros((new_vocab, hidden));
+    for (i, row) in weights.lm_head.rows().into_iter().enumerate() {
+        if i >= new_vocab {
+            break;
+        }
+        for (j, v) in row.iter().enumerate() {
+            lm_extended[[i, j]] = *v;
+        }
+    }
+    weights.lm_head = lm_extended.into_shared();
+    weights.vocab_size = new_vocab;
+    let embed_key = weights.arch.embed_key().to_string();
+    weights.tensors.insert(embed_key, weights.embed.clone());
+
+    // Match the embed by passing vocab_size-1 to the tokenizer so [UNK]
+    // lands at id new_vocab-1 (= old vocab_size), inside the extended
+    // embed table.
+    let tokenizer = larql_inference::test_utils::make_test_tokenizer(weights.vocab_size - 1);
+    let mut session = Session::new();
+    session.backend = Backend::Weight {
+        model_id: model_id.into(),
+        weights,
+        tokenizer,
+    };
+    session
+}
+
+#[test]
+fn infer_on_weight_backend_returns_dense_predictions() {
+    // Backend::Weight short-circuits in `exec_infer` (line 17-43 of
+    // infer.rs): runs `predict` directly on the weights with no walk
+    // FFN / vindex involvement.
+    let mut session = weight_backend_session("test/weight-backend-infer");
+    let stmt = parser::parse(r#"INFER "[1] [2]";"#).unwrap();
+    let out = session.execute(&stmt).expect("INFER on Backend::Weight");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("dense"),
+        "expected dense-prediction header, got: {joined}",
+    );
+}
+
+#[test]
+fn infer_on_weight_backend_with_compare_skips_tip_line() {
+    // The `if !compare { ... Tip: EXTRACT ... }` branch is the only
+    // path-difference in the Backend::Weight arm: with COMPARE the
+    // tip line is suppressed.
+    let mut session = weight_backend_session("test/weight-backend-compare");
+    let stmt = parser::parse(r#"INFER "[3]" COMPARE;"#).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("INFER COMPARE on Backend::Weight");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("dense"),
+        "expected dense header, got: {joined}",
+    );
+    // The "Tip: EXTRACT into a vindex..." line should NOT be present
+    // when COMPARE is set.
+    assert!(
+        !joined.contains("EXTRACT into a vindex"),
+        "Tip line should be suppressed when COMPARE is set, got: {joined}",
+    );
+}
+
+#[test]
+fn trace_on_weight_backend_runs_dense_path() {
+    // TRACE short-circuits to the Backend::Weight arm (line 28-37 of
+    // trace.rs) and runs the decomposed forward via WeightFfn.
+    let mut session = weight_backend_session("test/weight-backend-trace");
+    let stmt = parser::parse(r#"TRACE "[1] [2]";"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("TRACE on Backend::Weight");
+}
+
+#[test]
+fn trace_on_synthetic_vindex_errors_without_model_weights() {
+    // Basic synthetic fixture has has_model_weights=false; TRACE
+    // should surface the model-weights error path.
+    let (mut session, dir) = vindex_session("trace_no_weights_v2");
+    let stmt = parser::parse(r#"TRACE "[1]";"#).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("model weights"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_on_weight_backend_runs_dense_summary() {
+    // `exec_infer_trace` short-circuits at line 25 to
+    // `exec_infer_trace_dense` — produces a dense-only summary with
+    // no per-feature trace.
+    let mut session = weight_backend_session("test/weight-backend-explain");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[5]";"#).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER on Backend::Weight");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("dense"),
+        "expected dense trace header, got: {joined}",
+    );
+    assert!(
+        joined.contains("EXTRACT for full trace"),
+        "expected the EXTRACT-for-trace tip, got: {joined}",
+    );
+}
+
+#[test]
+fn diff_current_with_weight_backend_errors() {
+    // `resolve_vindex_ref` Current arm with a Weight backend should
+    // surface the "CURRENT refers to a live model" error suggesting
+    // EXTRACT first, exercising lines 215-219 of diff.rs.
+    let mut session = weight_backend_session("test/weight-backend-diff");
+    // Path b doesn't matter — Current is rejected before path resolution.
+    let stmt = parser::parse(r#"DIFF CURRENT "/tmp/no_such_vindex_xyz";"#).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("live model") && msg.contains("EXTRACT"),
+        "expected weight-backend CURRENT error, got: {msg}",
+    );
+}
+
+#[test]
+fn infer_with_canonical_knn_prompt_triggers_override_branch() {
+    // INSERT KNN stores the residual at install_layer for the canonical
+    // prompt "The {rel} of {entity} is". Re-running INFER with the same
+    // prompt forces the cosine match path: the captured residual matches
+    // the stored key 1:1, so apply_knn_override returns Some(...) and the
+    // formatter renders the override-row branch in infer.rs.
+    let (mut session, dir) = full_vindex_session("infer_canonical_override");
+
+    let insert = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") AT LAYER 0 MODE KNN;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&insert).expect("INSERT KNN");
+
+    // Same canonical prompt the INSERT path used internally — this is
+    // the only INFER input guaranteed to hit the cosine threshold on
+    // the synthetic fixture.
+    let stmt = parser::parse(r#"INFER "The [2] of [1] is";"#).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("INFER on canonical KNN prompt");
+    let joined = out.join("\n");
+    // The override branch surfaces a 100% probability line and the
+    // post-logits override note.
+    assert!(
+        joined.contains("100.00%"),
+        "expected KNN override row with 100% prob, got: {joined}",
+    );
+    assert!(
+        joined.contains("KNN override"),
+        "expected KNN override note, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_with_canonical_knn_prompt_renders_override_summary() {
+    // Same setup as infer_with_canonical_knn_prompt_triggers_override_branch
+    // but for EXPLAIN INFER, which routes through `exec_infer_trace`
+    // and renders the override summary line + "Pending retrieval
+    // override" note.
+    let (mut session, dir) = full_vindex_session("explain_infer_canonical_override");
+
+    let insert = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[7]") AT LAYER 0 MODE KNN;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&insert).expect("INSERT KNN");
+
+    let stmt = parser::parse(r#"EXPLAIN INFER "The [2] of [1] is";"#).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER canonical KNN prompt");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("Pending retrieval override"),
+        "expected 'Pending retrieval override' note, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn infer_after_knn_insert_drives_override_branch() {
     // INSERT KNN writes a residual key into the KnnStore. The next
@@ -3871,6 +4165,67 @@ fn explain_infer_relations_only_runs() {
     let stmt =
         parser::parse(r#"EXPLAIN INFER "[1]" RELATIONS ONLY;"#).unwrap();
     let _ = session.execute(&stmt).expect("EXPLAIN INFER RELATIONS ONLY");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_with_attention_and_band_runs() {
+    // WITH ATTENTION engages the f32 attention-capture path; combined
+    // with KNOWLEDGE band exercises the band_to_layer_range filter
+    // inside the per-layer render loop.
+    let (mut session, dir) = full_vindex_session("explain_infer_attn_band");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" KNOWLEDGE WITH ATTENTION;"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER KNOWLEDGE WITH ATTENTION");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_with_attention_and_relations_only_runs() {
+    // WITH ATTENTION + RELATIONS ONLY hits the compact-format render
+    // branch with the labelled-hits-empty short-circuit, since the
+    // synthetic vindex has no relation classifier.
+    let (mut session, dir) = full_vindex_session("explain_infer_attn_relonly");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[5]" RELATIONS ONLY WITH ATTENTION;"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER RELATIONS ONLY WITH ATTENTION");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_with_layers_range_filters_trace() {
+    // LAYERS m-n exercises the layer_range filter in the per-layer
+    // render loop.
+    let (mut session, dir) = full_vindex_session("explain_infer_layers_range");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" LAYERS 0-0;"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER LAYERS 0-0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_syntax_band_runs() {
+    // SYNTAX band — different layer_range than KNOWLEDGE; exercises
+    // the LayerBand::Syntax arm of band_to_layer_range.
+    let (mut session, dir) = full_vindex_session("explain_infer_syntax");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" SYNTAX;"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER SYNTAX");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_output_band_runs() {
+    // OUTPUT band — third arm of band_to_layer_range.
+    let (mut session, dir) = full_vindex_session("explain_infer_output");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" OUTPUT;"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER OUTPUT");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3943,6 +4298,279 @@ fn diff_into_patch_writes_vlp_file() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+/// Build a vindex matching `make_test_vindex_dir` but with three
+/// deliberate divergences vs. the base fixture so DIFF surfaces
+/// real edits:
+///   L0F0: Paris → Madrid           (modified)
+///   L0F1: French → None            (removed)
+///   L1F1: None   → Rome            (added)
+fn make_modified_test_vindex_dir(tag: &str) -> std::path::PathBuf {
+    use larql_models::TopKEntry;
+    use larql_vindex::{ExtractLevel, FeatureMeta, StorageDtype, VectorIndex, VindexConfig};
+
+    let dir = std::env::temp_dir().join(format!("larql_lql_modified_test_vindex_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let hidden = 4;
+    let num_features = 3;
+    let num_layers = 2;
+    let vocab_size = 10;
+
+    let mut gate0 = Array2::<f32>::zeros((num_features, hidden));
+    gate0[[0, 0]] = 1.0;
+    gate0[[1, 1]] = 1.0;
+    gate0[[2, 2]] = 1.0;
+
+    let mut gate1 = Array2::<f32>::zeros((num_features, hidden));
+    gate1[[0, 3]] = 1.0;
+    gate1[[1, 0]] = 0.5;
+    gate1[[2, 2]] = -1.0;
+
+    let make_meta = |tok: &str, id: u32, c: f32| FeatureMeta {
+        top_token: tok.to_string(),
+        top_token_id: id,
+        c_score: c,
+        top_k: vec![TopKEntry {
+            token: tok.to_string(),
+            token_id: id,
+            logit: c,
+        }],
+    };
+
+    let meta0 = vec![
+        // L0F0: Paris → Madrid (token modified, c_score also moved)
+        Some(make_meta("Madrid", 110, 0.92)),
+        // L0F1: French → None (removed)
+        None,
+        // L0F2: Europe unchanged
+        Some(make_meta("Europe", 102, 0.75)),
+    ];
+    let meta1 = vec![
+        // L1F0: Berlin unchanged
+        Some(make_meta("Berlin", 200, 0.90)),
+        // L1F1: None → Rome (added)
+        Some(make_meta("Rome", 211, 0.85)),
+        // L1F2: Spain unchanged
+        Some(make_meta("Spain", 202, 0.70)),
+    ];
+    let down_meta = vec![Some(meta0), Some(meta1)];
+
+    let index = VectorIndex::new(
+        vec![Some(gate0), Some(gate1)],
+        down_meta,
+        num_layers,
+        hidden,
+    );
+
+    let mut config = VindexConfig {
+        version: 2,
+        model: "test/lql-mutation".into(),
+        family: "llama".into(),
+        source: None,
+        checksums: None,
+        num_layers,
+        hidden_size: hidden,
+        intermediate_size: num_features,
+        vocab_size,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::Browse,
+        dtype: StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: None,
+        layers: Vec::new(),
+        down_top_k: 5,
+        has_model_weights: false,
+        model_config: None,
+        fp4: None,
+        ffn_layout: None,
+    };
+    index.save_vindex(&dir, &mut config).unwrap();
+
+    let embed_bytes = vec![0u8; vocab_size * hidden * 4];
+    std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+    dir
+}
+
+#[test]
+fn diff_with_changes_reports_modified_added_removed() {
+    // DIFF base vs modified should surface all three status categories
+    // exercised by the `match (meta_a, meta_b) { ... }` arm.
+    let dir_a = make_test_vindex_dir("diff_changes_a");
+    let dir_b = make_modified_test_vindex_dir("diff_changes_b");
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}";"#,
+        dir_a.display(),
+        dir_b.display(),
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("DIFF should succeed");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("modified"),
+        "expected 'modified' status, got: {joined}"
+    );
+    assert!(
+        joined.contains("removed"),
+        "expected 'removed' status, got: {joined}"
+    );
+    assert!(
+        joined.contains("added"),
+        "expected 'added' status, got: {joined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_with_no_changes_reports_no_differences() {
+    // DIFF a fixture against itself: every (Some,Some) cell hits the
+    // "tokens equal AND c_score within 0.01" continue arm and the
+    // (None,None) arm continues; the final no-differences message
+    // should appear.
+    let dir_a = make_test_vindex_dir("diff_self_a");
+    let dir_b = make_test_vindex_dir("diff_self_b"); // same content
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}";"#,
+        dir_a.display(),
+        dir_b.display(),
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("DIFF self");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("no differences found"),
+        "expected no-differences message, got: {joined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_into_patch_with_real_changes_serialises_all_op_types() {
+    // INTO PATCH on diverging fixtures should produce a .vlp file with
+    // Update + Delete + Insert ops corresponding to modified/removed/added.
+    let dir_a = make_test_vindex_dir("diff_patch_real_a");
+    let dir_b = make_modified_test_vindex_dir("diff_patch_real_b");
+    let mut session = Session::new();
+    let patch_path = std::env::temp_dir().join(format!(
+        "larql_diff_real_patch_{}_{}.vlp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}" INTO PATCH "{}";"#,
+        dir_a.display(),
+        dir_b.display(),
+        patch_path.display(),
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("DIFF INTO PATCH real");
+    let joined = out.join("\n");
+
+    // The summary line includes counts for inserts/updates/deletes.
+    assert!(
+        joined.contains("Extracted:"),
+        "expected 'Extracted:' summary, got: {joined}"
+    );
+    assert!(
+        joined.contains("inserts") && joined.contains("updates") && joined.contains("deletes"),
+        "expected all three op kinds in summary, got: {joined}"
+    );
+    assert!(
+        patch_path.exists(),
+        "patch file should be written at {}",
+        patch_path.display()
+    );
+
+    let _ = std::fs::remove_file(&patch_path);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_current_resolves_to_active_vindex() {
+    // VindexRef::Current resolves to the session's active backend path.
+    let (mut session, dir_a) = vindex_session("diff_current_a");
+    let dir_b = make_modified_test_vindex_dir("diff_current_b");
+    let stmt = parser::parse(&format!(
+        r#"DIFF CURRENT "{}";"#,
+        dir_b.display(),
+    ))
+    .unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("DIFF CURRENT against another path");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains(dir_a.to_string_lossy().as_ref()),
+        "DIFF header should reference current vindex path, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_with_layer_filter_excludes_other_layers() {
+    // LAYER 1 should restrict the diff to layer 1 — modifications on
+    // layer 0 (Paris → Madrid, French → None) must not appear.
+    let dir_a = make_test_vindex_dir("diff_layer_filter_a");
+    let dir_b = make_modified_test_vindex_dir("diff_layer_filter_b");
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}" LAYER 1;"#,
+        dir_a.display(),
+        dir_b.display(),
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("DIFF LAYER 1");
+    let joined = out.join("\n");
+    // Layer 1 only adds Rome; should NOT show Madrid/French
+    assert!(
+        !joined.contains("Madrid"),
+        "LAYER 1 filter should exclude L0 changes, got: {joined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_with_explicit_limit_caps_displayed_diffs() {
+    // LIMIT 1 should display at most 1 diff row even though the
+    // modified fixture has 3 changes.
+    let dir_a = make_test_vindex_dir("diff_limit_cap_a");
+    let dir_b = make_modified_test_vindex_dir("diff_limit_cap_b");
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}" LIMIT 1;"#,
+        dir_a.display(),
+        dir_b.display(),
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("DIFF LIMIT 1");
+    let joined = out.join("\n");
+    // Only one diff row should appear; the summary line still mentions LIMIT.
+    let diff_rows: usize = out
+        .iter()
+        .filter(|l| l.starts_with("L0") || l.starts_with("L1"))
+        .count();
+    assert!(
+        diff_rows <= 1,
+        "LIMIT 1 should cap diff rows, got {} rows in: {joined}",
+        diff_rows,
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 // ── COMPILE INTO MODEL ───────────────────────────────────────
 
 #[test]
@@ -3968,6 +4596,96 @@ fn compile_into_model_default_path_runs() {
     let _ = session.execute(&stmt);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn compile_into_vindex_with_memit_enabled_runs_solver_path() {
+    // LARQL_MEMIT_ENABLE=1 + a compose-mode INSERT in the recording
+    // means COMPILE INTO VINDEX invokes the MEMIT closed-form ΔW_down
+    // solve and bakes the delta on top of the column-replace overlay.
+    let (mut session, dir) = full_vindex_session("compile_into_vindex_memit");
+
+    let insert = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") AT LAYER 0 MODE COMPOSE;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&insert).expect("INSERT compose");
+
+    let out_dir = std::env::temp_dir().join(format!(
+        "larql_compile_vindex_memit_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO VINDEX "{}";"#,
+        out_dir.display()
+    ))
+    .unwrap();
+
+    std::env::set_var("LARQL_MEMIT_ENABLE", "1");
+    let result = session.execute(&stmt);
+    std::env::remove_var("LARQL_MEMIT_ENABLE");
+
+    // Random-init weights mean the MEMIT solve might not produce
+    // a useful delta but the code path runs end-to-end.
+    let _ = result;
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn compile_into_vindex_on_conflict_highest_confidence_runs() {
+    // ON CONFLICT HIGHEST_CONFIDENCE is accepted as a forward-compat
+    // strategy that today behaves like LAST_WINS — the path is
+    // accepted by the parser and exec_compile_into_vindex passes
+    // through the strategy match arm without erroring.
+    use larql_vindex::{PatchOp, VindexPatch};
+
+    let (mut session, dir) = vindex_session("compile_conflict_highest");
+    {
+        let (_, _, patched) = session.require_patched_mut().unwrap();
+        let mkp = |conf: f32, target: &str| VindexPatch {
+            version: 1,
+            base_model: String::new(),
+            base_checksum: None,
+            created_at: String::new(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            operations: vec![PatchOp::Insert {
+                layer: 0,
+                feature: 0,
+                relation: Some("r".into()),
+                entity: "e".into(),
+                target: target.into(),
+                confidence: Some(conf),
+                gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
+                down_meta: None,
+            }],
+        };
+        patched.patches.push(mkp(0.5, "low"));
+        patched.patches.push(mkp(0.9, "high"));
+    }
+
+    let output = dir.join("compiled_hc.vindex");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO VINDEX "{}" ON CONFLICT HIGHEST_CONFIDENCE;"#,
+        output.display()
+    ))
+    .unwrap();
+    let result = session.execute(&stmt);
+    assert!(
+        result.is_ok(),
+        "ON CONFLICT HIGHEST_CONFIDENCE should run, got: {result:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&output);
 }
 
 #[test]

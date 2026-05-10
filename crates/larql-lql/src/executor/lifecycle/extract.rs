@@ -138,3 +138,57 @@ impl larql_vindex::IndexBuildCallbacks for LqlBuildCallbacks {
         self.messages.push(format!("  {stage}: {elapsed_ms:.0}ms"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use larql_vindex::IndexBuildCallbacks;
+
+    #[test]
+    fn build_callbacks_new_starts_empty() {
+        let cb = LqlBuildCallbacks::new();
+        assert!(cb.messages.is_empty());
+        assert!(cb.current_stage.is_empty());
+    }
+
+    #[test]
+    fn build_callbacks_on_stage_records_stage() {
+        let mut cb = LqlBuildCallbacks::new();
+        cb.on_stage("gate-vectors");
+        assert_eq!(cb.current_stage, "gate-vectors");
+        assert_eq!(cb.messages.len(), 1);
+        assert!(cb.messages[0].contains("Stage: gate-vectors"));
+    }
+
+    #[test]
+    fn build_callbacks_on_stage_done_appends_timing() {
+        let mut cb = LqlBuildCallbacks::new();
+        cb.on_stage_done("down-meta", 12.34);
+        assert_eq!(cb.messages.len(), 1);
+        assert!(cb.messages[0].contains("down-meta"));
+        assert!(cb.messages[0].contains("ms"));
+    }
+
+    #[test]
+    fn build_callbacks_records_full_stage_lifecycle() {
+        // on_stage then on_stage_done should produce two messages in
+        // recording order — the LQL output replays this verbatim.
+        let mut cb = LqlBuildCallbacks::new();
+        cb.on_stage("write-weights");
+        cb.on_stage_done("write-weights", 250.0);
+        assert_eq!(cb.messages.len(), 2);
+        assert!(cb.messages[0].contains("Stage: write-weights"));
+        assert!(cb.messages[1].contains("write-weights: 250"));
+    }
+
+    #[test]
+    fn build_callbacks_multiple_stages_accumulate() {
+        let mut cb = LqlBuildCallbacks::new();
+        cb.on_stage("a");
+        cb.on_stage_done("a", 1.0);
+        cb.on_stage("b");
+        cb.on_stage_done("b", 2.0);
+        assert_eq!(cb.messages.len(), 4);
+        assert_eq!(cb.current_stage, "b");
+    }
+}

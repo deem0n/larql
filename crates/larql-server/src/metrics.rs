@@ -60,6 +60,12 @@ pub struct LayerLatencyTracker {
     inner: Mutex<HashMap<u32, LayerStats>>,
 }
 
+impl Default for LayerLatencyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LayerLatencyTracker {
     pub fn new() -> Self {
         Self {
