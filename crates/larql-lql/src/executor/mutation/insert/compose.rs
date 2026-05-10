@@ -147,7 +147,10 @@ impl Session {
                     unit_vector(residual)
                 } else {
                     let ev = crate::executor::helpers::entity_query_vec(
-                        &tokenizer, &embed, embed_scale, entity,
+                        &tokenizer,
+                        &embed,
+                        embed_scale,
+                        entity,
                     )?
                     .map(|a| a.to_vec())
                     .unwrap_or_else(|| vec![0.0f32; plan.hidden]);

@@ -40,6 +40,7 @@ impl ComputeBackend for MetalBackend {
                 | Capability::DecodeQ4KMoe
                 | Capability::DecodeProfile
                 | Capability::PrefillQ4
+                | Capability::HeterogeneousAttention
         )
     }
 }

@@ -45,7 +45,6 @@ impl Session {
         output_dir: &std::path::Path,
         config: &larql_vindex::VindexConfig,
     ) -> Result<Vec<String>, LqlError> {
-
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut weights = larql_vindex::load_model_weights(vindex_path, &mut cb)
             .map_err(|e| LqlError::exec("failed to load model weights", e))?;

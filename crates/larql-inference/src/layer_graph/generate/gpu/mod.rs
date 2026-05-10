@@ -17,7 +17,9 @@ pub use forced_logits::{stream_forced_full_logits, ForcedLogitsResult};
 use super::cpu::{backend_supports_fused_q4_pipeline, generate_via_cpu_q4k};
 use super::detok::Detokenizer;
 use super::eos::EosConfig;
-use super::gpu_setup::{build_gpu_decode_setup, ensure_prompt_fits, reset_and_preallocate_kv_cache};
+use super::gpu_setup::{
+    build_gpu_decode_setup, ensure_prompt_fits, reset_and_preallocate_kv_cache,
+};
 use super::lm_head::{cpu_lm_head_topk, lm_head_topk_with_policy};
 use super::policy::GenerationRuntimeConfig;
 use super::sampling::{Sampler, SamplingConfig};
@@ -227,7 +229,6 @@ where
         }
     };
     let layers = setup.layers;
-    let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
 
@@ -266,7 +267,18 @@ where
         let _ = metal_ple_enabled;
         None
     };
+    // PLE input width is only consumed by the metal-gated `upload_ple`
+    // closure below; on non-metal builds the binding is unused. Split
+    // the cfg so each path gets the right warning posture without
+    // breaking the metal name resolution.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     let ple_dim = if metal_ple.is_some() {
+        weights.arch.per_layer_embed_dim()
+    } else {
+        0
+    };
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let _ple_dim = if metal_ple.is_some() {
         weights.arch.per_layer_embed_dim()
     } else {
         0
@@ -275,29 +287,27 @@ where
     // and upload it onto the Metal backend. Mirrors
     // `precompute_per_layer_inputs` for a single position.
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    let upload_ple = |metal: &larql_compute::metal::MetalBackend, token_id: u32, embed_row: &[f32]| {
-        let embed_arr =
-            ndarray::Array2::from_shape_vec((1, hidden), embed_row.to_vec()).unwrap_or_else(|_| {
-                ndarray::Array2::<f32>::zeros((1, hidden))
-            });
-        let per_layer_inputs =
-            crate::forward::ple::precompute_per_layer_inputs(weights, &embed_arr, &[token_id]);
-        let num_layers = weights.num_layers;
-        let mut flat: Vec<f32> = Vec::with_capacity(num_layers * ple_dim);
-        for layer_arr in &per_layer_inputs {
-            for v in layer_arr.row(0).iter() {
-                flat.push(*v);
+    let upload_ple =
+        |metal: &larql_compute::metal::MetalBackend, token_id: u32, embed_row: &[f32]| {
+            let embed_arr = ndarray::Array2::from_shape_vec((1, hidden), embed_row.to_vec())
+                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((1, hidden)));
+            let per_layer_inputs =
+                crate::forward::ple::precompute_per_layer_inputs(weights, &embed_arr, &[token_id]);
+            let num_layers = weights.num_layers;
+            let mut flat: Vec<f32> = Vec::with_capacity(num_layers * ple_dim);
+            for layer_arr in &per_layer_inputs {
+                for v in layer_arr.row(0).iter() {
+                    flat.push(*v);
+                }
             }
-        }
-        metal.prepare_ple_inputs(&flat, num_layers, ple_dim);
-    };
+            metal.prepare_ple_inputs(&flat, num_layers, ple_dim);
+        };
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     let h_vec = match prefill::prefill_for_streaming(
         weights,
         backend,
         &layers,
-        attention,
         hidden,
         intermediate,
         token_ids,
@@ -315,7 +325,6 @@ where
         weights,
         backend,
         &layers,
-        attention,
         hidden,
         intermediate,
         token_ids,
@@ -396,7 +405,6 @@ where
         index,
         backend,
         &layers,
-        attention,
         hidden,
         intermediate,
         norm_offset,
@@ -419,7 +427,6 @@ where
         index,
         backend,
         &layers,
-        attention,
         hidden,
         intermediate,
         norm_offset,
@@ -532,7 +539,6 @@ fn diag_compare_cpu_topk(
 
     eprintln!("[compare] (run `larql walk --predict` (no --metal) for CPU reference tokens)");
 }
-
 
 #[cfg(test)]
 mod tests {

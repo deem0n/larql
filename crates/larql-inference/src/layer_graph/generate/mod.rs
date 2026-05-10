@@ -38,8 +38,8 @@ pub use types::{GenerateError, GenerateResult, StageTimings};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_test_weights;
     use crate::layer_graph::CachedLayerGraph;
+    use crate::test_utils::make_test_weights;
 
     // ── lm_head / logit helpers (synthetic, no vindex) ────────────────────────
 

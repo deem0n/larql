@@ -58,6 +58,7 @@ impl WirePreference {
     }
 
     /// Parse from a short string (`"f32"`, `"f16"`, `"i8"`).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim() {
             "f32" => Some(Self::F32),

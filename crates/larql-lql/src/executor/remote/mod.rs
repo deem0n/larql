@@ -70,10 +70,7 @@ pub(super) fn require_layer_feature(
     Ok((layer, feature))
 }
 
-pub(super) fn lookup_usize_condition(
-    conditions: &[Condition],
-    field: &str,
-) -> Option<usize> {
+pub(super) fn lookup_usize_condition(conditions: &[Condition], field: &str) -> Option<usize> {
     conditions
         .iter()
         .find(|c| c.field == field)
@@ -311,6 +308,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn default_timeout_is_reasonable() {
         // < 5s would race common deep-walk INFER; > 10min would let
         // the REPL freeze on a hung server.
@@ -396,9 +394,7 @@ mod tests {
     fn use_remote_errors_when_server_unreachable() {
         let mut session = Session::new();
         // Port 1 is reserved + nothing's listening there.
-        let err = session
-            .exec_use_remote("http://127.0.0.1:1")
-            .unwrap_err();
+        let err = session.exec_use_remote("http://127.0.0.1:1").unwrap_err();
         assert!(err.to_string().contains("failed to connect"));
     }
 
@@ -502,9 +498,7 @@ mod tests {
         let _describe = server
             .mock("GET", mockito::Matcher::Regex(r"/v1/describe".into()))
             .with_status(200)
-            .with_body(
-                serde_json::json!({"edges": [], "latency_ms": 5.0}).to_string(),
-            )
+            .with_body(serde_json::json!({"edges": [], "latency_ms": 5.0}).to_string())
             .create();
 
         let session = connect(&server.url());
@@ -571,9 +565,7 @@ mod tests {
             .create();
 
         let session = connect(&server.url());
-        let out = session
-            .remote_infer("test", Some(1), true)
-            .unwrap();
+        let out = session.remote_infer("test", Some(1), true).unwrap();
         let joined = out.join("\n");
         assert!(joined.contains("Predictions (walk)"));
         assert!(joined.contains("Predictions (dense)"));
@@ -799,5 +791,215 @@ mod tests {
         assert!(session.remote_stats().is_err());
         let conds: Vec<Condition> = vec![];
         assert!(session.remote_select(&conds, None).is_err());
+    }
+
+    // ── remote_explain_infer ────────────────────────────────────
+
+    #[test]
+    fn remote_explain_infer_renders_layer_trace() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _explain = server
+            .mock("POST", ENDPOINT_EXPLAIN_INFER)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "predictions": [
+                        {"token": "Paris", "probability": 0.92}
+                    ],
+                    "trace": [
+                        {
+                            "layer": 26,
+                            "features": [
+                                {
+                                    "feature": 1,
+                                    "gate_score": 14.2,
+                                    "top_token": "Paris",
+                                    "relation": "capital",
+                                    "down_top": ["Paris", "France", "Europe"],
+                                }
+                            ]
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_explain_infer("test", Some(3), None, false, false)
+            .expect("remote_explain_infer");
+        let joined = out.join("\n");
+        assert!(joined.contains("Inference trace"));
+        assert!(joined.contains("Paris"));
+        assert!(joined.contains("L26"));
+    }
+
+    #[test]
+    fn remote_explain_infer_with_attention_renders_compact_format() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _explain = server
+            .mock("POST", ENDPOINT_EXPLAIN_INFER)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "predictions": [{"token": "X", "probability": 0.5}],
+                    "trace": [
+                        {
+                            "layer": 5,
+                            "features": [{
+                                "feature": 0,
+                                "gate_score": 9.0,
+                                "top_token": "T",
+                                "relation": "rel",
+                                "down_top": ["T"],
+                            }],
+                            "attention": [
+                                {"token": "X", "weight": 0.7}
+                            ],
+                            "lens": {"token": "Y", "probability": 0.3},
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_explain_infer("p", Some(1), None, false, true)
+            .expect("remote_explain_infer WITH ATTENTION");
+        let joined = out.join("\n");
+        assert!(joined.contains("L"));
+    }
+
+    #[test]
+    fn remote_explain_infer_with_knn_override_surfaces_pending_note() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _explain = server
+            .mock("POST", ENDPOINT_EXPLAIN_INFER)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "knn_override": {
+                        "token": "Madrid",
+                        "cosine": 0.88,
+                        "layer": 12,
+                    },
+                    "trace": [],
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_explain_infer("q", None, None, false, false)
+            .expect("remote_explain_infer KNN override");
+        let joined = out.join("\n");
+        assert!(joined.contains("Pending retrieval override"));
+        assert!(joined.contains("Madrid"));
+    }
+
+    #[test]
+    fn remote_infer_renders_knn_override_note() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _infer = server
+            .mock("POST", ENDPOINT_INFER)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "predictions": [],
+                    "knn_override": {
+                        "token": "Atlantis",
+                        "cosine": 0.91,
+                        "layer": 5,
+                    },
+                    "latency_ms": 12.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session.remote_infer("any", None, false).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Atlantis"));
+        assert!(joined.contains("note: KNN override"));
+    }
+
+    #[test]
+    fn remote_describe_brief_mode_renders_compact_output() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _describe = server
+            .mock("GET", mockito::Matcher::Regex(r"/v1/describe".into()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "edges": [{"target": "Berlin", "gate_score": 8.0, "layer": 26, "relation": "capital", "source": "probe", "also": []}],
+                    "latency_ms": 4.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_describe("Germany", None, crate::ast::DescribeMode::Brief)
+            .expect("remote_describe brief");
+        let joined = out.join("\n");
+        assert!(joined.contains("Berlin"));
+    }
+
+    #[test]
+    fn remote_walk_with_layer_range_passes_through() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _walk = server
+            .mock("GET", mockito::Matcher::Regex(r"/v1/walk".into()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "hits": [],
+                    "latency_ms": 1.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        // LAYERS m-n exercises a different query-string serialisation
+        // branch than the no-range variant.
+        let range = crate::ast::Range { start: 0, end: 5 };
+        let _ = session.remote_walk("p", Some(5), Some(&range)).unwrap();
     }
 }

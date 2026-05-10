@@ -11,8 +11,6 @@
 //! keeps the tests fast, deterministic, and independent of BLAS / HF
 //! weights / disk.
 
-#![cfg(test)]
-
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Mutex;
 

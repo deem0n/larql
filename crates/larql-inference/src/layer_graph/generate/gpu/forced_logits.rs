@@ -8,10 +8,7 @@
 //! step extends the KV cache instead of recomputing the full prefix.
 
 use crate::layer_graph::generate::cpu::backend_supports_fused_q4_pipeline;
-use crate::layer_graph::generate::gpu_setup::{
-    prefill_q4_prompt, reset_and_preallocate_kv_cache,
-};
-use crate::layer_graph::pipeline_layer::attention_geometry_for_arch_layer;
+use crate::layer_graph::generate::gpu_setup::{prefill_q4_prompt, reset_and_preallocate_kv_cache};
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
@@ -89,7 +86,6 @@ where
         q4_ffn_per_matrix,
         ffn_format,
     );
-    let attention = attention_geometry_for_arch_layer(weights, 0);
 
     let prefill_start = std::time::Instant::now();
     reset_and_preallocate_kv_cache(weights, backend);
@@ -104,7 +100,6 @@ where
         &x,
         hidden,
         intermediate,
-        attention,
         1,
         qk_norm_val,
         softcap_val,
@@ -129,18 +124,7 @@ where
         let h_tok = crate::forward::embed_tokens_pub(weights, &[forced]);
         let x_dec: Vec<f32> = h_tok.row(0).to_vec();
         let h_out = backend
-            .decode_token(
-                &layers,
-                &x_dec,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-            )
+            .decode_token(&layers, &x_dec, hidden, intermediate)
             .ok_or_else(|| format!("Q4 decode failed at forced step {step}"))?;
         h_1d = final_norm_row(weights, &h_out, hidden, norm_offset)?;
         decode_ms.push(decode_start.elapsed().as_secs_f64() * 1000.0);
@@ -239,14 +223,9 @@ mod tests {
         let mut weights = make_test_weights();
         let index = make_test_vindex(&weights);
         let backend = larql_compute::default_backend();
-        let r = stream_forced_full_logits(
-            &mut weights,
-            0,
-            0,
-            &index,
-            backend.as_ref(),
-            |_, _| panic!("on_logits must not fire when target_steps == 0"),
-        )
+        let r = stream_forced_full_logits(&mut weights, 0, 0, &index, backend.as_ref(), |_, _| {
+            panic!("on_logits must not fire when target_steps == 0")
+        })
         .expect("target_steps==0 must succeed");
         assert!(r.forced_tokens.is_empty());
         assert!(r.decode_ms.is_empty());
@@ -262,14 +241,7 @@ mod tests {
         let mut weights = make_test_weights();
         let index = make_test_vindex(&weights);
         let cpu = larql_compute::CpuBackend;
-        let r = stream_forced_full_logits(
-            &mut weights,
-            0,
-            1,
-            &index,
-            &cpu,
-            |_, _| Ok(0),
-        );
+        let r = stream_forced_full_logits(&mut weights, 0, 1, &index, &cpu, |_, _| Ok(0));
         let err = r.expect_err("CpuBackend must be rejected as non-fused-Q4");
         assert!(
             err.contains("fused Q4 backend"),
@@ -292,8 +264,8 @@ mod tests {
     #[test]
     fn final_norm_row_returns_hidden_length_finite_values() {
         let weights = make_test_weights();
-        let r = final_norm_row(&weights, &[0.5; 16], 16, 0.0)
-            .expect("exact-length input must succeed");
+        let r =
+            final_norm_row(&weights, &[0.5; 16], 16, 0.0).expect("exact-length input must succeed");
         assert_eq!(r.len(), 16);
         assert!(
             r.iter().all(|v| v.is_finite()),
@@ -344,4 +316,3 @@ mod tests {
         );
     }
 }
-

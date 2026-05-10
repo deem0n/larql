@@ -87,6 +87,7 @@ pub(super) fn print_run_summary(label: &str, per_token: &[Vec<LayerTiming>]) {
 }
 
 /// Inner MoE call with optional timing capture.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn moe_call_timed(
     remote: &RemoteMoeBackend,
     layer: usize,

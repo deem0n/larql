@@ -448,9 +448,8 @@ mod tests {
         let v = small(seq, hd, 1.0);
         let scale = 1.0 / (hd as f64).sqrt();
         let out_nocap = gqa_attention(&q, &k, &v, 1, hd, 1, scale, seq);
-        let (out_cap, _) = gqa_attention_with_weights(
-            &q, &k, &v, 1, hd, 1, scale, seq, false, Some(0.5),
-        );
+        let (out_cap, _) =
+            gqa_attention_with_weights(&q, &k, &v, 1, hd, 1, scale, seq, false, Some(0.5));
         let mut max_diff = 0.0f32;
         for (a, b) in out_nocap.iter().zip(out_cap.iter()) {
             max_diff = max_diff.max((a - b).abs());
@@ -571,8 +570,7 @@ mod tests {
         let k = small(seq, hd, 0.1);
         let scale = 1.0 / (hd as f64).sqrt();
         let all_full = gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, scale, seq, None, hd);
-        let all_clamped =
-            gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, scale, seq, None, hd * 4);
+        let all_clamped = gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, scale, seq, None, hd * 4);
         for (a, b) in all_full.heads[0].iter().zip(all_clamped.heads[0].iter()) {
             for (x, y) in a.iter().zip(b.iter()) {
                 assert!(
@@ -591,17 +589,8 @@ mod tests {
         let hd = 4usize;
         let q = small(seq, hd, 0.1);
         let k = small(seq, hd, 0.1);
-        let all = gqa_reduced_qk_all_weights(
-            &q,
-            &k,
-            1,
-            hd,
-            1,
-            1.0 / (hd as f64).sqrt(),
-            seq,
-            None,
-            0,
-        );
+        let all =
+            gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, 1.0 / (hd as f64).sqrt(), seq, None, 0);
         for (qi, dist) in all.heads[0].iter().enumerate() {
             let causal_sum: f32 = dist[..=qi].iter().sum();
             assert!(
@@ -648,8 +637,8 @@ mod tests {
         let mut q_data = vec![0.0f32; seq * num_q * hd];
         for s in 0..seq {
             for d in 0..hd {
-                q_data[s * num_q * hd + 0 * hd + d] = 0.1; // head 0
-                q_data[s * num_q * hd + 1 * hd + d] = 0.1; // head 1 (same as 0)
+                q_data[s * num_q * hd + d] = 0.1; // head 0
+                q_data[s * num_q * hd + hd + d] = 0.1; // head 1 (same as 0)
                 q_data[s * num_q * hd + 2 * hd + d] = 0.5; // head 2
                 q_data[s * num_q * hd + 3 * hd + d] = 0.5; // head 3 (same as 2)
             }
@@ -659,8 +648,8 @@ mod tests {
         let v = small(seq, num_kv * hd, 0.1);
         let out = gqa_attention(&q, &k, &v, num_q, hd, reps, 1.0 / (hd as f64).sqrt(), seq);
         // heads 0 and 1 should produce identical output rows (same Q, same KV)
-        let h0: Vec<f32> = out.row(0).iter().skip(0 * hd).take(hd).copied().collect();
-        let h1: Vec<f32> = out.row(0).iter().skip(1 * hd).take(hd).copied().collect();
+        let h0: Vec<f32> = out.row(0).iter().take(hd).copied().collect();
+        let h1: Vec<f32> = out.row(0).iter().skip(hd).take(hd).copied().collect();
         for (a, b) in h0.iter().zip(h1.iter()) {
             assert!(
                 (a - b).abs() < 1e-5,

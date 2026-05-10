@@ -452,6 +452,62 @@ fn gather_columns(
     buf
 }
 
+/// Select top-K features by gate activation magnitude (architecture-correct).
+pub fn select_top_k_features(
+    weights: &ModelWeights,
+    layer: usize,
+    x_row: &ndarray::ArrayView1<f32>,
+    top_k: usize,
+) -> Vec<usize> {
+    let arch = &*weights.arch;
+    let is_gated = arch.ffn_type() == larql_models::FfnType::Gated;
+    let use_gelu = matches!(
+        arch.activation(),
+        larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
+    );
+
+    let proj = if is_gated {
+        let w_gate = weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
+        w_gate.dot(x_row)
+    } else {
+        let w_up = weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
+        let mut p = w_up.dot(x_row);
+        if let Some(bias) = arch
+            .ffn_up_bias_key(layer)
+            .and_then(|bk| weights.vectors.get(&bk))
+        {
+            for i in 0..p.len().min(bias.len()) {
+                p[i] += bias[i];
+            }
+        }
+        p
+    };
+
+    let intermediate = proj.len();
+    let k = top_k.min(intermediate);
+
+    let mut indexed: Vec<(usize, f32)> = proj
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| {
+            let act = if use_gelu {
+                gelu_tanh(v)
+            } else {
+                v * sigmoid(v)
+            };
+            (i, act)
+        })
+        .collect();
+
+    if k > 0 && k < indexed.len() {
+        indexed.select_nth_unstable_by(k, |a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+        indexed.truncate(k);
+    }
+    indexed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    indexed.into_iter().map(|(id, _)| id).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,8 +635,18 @@ mod tests {
         let x = input(1, weights.hidden_size);
         let feats = &[0usize, 1];
         let overrides = vec![
-            FeatureSlotOverride { feature: 0, gate: None, up: None, down: None },
-            FeatureSlotOverride { feature: 1, gate: None, up: None, down: None },
+            FeatureSlotOverride {
+                feature: 0,
+                gate: None,
+                up: None,
+                down: None,
+            },
+            FeatureSlotOverride {
+                feature: 1,
+                gate: None,
+                up: None,
+                down: None,
+            },
         ];
         let (out_full, _) =
             sparse_ffn_forward_with_full_overrides(&weights, 0, &x, feats, &overrides);
@@ -653,8 +719,7 @@ mod tests {
             up: Some(&custom_up),
             down: Some(&custom_down),
         }];
-        let (out, _) =
-            sparse_ffn_forward_with_full_overrides(&weights, 0, &x, feats, &overrides);
+        let (out, _) = sparse_ffn_forward_with_full_overrides(&weights, 0, &x, feats, &overrides);
         assert_eq!(out.shape(), &[2, weights.hidden_size]);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -663,8 +728,7 @@ mod tests {
     fn full_overrides_empty_features_returns_zeros() {
         let weights = make_test_weights();
         let x = input(2, weights.hidden_size);
-        let (out, act) =
-            sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[], &[]);
+        let (out, act) = sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[], &[]);
         assert_eq!(out.shape(), &[2, weights.hidden_size]);
         assert!(out.iter().all(|v| v.abs() < 1e-9));
         assert_eq!(act.shape()[0], 2);
@@ -724,8 +788,7 @@ mod tests {
             up: Some(&custom_up),
             down: None,
         }];
-        let (out, _) =
-            sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[0], &overrides);
+        let (out, _) = sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[0], &overrides);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -746,8 +809,7 @@ mod tests {
             up: None,
             down: None,
         }];
-        let (out, _) =
-            sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[0], &overrides);
+        let (out, _) = sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[0], &overrides);
         assert!(out.iter().all(|v| v.is_finite()));
     }
 
@@ -762,64 +824,7 @@ mod tests {
             up: Some(&bad_up),
             down: None,
         }];
-        let (out, _) =
-            sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[0], &overrides);
+        let (out, _) = sparse_ffn_forward_with_full_overrides(&weights, 0, &x, &[0], &overrides);
         assert!(out.iter().all(|v| v.is_finite()));
     }
-}
-
-/// Select top-K features by gate activation magnitude (architecture-correct).
-pub fn select_top_k_features(
-    weights: &ModelWeights,
-    layer: usize,
-    x_row: &ndarray::ArrayView1<f32>,
-    top_k: usize,
-) -> Vec<usize> {
-    let arch = &*weights.arch;
-    let is_gated = arch.ffn_type() == larql_models::FfnType::Gated;
-    let use_gelu = matches!(
-        arch.activation(),
-        larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
-    );
-
-    let proj = if is_gated {
-        let w_gate = weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
-        w_gate.dot(x_row)
-    } else {
-        let w_up = weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
-        let mut p = w_up.dot(x_row);
-        if let Some(bias) = arch
-            .ffn_up_bias_key(layer)
-            .and_then(|bk| weights.vectors.get(&bk))
-        {
-            for i in 0..p.len().min(bias.len()) {
-                p[i] += bias[i];
-            }
-        }
-        p
-    };
-
-    let intermediate = proj.len();
-    let k = top_k.min(intermediate);
-
-    let mut indexed: Vec<(usize, f32)> = proj
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, v)| {
-            let act = if use_gelu {
-                gelu_tanh(v)
-            } else {
-                v * sigmoid(v)
-            };
-            (i, act)
-        })
-        .collect();
-
-    if k > 0 && k < indexed.len() {
-        indexed.select_nth_unstable_by(k, |a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-        indexed.truncate(k);
-    }
-    indexed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    indexed.into_iter().map(|(id, _)| id).collect()
 }

@@ -230,8 +230,7 @@ mod tests {
 
     #[test]
     fn multi_renders_all_messages_in_order() {
-        let tmpl =
-            "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}\
+        let tmpl = "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}\
              {% if add_generation_prompt %}{{ '<go>' }}{% endif %}";
         let out = render_chat_template_multi(
             tmpl,
@@ -246,10 +245,10 @@ mod tests {
     #[test]
     fn multi_threads_enable_thinking_flag() {
         let tmpl = "{% if enable_thinking %}think{% else %}plain{% endif %}";
-        let on = render_chat_template_multi(tmpl, &empty_cfg(), &msgs(&[("user", "x")]), true)
-            .unwrap();
-        let off = render_chat_template_multi(tmpl, &empty_cfg(), &msgs(&[("user", "x")]), false)
-            .unwrap();
+        let on =
+            render_chat_template_multi(tmpl, &empty_cfg(), &msgs(&[("user", "x")]), true).unwrap();
+        let off =
+            render_chat_template_multi(tmpl, &empty_cfg(), &msgs(&[("user", "x")]), false).unwrap();
         assert_eq!(on, "think");
         assert_eq!(off, "plain");
     }
@@ -265,8 +264,9 @@ mod tests {
 
     #[test]
     fn multi_surfaces_syntax_errors_as_string() {
-        let err = render_chat_template_multi("{% for", &empty_cfg(), &msgs(&[("user", "x")]), false)
-            .unwrap_err();
+        let err =
+            render_chat_template_multi("{% for", &empty_cfg(), &msgs(&[("user", "x")]), false)
+                .unwrap_err();
         assert!(err.contains("syntax"), "err={err}");
     }
 

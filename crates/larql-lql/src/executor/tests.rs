@@ -138,7 +138,9 @@ fn use_with_corrupt_knn_store_warns_and_continues() {
 
     let mut session = Session::new();
     let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
-    let _ = session.execute(&stmt).expect("USE should tolerate corrupt knn_store.bin");
+    let _ = session
+        .execute(&stmt)
+        .expect("USE should tolerate corrupt knn_store.bin");
     assert!(matches!(session.backend, Backend::Vindex { .. }));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -912,8 +914,8 @@ fn rich_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
 
 fn make_full_test_vindex_dir(tag: &str) -> std::path::PathBuf {
     use larql_vindex::{
-        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype,
-        VindexConfig, VindexLayerInfo, VindexModelConfig,
+        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype, VindexConfig,
+        VindexLayerInfo, VindexModelConfig,
     };
 
     let dir = std::env::temp_dir().join(format!(
@@ -1064,8 +1066,8 @@ fn make_large_test_vindex_dir(tag: &str) -> std::path::PathBuf {
     use larql_inference::ndarray::Array2;
     use larql_models::{detect_from_json, ModelWeights, WeightArray};
     use larql_vindex::{
-        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype,
-        VindexConfig, VindexLayerInfo, VindexModelConfig,
+        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype, VindexConfig,
+        VindexLayerInfo, VindexModelConfig,
     };
     use std::collections::HashMap;
 
@@ -1286,8 +1288,8 @@ fn large_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
 /// `try_moe_describe` path in `describe/moe.rs`.
 fn make_moe_test_vindex_dir(tag: &str) -> std::path::PathBuf {
     use larql_vindex::{
-        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype,
-        VindexConfig, VindexLayerInfo, VindexModelConfig,
+        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype, VindexConfig,
+        VindexLayerInfo, VindexModelConfig,
     };
 
     const NUM_EXPERTS: usize = 4;
@@ -1446,7 +1448,7 @@ fn make_moe_test_vindex_dir(tag: &str) -> std::path::PathBuf {
     let per_layer = NUM_EXPERTS * weights.hidden_size + NUM_EXPERTS;
     let total = per_layer * weights.num_layers;
     let mut router_bytes = Vec::with_capacity(total * bpf);
-    let mut state: u64 = 0xc0_ffee_42;
+    let mut state: u64 = 0x00c0_ffee_4200_0000;
     for _ in 0..total {
         state = state
             .wrapping_mul(6364136223846793005)
@@ -2998,10 +3000,7 @@ fn delete_with_feature_only_targets_only_that_feature() {
 #[test]
 fn update_with_feature_only_targets_only_that_feature() {
     let (mut session, dir) = vindex_session("update_feature_only");
-    let stmt = parser::parse(
-        r#"UPDATE EDGES SET target = "Madrid" WHERE feature = 2;"#,
-    )
-    .unwrap();
+    let stmt = parser::parse(r#"UPDATE EDGES SET target = "Madrid" WHERE feature = 2;"#).unwrap();
     let out = session.execute(&stmt).expect("UPDATE should succeed");
     let count = parse_mutation_count(&out);
     assert!(
@@ -3185,7 +3184,9 @@ fn select_features_with_layer_filter_runs() {
 fn select_features_with_feature_filter_runs() {
     let (mut session, dir) = vindex_session("select_features_feat");
     let stmt = parser::parse("SELECT * FROM FEATURES WHERE feature = 0;").unwrap();
-    let _ = session.execute(&stmt).expect("SELECT FEATURES WHERE feature");
+    let _ = session
+        .execute(&stmt)
+        .expect("SELECT FEATURES WHERE feature");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3245,8 +3246,7 @@ fn select_entities_no_matches_runs() {
 #[test]
 fn select_nearest_to_known_entity_runs() {
     let (mut session, dir) = rich_vindex_session("select_nearest_known");
-    let stmt =
-        parser::parse(r#"SELECT * FROM EDGES NEAREST TO "Paris" AT LAYER 0;"#).unwrap();
+    let stmt = parser::parse(r#"SELECT * FROM EDGES NEAREST TO "Paris" AT LAYER 0;"#).unwrap();
     let _ = session.execute(&stmt).expect("SELECT NEAREST");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3255,8 +3255,7 @@ fn select_nearest_to_known_entity_runs() {
 fn select_nearest_to_unknown_entity_runs() {
     let (mut session, dir) = rich_vindex_session("select_nearest_unknown");
     let stmt =
-        parser::parse(r#"SELECT * FROM EDGES NEAREST TO "Atlantis" AT LAYER 0 LIMIT 5;"#)
-            .unwrap();
+        parser::parse(r#"SELECT * FROM EDGES NEAREST TO "Atlantis" AT LAYER 0 LIMIT 5;"#).unwrap();
     let _ = session.execute(&stmt).expect("SELECT NEAREST");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3331,10 +3330,9 @@ fn select_edges_with_entity_and_relation_drives_walk_path() {
     // Both filters present → walk-anchored path. The rich fixture has
     // a relation classifier (feature_labels.json) so labelled edges
     // can match the user's relation predicate.
-    let stmt = parser::parse(
-        r#"SELECT * FROM EDGES WHERE entity = "Paris" AND relation = "capital";"#,
-    )
-    .unwrap();
+    let stmt =
+        parser::parse(r#"SELECT * FROM EDGES WHERE entity = "Paris" AND relation = "capital";"#)
+            .unwrap();
     let _ = session
         .execute(&stmt)
         .expect("SELECT EDGES walk path with classifier");
@@ -3427,6 +3425,45 @@ fn stats_runs_against_synthetic_vindex() {
 }
 
 #[test]
+fn stats_with_relation_classifier_renders_coverage_breakdown() {
+    // Drop relation_clusters.json + feature_clusters.jsonl into the
+    // basic fixture so RelationClassifier::from_vindex returns Some(rc)
+    // and STATS exercises the cluster/probe coverage branches.
+    let dir = make_test_vindex_dir("stats_with_classifier");
+    std::fs::write(
+        dir.join(larql_vindex::format::filenames::RELATION_CLUSTERS_JSON),
+        r#"{"k":2,"centres":[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0]],"labels":["capital","language"],"counts":[5,3],"top_tokens":[["paris"],["english"]]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(larql_vindex::format::filenames::FEATURE_CLUSTERS_JSONL),
+        "{\"l\":0,\"f\":0,\"c\":0}\n{\"l\":1,\"f\":2,\"c\":1}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(larql_vindex::format::filenames::FEATURE_LABELS_JSON),
+        r#"{"L0_F1":"capital","L1_F0":"language"}"#,
+    )
+    .unwrap();
+
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    session.execute(&stmt).expect("USE with classifier");
+    let stmt = parser::parse("STATS;").unwrap();
+    let out = session.execute(&stmt).expect("STATS");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("Clusters:") || joined.contains("Mapped relations"),
+        "expected classifier-driven STATS output, got: {joined}",
+    );
+    assert!(
+        joined.contains("Coverage:"),
+        "expected Coverage section, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stats_with_explicit_path_runs() {
     // STATS "<path>" form — explicit vindex path argument.
     let (mut session, dir) = vindex_session("stats_path");
@@ -3447,7 +3484,9 @@ fn show_relations_verbose_runs_against_classifier() {
 fn show_relations_with_examples_runs() {
     let (mut session, dir) = rich_vindex_session("show_rel_examples");
     let stmt = parser::parse("SHOW RELATIONS WITH EXAMPLES;").unwrap();
-    let _ = session.execute(&stmt).expect("SHOW RELATIONS WITH EXAMPLES");
+    let _ = session
+        .execute(&stmt)
+        .expect("SHOW RELATIONS WITH EXAMPLES");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3515,12 +3554,11 @@ fn diff_with_explicit_limit_runs() {
 #[test]
 fn diff_with_nonexistent_source_errors() {
     let mut session = Session::new();
-    let stmt = parser::parse(
-        r#"DIFF "/tmp/no_such_vindex_a" "/tmp/no_such_vindex_b";"#,
-    )
-    .unwrap();
+    let stmt = parser::parse(r#"DIFF "/tmp/no_such_vindex_a" "/tmp/no_such_vindex_b";"#).unwrap();
     let err = session.execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("load") || err.to_string().contains("not found"));
+    assert!(
+        err.to_string().to_lowercase().contains("load") || err.to_string().contains("not found")
+    );
 }
 
 // ── MERGE ────────────────────────────────────────────────────
@@ -3529,11 +3567,7 @@ fn diff_with_nonexistent_source_errors() {
 fn merge_synthetic_into_current_keeps_source_strategy() {
     let (mut session, dir) = vindex_session("merge_target");
     let source_dir = make_test_vindex_dir("merge_source");
-    let stmt = parser::parse(&format!(
-        r#"MERGE "{}";"#,
-        source_dir.display()
-    ))
-    .unwrap();
+    let stmt = parser::parse(&format!(r#"MERGE "{}";"#, source_dir.display())).unwrap();
     let out = session.execute(&stmt).expect("MERGE");
     let joined = out.join("\n");
     assert!(joined.contains("Merged"));
@@ -3583,11 +3617,7 @@ fn merge_with_missing_source_errors() {
 fn merge_no_backend_no_target_errors() {
     let mut session = Session::new();
     let source_dir = make_test_vindex_dir("merge_no_backend");
-    let stmt = parser::parse(&format!(
-        r#"MERGE "{}";"#,
-        source_dir.display()
-    ))
-    .unwrap();
+    let stmt = parser::parse(&format!(r#"MERGE "{}";"#, source_dir.display())).unwrap();
     // No USE ran → MERGE without explicit target should error.
     let _ = session.execute(&stmt); // accept either error or ok depending on path
     let _ = std::fs::remove_dir_all(&source_dir);
@@ -3665,10 +3695,7 @@ fn rebalance_with_no_installs_short_circuits_v2() {
 #[test]
 fn rebalance_with_explicit_clauses_short_circuits() {
     let (mut session, dir) = vindex_session("rebalance_clauses_v2");
-    let stmt = parser::parse(
-        "REBALANCE FLOOR 0.20 CEILING 0.95 MAX 8;",
-    )
-    .unwrap();
+    let stmt = parser::parse("REBALANCE FLOOR 0.20 CEILING 0.95 MAX 8;").unwrap();
     let _ = session.execute(&stmt).expect("REBALANCE with clauses");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3744,7 +3771,9 @@ fn explain_infer_against_full_fixture_runs() {
 fn explain_infer_verbose_with_attention_runs() {
     let (mut session, dir) = full_vindex_session("explain_infer_attn");
     let stmt = parser::parse(r#"EXPLAIN INFER "[5]" VERBOSE WITH ATTENTION;"#).unwrap();
-    let _ = session.execute(&stmt).expect("EXPLAIN INFER VERBOSE WITH ATTENTION");
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER VERBOSE WITH ATTENTION");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3822,7 +3851,9 @@ fn insert_compose_with_explicit_alpha_and_confidence() {
            MODE COMPOSE;"#,
     )
     .unwrap();
-    let _ = session.execute(&stmt).expect("INSERT compose with alpha+confidence");
+    let _ = session
+        .execute(&stmt)
+        .expect("INSERT compose with alpha+confidence");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3993,9 +4024,7 @@ fn trace_on_weight_backend_runs_dense_path() {
     // trace.rs) and runs the decomposed forward via WeightFfn.
     let mut session = weight_backend_session("test/weight-backend-trace");
     let stmt = parser::parse(r#"TRACE "[1] [2]";"#).unwrap();
-    let _ = session
-        .execute(&stmt)
-        .expect("TRACE on Backend::Weight");
+    let _ = session.execute(&stmt).expect("TRACE on Backend::Weight");
 }
 
 #[test]
@@ -4162,9 +4191,10 @@ fn explain_infer_with_band_clause_runs() {
 #[test]
 fn explain_infer_relations_only_runs() {
     let (mut session, dir) = full_vindex_session("explain_infer_rel_only");
-    let stmt =
-        parser::parse(r#"EXPLAIN INFER "[1]" RELATIONS ONLY;"#).unwrap();
-    let _ = session.execute(&stmt).expect("EXPLAIN INFER RELATIONS ONLY");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1]" RELATIONS ONLY;"#).unwrap();
+    let _ = session
+        .execute(&stmt)
+        .expect("EXPLAIN INFER RELATIONS ONLY");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4200,9 +4230,7 @@ fn explain_infer_with_layers_range_filters_trace() {
     // render loop.
     let (mut session, dir) = full_vindex_session("explain_infer_layers_range");
     let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" LAYERS 0-0;"#).unwrap();
-    let _ = session
-        .execute(&stmt)
-        .expect("EXPLAIN INFER LAYERS 0-0");
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER LAYERS 0-0");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4212,9 +4240,7 @@ fn explain_infer_syntax_band_runs() {
     // the LayerBand::Syntax arm of band_to_layer_range.
     let (mut session, dir) = full_vindex_session("explain_infer_syntax");
     let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" SYNTAX;"#).unwrap();
-    let _ = session
-        .execute(&stmt)
-        .expect("EXPLAIN INFER SYNTAX");
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER SYNTAX");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4223,9 +4249,7 @@ fn explain_infer_output_band_runs() {
     // OUTPUT band — third arm of band_to_layer_range.
     let (mut session, dir) = full_vindex_session("explain_infer_output");
     let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" OUTPUT;"#).unwrap();
-    let _ = session
-        .execute(&stmt)
-        .expect("EXPLAIN INFER OUTPUT");
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER OUTPUT");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4281,10 +4305,8 @@ fn diff_into_patch_writes_vlp_file() {
     let dir_a = make_test_vindex_dir("diff_into_patch_a");
     let dir_b = make_test_vindex_dir("diff_into_patch_b");
     let mut session = Session::new();
-    let patch_path = std::env::temp_dir().join(format!(
-        "larql_diff_patch_{}.vlp",
-        std::process::id()
-    ));
+    let patch_path =
+        std::env::temp_dir().join(format!("larql_diff_patch_{}.vlp", std::process::id()));
     let stmt = parser::parse(&format!(
         r#"DIFF "{}" "{}" INTO PATCH "{}";"#,
         dir_a.display(),
@@ -4501,11 +4523,7 @@ fn diff_current_resolves_to_active_vindex() {
     // VindexRef::Current resolves to the session's active backend path.
     let (mut session, dir_a) = vindex_session("diff_current_a");
     let dir_b = make_modified_test_vindex_dir("diff_current_b");
-    let stmt = parser::parse(&format!(
-        r#"DIFF CURRENT "{}";"#,
-        dir_b.display(),
-    ))
-    .unwrap();
+    let stmt = parser::parse(&format!(r#"DIFF CURRENT "{}";"#, dir_b.display(),)).unwrap();
     let out = session
         .execute(&stmt)
         .expect("DIFF CURRENT against another path");
@@ -4908,9 +4926,7 @@ fn describe_on_moe_fixture_unknown_entity_reports_not_found() {
     let (mut session, dir) = moe_vindex_session("describe_moe_unknown");
 
     let stmt = parser::parse(r#"DESCRIBE "totally_unknown_entity_that_wont_tokenize";"#).unwrap();
-    let out = session
-        .execute(&stmt)
-        .expect("DESCRIBE on unknown entity");
+    let out = session.execute(&stmt).expect("DESCRIBE on unknown entity");
     let joined = out.join("\n");
     // Either "(not found)" or the entity name with empty experts is
     // acceptable — the test is that we don't panic on unknown input.

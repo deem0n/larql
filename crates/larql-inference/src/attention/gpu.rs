@@ -441,13 +441,9 @@ mod tests {
         let weights = crate::test_utils::make_gemma3_test_weights();
         let input = h(2, weights.hidden_size);
         let (h_no, _, _) = run_attention_with_kv_backend(&weights, &input, 0, None).unwrap();
-        let (h_cpu, _, _) = run_attention_with_kv_backend(
-            &weights,
-            &input,
-            0,
-            Some(&larql_compute::CpuBackend),
-        )
-        .unwrap();
+        let (h_cpu, _, _) =
+            run_attention_with_kv_backend(&weights, &input, 0, Some(&larql_compute::CpuBackend))
+                .unwrap();
         for (a, b) in h_no.iter().zip(h_cpu.iter()) {
             assert!((a - b).abs() < 1e-4, "diverged: {a} vs {b}");
         }
@@ -485,13 +481,9 @@ mod tests {
         let weights = make_test_weights();
         let input = h(2, weights.hidden_size);
         let (h_no, k_no, v_no) = run_attention_with_kv_backend(&weights, &input, 0, None).unwrap();
-        let (h_cpu, k_cpu, v_cpu) = run_attention_with_kv_backend(
-            &weights,
-            &input,
-            0,
-            Some(&larql_compute::CpuBackend),
-        )
-        .unwrap();
+        let (h_cpu, k_cpu, v_cpu) =
+            run_attention_with_kv_backend(&weights, &input, 0, Some(&larql_compute::CpuBackend))
+                .unwrap();
         for (a, b) in h_no.iter().zip(h_cpu.iter()) {
             assert!((a - b).abs() < 1e-4);
         }
@@ -502,5 +494,4 @@ mod tests {
             assert!((a - b).abs() < 1e-4);
         }
     }
-
 }

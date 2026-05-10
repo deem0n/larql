@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 pub const EXPERT_BINARY_CONTENT_TYPE: &str = "application/x-larql-expert";
 
+/// Decoded layer-batch request: `(layer, residual, expert_ids, expert_weights)`.
+pub type DecodedLayerBatchRequest = (usize, Vec<f32>, Vec<u32>, Vec<f32>);
+
 /// HTTP path served by the single-expert / batched-expert binary
 /// endpoint matched to [`EXPERT_BINARY_CONTENT_TYPE`].
 pub const EXPERT_BATCH_PATH: &str = "/v1/expert/batch";
@@ -89,7 +92,7 @@ pub fn encode_layer_batch_request(
 
 /// Decode a layer-batch request from raw bytes.  Returns
 /// `(layer, residual, expert_ids, expert_weights)` or `None` on truncation.
-pub fn decode_layer_batch_request(bytes: &[u8]) -> Option<(usize, Vec<f32>, Vec<u32>, Vec<f32>)> {
+pub fn decode_layer_batch_request(bytes: &[u8]) -> Option<DecodedLayerBatchRequest> {
     if bytes.len() < 12 {
         return None;
     }
@@ -197,9 +200,7 @@ pub fn encode_layer_batch_request_f16(
 
 /// Decode an f16 layer-batch request.  Reconstructs `residual` to f32 on
 /// the server before passing into `run_experts_cpu_batch`.
-pub fn decode_layer_batch_request_f16(
-    bytes: &[u8],
-) -> Option<(usize, Vec<f32>, Vec<u32>, Vec<f32>)> {
+pub fn decode_layer_batch_request_f16(bytes: &[u8]) -> Option<DecodedLayerBatchRequest> {
     if bytes.len() < 12 {
         return None;
     }
@@ -534,7 +535,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&1u32.to_le_bytes()); // n
         body.extend_from_slice(&2u32.to_le_bytes()); // hidden
-        // Missing the 16-byte item.
+                                                     // Missing the 16-byte item.
         assert!(decode_expert_request(&body).is_none());
     }
 

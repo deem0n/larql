@@ -291,7 +291,7 @@ mod tests {
 
         // Adjacent feature row untouched.
         let neighbour = read_gate_row_f32(&dst, 1, 1, nf, hidden);
-        let global_feat = 1 * nf + 1; // layer 1, feature 1
+        let global_feat = nf + 1; // layer 1, feature 1
         for (d, val) in neighbour.iter().enumerate() {
             let expected = (global_feat * 100 + d) as f32 * 0.01;
             assert!(
@@ -325,7 +325,7 @@ mod tests {
         // Read back as f16.
         let bytes = std::fs::read(dst.join(GATE_VECTORS_BIN)).unwrap();
         let row_bytes = hidden * BYTES_PER_F16;
-        let row_start = 1 * row_bytes; // layer 0, feature 1
+        let row_start = row_bytes; // layer 0, feature 1
         for (d, want) in new_row.iter().enumerate() {
             let cell = row_start + d * BYTES_PER_F16;
             let bits = u16::from_le_bytes(bytes[cell..cell + BYTES_PER_F16].try_into().unwrap());

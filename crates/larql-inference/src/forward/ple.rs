@@ -57,7 +57,7 @@ pub fn precompute_per_layer_inputs(
         .and_then(|key| weights.vectors.get(&key));
     let norm_offset = arch.norm_weight_offset();
 
-    let norm_eps = arch.norm_eps() as f32;
+    let norm_eps = arch.norm_eps();
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
 
     let mut per_layer_inputs = Vec::with_capacity(num_layers);

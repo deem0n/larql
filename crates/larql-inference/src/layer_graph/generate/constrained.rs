@@ -191,7 +191,6 @@ where
         }
     };
     let layers = setup.layers;
-    let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
 
@@ -212,7 +211,6 @@ where
         &x,
         hidden,
         intermediate,
-        attention,
         seq_len,
         qk_norm_val,
         softcap_val,
@@ -281,18 +279,7 @@ where
 
         let h_tok = crate::forward::embed_tokens_pub(weights, &[current_token_id]);
         let x_dec: Vec<f32> = h_tok.row(0).to_vec();
-        let result = backend.decode_token(
-            &layers,
-            &x_dec,
-            hidden,
-            intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
-        );
+        let result = backend.decode_token(&layers, &x_dec, hidden, intermediate);
 
         let h_1d = if let Some(h_out) = result {
             let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_out).unwrap();

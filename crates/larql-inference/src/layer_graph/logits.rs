@@ -244,8 +244,15 @@ mod tests {
         let index = vindex_with_lm_head(&weights, tmp.path());
         let h = ndarray::Array2::from_elem((1, weights.hidden_size), 0.1f32);
         let norm_offset = weights.arch.norm_weight_offset();
-        let result =
-            finalize_logits(&weights, &tokenizer, &h, 5, &index, &CpuBackend, norm_offset);
+        let result = finalize_logits(
+            &weights,
+            &tokenizer,
+            &h,
+            5,
+            &index,
+            &CpuBackend,
+            norm_offset,
+        );
 
         // First entry has the highest probability (top-k is sorted descending).
         let probs: Vec<f64> = result.predictions.iter().map(|(_, p)| *p).collect();

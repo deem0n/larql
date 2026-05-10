@@ -291,12 +291,8 @@ mod tests {
         let weights = make_test_weights();
         let input = x(2, weights.hidden_size);
         let (out_none, act_none) = dense_ffn_forward_backend(&weights, 0, &input, None);
-        let (out_some, act_some) = dense_ffn_forward_backend(
-            &weights,
-            0,
-            &input,
-            Some(&larql_compute::CpuBackend),
-        );
+        let (out_some, act_some) =
+            dense_ffn_forward_backend(&weights, 0, &input, Some(&larql_compute::CpuBackend));
         for (a, b) in out_none.iter().zip(out_some.iter()) {
             assert!((a - b).abs() < 1e-4, "out diverged: {a} vs {b}");
         }

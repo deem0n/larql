@@ -149,9 +149,9 @@ pub fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_test_weights;
     use crate::ffn::FfnBackend;
     use crate::forward::{forward_raw_logits, hidden_to_raw_logits, trace_forward_with_ffn};
+    use crate::test_utils::make_test_weights;
     use larql_models::ModelWeights;
     use ndarray::Array2;
     use std::sync::OnceLock;
@@ -298,9 +298,8 @@ mod tests {
         }
 
         let traced_logits = hidden_to_raw_logits(w, &traced_h);
-        for i in 0..traced_logits.len() {
+        for (i, &got) in traced_logits.iter().enumerate() {
             let expected = raw.logits[i];
-            let got = traced_logits[i];
             assert!(
                 (got - expected).abs() < 1e-3,
                 "logit {i}: trace projection {got} != raw forward {expected}"

@@ -216,7 +216,12 @@ mod tests {
         larql_models::quant::half::f16_to_f32(bits)
     }
 
-    fn synth_result(layer: usize, hidden: usize, intermediate: usize, sparse: &[((usize, usize), f32)]) -> MemitResult {
+    fn synth_result(
+        layer: usize,
+        hidden: usize,
+        intermediate: usize,
+        sparse: &[((usize, usize), f32)],
+    ) -> MemitResult {
         let mut delta = InfArray2::<f32>::zeros((hidden, intermediate));
         for &((r, c), v) in sparse {
             delta[[r, c]] = v;
@@ -295,8 +300,8 @@ mod tests {
             for r in 0..hidden {
                 for c in 0..intermediate {
                     let got = read_cell_f32(&dir, layer, r, c, hidden, intermediate);
-                    let expected =
-                        5.0 + ((layer * hidden * intermediate + r * intermediate + c) as f32) * 0.001;
+                    let expected = 5.0
+                        + ((layer * hidden * intermediate + r * intermediate + c) as f32) * 0.001;
                     assert!(
                         (got - expected).abs() < 1e-6,
                         "L{layer} ({r},{c}): expected {expected}, got {got}"
@@ -439,13 +444,12 @@ mod tests {
         assert!((v00 - expected_v00).abs() < 1e-6);
 
         // L2 (1,2) bumped by +2.0
-        let pre_v12 =
-            ((2 * hidden * intermediate + 1 * intermediate + 2) as f32) * 0.001;
+        let pre_v12 = ((2 * hidden * intermediate + intermediate + 2) as f32) * 0.001;
         let v12 = read_cell_f32(&dir, 2, 1, 2, hidden, intermediate);
         assert!((v12 - (pre_v12 + 2.0)).abs() < 1e-6);
 
         // L1 fully untouched (no result targeted it).
-        let mid_pre = ((hidden * intermediate + 0) as f32) * 0.001;
+        let mid_pre = ((hidden * intermediate) as f32) * 0.001;
         let mid_post = read_cell_f32(&dir, 1, 0, 0, hidden, intermediate);
         assert!((mid_post - mid_pre).abs() < 1e-6);
 

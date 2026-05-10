@@ -14,8 +14,8 @@
 use crate::error::LqlError;
 use crate::executor::helpers::{target_prefix, TARGET_PREFIX_CHARS};
 use crate::executor::tuning::{
-    canonical_prompt, BALANCE_ITERS, BALANCE_PROBE_TOP_K, CROSS_ITERS, DOWN_SCALE, MAX_PRIORS_CHECKED,
-    MAX_STALE, PRIOR_FLOOR, PROB_CEILING, PROB_FLOOR, UP_SCALE,
+    canonical_prompt, BALANCE_ITERS, BALANCE_PROBE_TOP_K, CROSS_ITERS, DOWN_SCALE,
+    MAX_PRIORS_CHECKED, MAX_STALE, PRIOR_FLOOR, PROB_CEILING, PROB_FLOOR, UP_SCALE,
 };
 use crate::executor::Session;
 
@@ -203,8 +203,13 @@ impl Session {
                 let (_, _, patched) = self.require_vindex()?;
                 let walk =
                     larql_inference::vindex::WalkFfn::new_unlimited_with_trace(&weights, patched);
-                let r =
-                    larql_inference::predict_with_ffn(&weights, &tokenizer, &fact_ids, BALANCE_PROBE_TOP_K, &walk);
+                let r = larql_inference::predict_with_ffn(
+                    &weights,
+                    &tokenizer,
+                    &fact_ids,
+                    BALANCE_PROBE_TOP_K,
+                    &walk,
+                );
                 let prefix = target_prefix(&fact.target, TARGET_PREFIX_CHARS);
                 let p: f64 = r
                     .predictions

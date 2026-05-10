@@ -310,7 +310,6 @@ where
     Some((id, score))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,9 +420,8 @@ mod tests {
     fn pick_next_token_masked_sampled_returns_id_and_score() {
         let f = fx();
         let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
-        let mut sampler = super::super::sampling::Sampler::new(
-            super::super::sampling::SamplingConfig::greedy(),
-        );
+        let mut sampler =
+            super::super::sampling::Sampler::new(super::super::sampling::SamplingConfig::greedy());
         let mut mask = |_generated: &[u32], _logits: &mut Vec<f32>| {
             // No-op mask
         };
@@ -445,12 +443,16 @@ mod tests {
         let mut f = fx();
         f.weights.lm_head = ndarray::Array2::<f32>::zeros((0, f.weights.hidden_size)).into_shared();
         let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.0);
-        let mut sampler = super::super::sampling::Sampler::new(
-            super::super::sampling::SamplingConfig::greedy(),
-        );
+        let mut sampler =
+            super::super::sampling::Sampler::new(super::super::sampling::SamplingConfig::greedy());
         let mut mask = |_g: &[u32], _l: &mut Vec<f32>| {};
         assert!(pick_next_token_masked_sampled(
-            &f.weights, &q, &[], &larql_compute::CpuBackend, &mut mask, &mut sampler,
+            &f.weights,
+            &q,
+            &[],
+            &larql_compute::CpuBackend,
+            &mut mask,
+            &mut sampler,
         )
         .is_none());
     }
@@ -521,9 +523,8 @@ mod tests {
     fn pick_next_token_masked_sampled_invokes_mask_fn() {
         let f = fx();
         let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
-        let mut sampler = super::super::sampling::Sampler::new(
-            super::super::sampling::SamplingConfig::greedy(),
-        );
+        let mut sampler =
+            super::super::sampling::Sampler::new(super::super::sampling::SamplingConfig::greedy());
         // Mask all but token 7 to NEG_INFINITY → greedy pick must be 7.
         let target_id = 7u32;
         let mut mask = |_g: &[u32], logits: &mut Vec<f32>| {
@@ -534,7 +535,12 @@ mod tests {
             }
         };
         let (id, _) = pick_next_token_masked_sampled(
-            &f.weights, &q, &[], &larql_compute::CpuBackend, &mut mask, &mut sampler,
+            &f.weights,
+            &q,
+            &[],
+            &larql_compute::CpuBackend,
+            &mut mask,
+            &mut sampler,
         )
         .expect("greedy pick under tight mask");
         assert_eq!(id, target_id);

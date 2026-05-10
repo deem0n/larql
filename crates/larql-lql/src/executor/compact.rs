@@ -314,7 +314,9 @@ impl Session {
             };
             if let Some(store) = self.memit_store() {
                 if let Err(e) = save_memit_store(&vindex_dir, store) {
-                    out.push(format!("  warning: failed to persist memit_store.json: {e}"));
+                    out.push(format!(
+                        "  warning: failed to persist memit_store.json: {e}"
+                    ));
                 }
             }
 

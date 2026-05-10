@@ -230,12 +230,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn balance_band_is_inclusive_and_ordered() {
         assert!(PROB_FLOOR < PROB_CEILING, "floor must be below ceiling");
         assert!(PROB_FLOOR > 0.0 && PROB_CEILING < 1.0);
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn rebalance_band_default_is_inside_per_insert_band() {
         // Rebalance dampens around the same target band as per-INSERT
         // balance; defaults should land within one step of each other.
@@ -243,15 +245,16 @@ mod tests {
         // feed `predict_with_ffn` which returns probabilities as f64).
         let rb_floor = REBALANCE_FLOOR_DEFAULT as f64;
         let rb_ceiling = REBALANCE_CEILING_DEFAULT as f64;
-        assert!(rb_floor >= PROB_FLOOR - 0.05 && rb_floor <= PROB_FLOOR + 0.05);
+        assert!((PROB_FLOOR - 0.05..=PROB_FLOOR + 0.05).contains(&rb_floor));
         assert!(rb_ceiling <= PROB_CEILING);
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn down_and_up_scale_are_complementary() {
         // Per-INSERT scales should round-trip approximately:
         // applying DOWN then UP should land near 1× rather than overshooting.
         let round_trip = DOWN_SCALE * UP_SCALE;
-        assert!(round_trip >= 1.0 && round_trip <= 1.5);
+        assert!((1.0..=1.5).contains(&round_trip));
     }
 }

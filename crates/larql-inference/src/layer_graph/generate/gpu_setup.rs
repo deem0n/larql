@@ -1,17 +1,60 @@
 //! Shared setup for GPU/vindex-backed generation paths.
 
 use super::types::GenerateError;
-use crate::layer_graph::pipeline_layer::{
-    attention_geometry_for_arch_layer, kv_cache_shapes_for_arch, AttentionGeometry,
-    DEFAULT_GPU_KV_CACHE_MAX_SEQ,
-};
+use crate::layer_graph::pipeline_layer::{kv_cache_shapes_for_arch, DEFAULT_GPU_KV_CACHE_MAX_SEQ};
 use crate::model::ModelWeights;
+use larql_compute::backend::Capability;
 use larql_compute::{prelude::*, FullPipelineLayer};
 use std::ops::Range;
 
+/// True when the model has at least two layers and any per-layer
+/// attention parameter differs from layer 0. Catches Gemma 4 31B's
+/// sliding/global geometry alternation, the canonical heterogeneous
+/// case (50 sliding-attention layers at head_dim=256/16-kv plus 10
+/// global-attention layers at head_dim=512/4-kv).
+pub(crate) fn has_heterogeneous_attention(weights: &ModelWeights) -> bool {
+    let arch = &*weights.arch;
+    let n = weights.num_layers;
+    if n < 2 {
+        return false;
+    }
+    let l0_head = arch.head_dim_for_layer(0);
+    let l0_kv = arch.num_kv_heads_for_layer(0);
+    let l0_q = arch.num_q_heads_for_layer(0);
+    let l0_rope = arch.rope_base_for_layer(0);
+    let l0_rotary = arch.rotary_fraction_for_layer(0);
+    let l0_sliding = arch.is_sliding_window_layer(0);
+    (1..n).any(|l| {
+        arch.head_dim_for_layer(l) != l0_head
+            || arch.num_kv_heads_for_layer(l) != l0_kv
+            || arch.num_q_heads_for_layer(l) != l0_q
+            || arch.rope_base_for_layer(l) != l0_rope
+            || arch.rotary_fraction_for_layer(l) != l0_rotary
+            || arch.is_sliding_window_layer(l) != l0_sliding
+    })
+}
+
+/// Reject heterogeneous models on backends that haven't opted in via
+/// `Capability::HeterogeneousAttention`. The error fires *before* the
+/// first decode dispatch so the caller sees a precise unsupported-backend
+/// message rather than corrupted KV state at the first non-uniform layer.
+pub(crate) fn ensure_attention_supported(
+    weights: &ModelWeights,
+    backend: &dyn ComputeBackend,
+) -> Result<(), GenerateError> {
+    if has_heterogeneous_attention(weights) && !backend.supports(Capability::HeterogeneousAttention)
+    {
+        return Err(GenerateError::unsupported_backend(format!(
+            "{} model has heterogeneous attention geometry but the active backend ({}) does not advertise Capability::HeterogeneousAttention",
+            weights.arch.family(),
+            backend.name(),
+        )));
+    }
+    Ok(())
+}
+
 pub(super) struct GpuDecodeSetup<'a> {
     pub layers: Vec<FullPipelineLayer<'a>>,
-    pub attention: AttentionGeometry,
     pub hidden: usize,
     pub intermediate: usize,
 }
@@ -38,6 +81,7 @@ pub(super) fn build_gpu_decode_setup<'a>(
             if constrained { "constrained " } else { "" }
         )));
     }
+    ensure_attention_supported(weights, backend)?;
 
     let first_layer = layer_range.start;
     let intermediate = gate_index.num_features(first_layer);
@@ -68,11 +112,9 @@ pub(super) fn build_gpu_decode_setup<'a>(
         q4_ffn_per_matrix,
         ffn_format,
     );
-    let attention = attention_geometry_for_arch_layer(weights, first_layer);
 
     Ok(GpuDecodeSetup {
         layers,
-        attention,
         hidden,
         intermediate,
     })
@@ -101,27 +143,12 @@ pub(super) fn prefill_q4_prompt(
     x: &[f32],
     hidden: usize,
     intermediate: usize,
-    attention: AttentionGeometry,
     seq_len: usize,
     qk_norm: bool,
     softcap: f32,
     failure_reason: &'static str,
 ) -> Result<Vec<f32>, GenerateError> {
     backend
-        .prefill_q4(
-            layers,
-            x,
-            hidden,
-            intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            seq_len,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
-            qk_norm,
-            softcap,
-        )
+        .prefill_q4(layers, x, hidden, intermediate, seq_len, qk_norm, softcap)
         .ok_or_else(|| GenerateError::prefill_failed(failure_reason))
 }

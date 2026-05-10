@@ -79,15 +79,6 @@ pub fn predict_honest(
                     ffn_format,
                 );
 
-                let attention = layers
-                    .first()
-                    .map(crate::layer_graph::pipeline_layer::attention_geometry_for_pipeline_layer)
-                    .unwrap_or_else(|| {
-                        crate::layer_graph::pipeline_layer::attention_geometry_for_arch_layer(
-                            weights,
-                            layer_range.start,
-                        )
-                    });
                 let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
                 let qk_norm = arch.attn_q_norm_key(layer_range.start).is_some();
 
@@ -95,18 +86,7 @@ pub fn predict_honest(
                     // Decode path (seq=1): try KV-cached decode first, then full_pipeline
                     let x: Vec<f32> = h.row(0).to_vec();
 
-                    if let Some(result) = backend.decode_token(
-                        &layers,
-                        &x,
-                        hidden,
-                        intermediate,
-                        attention.q_dim,
-                        attention.kv_dim,
-                        attention.num_q_heads,
-                        attention.num_kv_heads,
-                        attention.head_dim,
-                        attention.rope_base,
-                    ) {
+                    if let Some(result) = backend.decode_token(&layers, &x, hidden, intermediate) {
                         let mut row = h.row_mut(0);
                         for j in 0..hidden {
                             row[j] = result[j];
@@ -127,13 +107,7 @@ pub fn predict_honest(
                         &x,
                         hidden,
                         intermediate,
-                        attention.q_dim,
-                        attention.kv_dim,
                         1,
-                        attention.num_q_heads,
-                        attention.num_kv_heads,
-                        attention.head_dim,
-                        attention.rope_base,
                         qk_norm,
                         softcap,
                     ) {
@@ -156,13 +130,7 @@ pub fn predict_honest(
                         &x,
                         hidden,
                         intermediate,
-                        attention.q_dim,
-                        attention.kv_dim,
                         seq_len,
-                        attention.num_q_heads,
-                        attention.num_kv_heads,
-                        attention.head_dim,
-                        attention.rope_base,
                         qk_norm,
                         softcap,
                     ) {

@@ -414,8 +414,8 @@ impl<'a> FfnBackend for WalkFfn<'a> {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use crate::test_utils::make_test_weights;
     use crate::model::ModelWeights;
+    use crate::test_utils::make_test_weights;
     use larql_vindex::{
         FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,
     };
@@ -478,16 +478,16 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_new_unlimited() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         assert_eq!(ffn.name(), "walk");
     }
 
     #[test]
     fn walk_ffn_sparse_k() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new(&weights, &idx, 4);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new(weights, &idx, 4);
         assert_eq!(ffn.name(), "walk");
     }
 
@@ -496,8 +496,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_forward_shape_single_token() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
@@ -506,8 +506,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_forward_shape_multi_token() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         let x = input(3, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[3, weights.hidden_size]);
@@ -517,8 +517,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_forward_all_layers() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         let x = input(1, weights.hidden_size);
         for layer in 0..weights.num_layers {
             let out = ffn.forward(layer, &x);
@@ -537,9 +537,9 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_sparse_vs_dense_same_shape() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn_sparse = WalkFfn::new(&weights, &idx, 4);
-        let ffn_dense = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn_sparse = WalkFfn::new(weights, &idx, 4);
+        let ffn_dense = WalkFfn::new_unlimited(weights, &idx);
         let x = input(1, weights.hidden_size);
         let out_s = ffn_sparse.forward(0, &x);
         let out_d = ffn_dense.forward(0, &x);
@@ -549,8 +549,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_with_activation_returns_activation() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         let x = input(2, weights.hidden_size);
         let (out, act) = ffn.forward_with_activation(0, &x);
         assert_eq!(out.shape(), &[2, weights.hidden_size]);
@@ -562,7 +562,7 @@ mod dispatch_tests {
         // When MockGateIndex returns 0 features, WalkFfn should fall back to WeightFfn.
         let weights = shared_weights();
         let zero_idx = MockGateIndex { n_features: 0 };
-        let ffn = WalkFfn::new_unlimited(&weights, &zero_idx);
+        let ffn = WalkFfn::new_unlimited(weights, &zero_idx);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
@@ -572,8 +572,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_with_backend() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited_with_backend(&weights, &idx, &larql_compute::CpuBackend);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited_with_backend(weights, &idx, &larql_compute::CpuBackend);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
@@ -584,8 +584,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_take_residuals_returns_per_layer_traces() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx).with_trace();
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx).with_trace();
         let x = input(2, weights.hidden_size);
         // Run forward for every layer so trace_residuals populates.
         for layer in 0..weights.num_layers {
@@ -605,8 +605,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_with_trace_emits_residuals() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_with_trace(&weights, &idx, 4);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_with_trace(weights, &idx, 4);
         let x = input(1, weights.hidden_size);
         ffn.forward(0, &x);
         let residuals = ffn.take_residuals();
@@ -617,8 +617,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_new_unlimited_with_trace_records() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited_with_trace(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited_with_trace(weights, &idx);
         let x = input(1, weights.hidden_size);
         ffn.forward(0, &x);
         assert_eq!(ffn.take_residuals().len(), 1);
@@ -627,8 +627,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_take_trace_pairs_residuals_with_walk_hits() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited_with_trace(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited_with_trace(weights, &idx);
         let x = input(1, weights.hidden_size);
         ffn.forward(0, &x);
         let trace = ffn.take_trace();
@@ -641,8 +641,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_new_with_backend_attaches_backend() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_with_backend(&weights, &idx, 4, &larql_compute::CpuBackend);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_with_backend(weights, &idx, 4, &larql_compute::CpuBackend);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
@@ -651,9 +651,8 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_with_l1_cache_records_misses_then_hits() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn =
-            WalkFfn::new_unlimited(&weights, &idx).with_l1_cache(weights.num_layers);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx).with_l1_cache(weights.num_layers);
         let x = input(1, weights.hidden_size);
         // L1 cache stats: first call is a miss, second identical call a hit.
         ffn.forward(0, &x);
@@ -668,16 +667,16 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_l1_cache_stats_returns_none_when_disabled() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         assert!(ffn.l1_cache_stats().is_none());
     }
 
     #[test]
     fn walk_ffn_with_dispatch_trace_records_per_layer_path() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx).with_dispatch_trace();
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx).with_dispatch_trace();
         let x = input(1, weights.hidden_size);
         for layer in 0..weights.num_layers {
             ffn.forward(layer, &x);
@@ -695,17 +694,17 @@ mod dispatch_tests {
     #[test]
     fn walk_ffn_take_dispatch_trace_returns_empty_when_disabled() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
-        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let idx = mock_index(weights);
+        let ffn = WalkFfn::new_unlimited(weights, &idx);
         assert!(ffn.take_dispatch_trace().is_empty());
     }
 
     #[test]
     fn walk_ffn_from_config_uses_supplied_walkffnconfig() {
         let weights = shared_weights();
-        let idx = mock_index(&weights);
+        let idx = mock_index(weights);
         let cfg = crate::vindex::WalkFfnConfig::sparse(weights.num_layers, 2);
-        let ffn = WalkFfn::from_config(&weights, &idx, cfg);
+        let ffn = WalkFfn::from_config(weights, &idx, cfg);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);

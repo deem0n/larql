@@ -12,6 +12,11 @@ use super::stream::{InflightMoe, ShardStream};
 use super::wire::{ExpertCallItem, ExpertResultItem};
 use larql_compute::cpu::ops::moe::quantize_x_to_q8k;
 
+/// Per-shard call list element: (position, expert_id, residual).
+type ShardCallItem = (usize, usize, Vec<f32>);
+/// Output of `forward_layer_moe`: (output rows, optional per-expert (logit, weight)).
+type LayerMoeResult = (Vec<f32>, Vec<(f32, f32)>);
+
 // ── RemoteMoeBackend ───────────────────────────────────────────────────────
 
 /// Remote MoE expert backend. Thread-safe — all methods take `&self`.
@@ -219,12 +224,12 @@ impl RemoteMoeBackend {
         //    can reconstruct the output ordering.
         //    shard_items[si] = Vec<(pos, expert_id, residual)>
         let shards = self.shards.read().unwrap();
-        let mut shard_items: Vec<Vec<(usize, usize, Vec<f32>)>> =
+        let mut shard_items: Vec<Vec<ShardCallItem>> =
             (0..shards.len()).map(|_| Vec::new()).collect();
 
-        for pos in 0..seq_len {
+        for (pos, route) in routing.iter().enumerate().take(seq_len) {
             let row: Vec<f32> = h.row(pos).to_vec();
-            for &expert_id in &routing[pos].0 {
+            for &expert_id in &route.0 {
                 let si = shards
                     .iter()
                     .position(|s| s.owns_unit(layer, expert_id))
@@ -234,7 +239,7 @@ impl RemoteMoeBackend {
         }
 
         // 3. One batch call per shard that has work (parallel).
-        let non_empty: Vec<(usize, &Vec<(usize, usize, Vec<f32>)>)> = shard_items
+        let non_empty: Vec<(usize, &Vec<ShardCallItem>)> = shard_items
             .iter()
             .enumerate()
             .filter(|(_, items)| !items.is_empty())
@@ -523,7 +528,7 @@ impl RemoteMoeBackend {
         &self,
         streams: &[ShardStream],
         inflight: InflightMoe,
-    ) -> Result<(Vec<f32>, Vec<(f32, f32)>), RemoteMoeError> {
+    ) -> Result<LayerMoeResult, RemoteMoeError> {
         let InflightMoe {
             layer,
             hidden,
@@ -779,19 +784,15 @@ impl RemoteMoeBackend {
                 let t_dispatch = t0.elapsed().as_secs_f64() * 1000.0;
                 let mut h2_per_layer: Vec<Vec<f32>> = vec![vec![0.0f32; hidden]; num_layers];
                 for (_, result) in shard_results {
-                    match result {
-                        Ok(results) => {
-                            for r in results {
-                                if r.h2.len() == hidden {
-                                    for (acc, &v) in
-                                        h2_per_layer[r.layer].iter_mut().zip(r.h2.iter())
-                                    {
-                                        *acc += v;
-                                    }
+                    // Err: partial deployment — contribute zeros.
+                    if let Ok(results) = result {
+                        for r in results {
+                            if r.h2.len() == hidden {
+                                for (acc, &v) in h2_per_layer[r.layer].iter_mut().zip(r.h2.iter()) {
+                                    *acc += v;
                                 }
                             }
                         }
-                        Err(_) => {} // partial deployment — contribute zeros
                     }
                 }
                 let t_accum = t0.elapsed().as_secs_f64() * 1000.0;

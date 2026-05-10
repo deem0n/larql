@@ -338,12 +338,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {
         return None;
     }
-    for i in 0..=buf.len() - 4 {
-        if &buf[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    None
+    (0..=buf.len() - 4).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
 }
 
 fn parse_content_length(headers: &[u8]) -> Result<usize, RemoteMoeError> {

@@ -818,14 +818,8 @@ mod tests {
     fn optimise_target_delta_rejects_mid_layer() {
         let weights = make_test_weights();
         // num_layers=2 in test fixture, so install_layer=0 is mid-layer.
-        let err = optimise_target_delta(
-            &weights,
-            &[0u32],
-            0,
-            0,
-            TargetDeltaOpts::default(),
-        )
-        .expect_err("mid-layer install must error");
+        let err = optimise_target_delta(&weights, &[0u32], 0, 0, TargetDeltaOpts::default())
+            .expect_err("mid-layer install must error");
         assert!(
             err.contains("only install_layer = n_layers-1"),
             "expected mid-layer rejection, got: {err}"

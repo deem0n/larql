@@ -126,7 +126,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn default_limits_are_positive() {
+        // Pinned: const-evaluated guards against accidentally setting
+        // a default limit to zero, which would silently truncate the
+        // query result. The runtime assert is the regression test.
         assert!(EDGES_DEFAULT_LIMIT > 0);
         assert!(NEAREST_DEFAULT_LIMIT > 0);
         assert!(ENTITIES_DEFAULT_LIMIT > 0);
@@ -135,6 +139,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn score_eq_tolerance_in_reasonable_range() {
         assert!(SCORE_EQ_TOLERANCE > 0.0 && SCORE_EQ_TOLERANCE < 0.1);
     }

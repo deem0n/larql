@@ -523,8 +523,8 @@ mod tests {
     #[test]
     #[ignore = "requires LARQL_VINDEX_PATH pointing to a non-Q4K vindex with model weights"]
     fn run_memit_single_fact_produces_delta() {
-        let vpath = std::env::var(crate::vindex::ENV_VINDEX_PATH)
-            .expect("LARQL_VINDEX_PATH not set");
+        let vpath =
+            std::env::var(crate::vindex::ENV_VINDEX_PATH).expect("LARQL_VINDEX_PATH not set");
         let path = std::path::Path::new(&vpath);
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let weights = larql_vindex::load_model_weights(path, &mut cb).expect("weights load failed");

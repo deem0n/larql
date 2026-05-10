@@ -101,7 +101,10 @@ impl Session {
             target_id = target_encoding.get_ids().first().copied().unwrap_or(0);
 
             residual_key = crate::executor::helpers::entity_query_vec(
-                &tokenizer, &embed, embed_scale, entity,
+                &tokenizer,
+                &embed,
+                embed_scale,
+                entity,
             )?
             .map(|a| a.to_vec())
             .unwrap_or_else(|| vec![0.0f32; hidden]);

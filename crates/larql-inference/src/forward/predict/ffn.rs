@@ -162,7 +162,6 @@ pub fn predict_with_strategy(
     logits_to_predictions(weights, &h, tokenizer, top_k, 1.0)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +171,9 @@ mod tests {
     #[test]
     fn predict_with_ffn_attention_returns_attention_and_residuals() {
         let fx = TestFixtures::build();
-        let ffn = WeightFfn { weights: &fx.weights };
+        let ffn = WeightFfn {
+            weights: &fx.weights,
+        };
         let result = predict_with_ffn_attention(&fx.weights, &fx.tokenizer, &[0u32, 1], 3, &ffn);
         assert!(result.predictions.len() <= 3);
         assert_eq!(result.residuals.len(), fx.weights.num_layers);
@@ -186,7 +187,9 @@ mod tests {
     #[test]
     fn predict_with_router_routes_per_layer() {
         let fx = TestFixtures::build();
-        let ffn = WeightFfn { weights: &fx.weights };
+        let ffn = WeightFfn {
+            weights: &fx.weights,
+        };
         let router = LayerFfnRouter::uniform(&ffn, fx.weights.num_layers);
         let result = predict_with_router(&fx.weights, &fx.tokenizer, &[0u32, 1], 3, &router);
         assert!(result.predictions.len() <= 3);
@@ -195,7 +198,9 @@ mod tests {
     #[test]
     fn predict_with_strategy_compute_mode_runs_layer_normally() {
         let fx = TestFixtures::build();
-        let ffn = WeightFfn { weights: &fx.weights };
+        let ffn = WeightFfn {
+            weights: &fx.weights,
+        };
         // Every layer = compute mode (same as predict_with_ffn).
         let strategy: Vec<LayerMode> = (0..fx.weights.num_layers)
             .map(|_| LayerMode::Compute(&ffn as &dyn FfnBackend))
@@ -207,7 +212,9 @@ mod tests {
     #[test]
     fn predict_with_strategy_scalar_gain_skips_compute() {
         let fx = TestFixtures::build();
-        let ffn = WeightFfn { weights: &fx.weights };
+        let ffn = WeightFfn {
+            weights: &fx.weights,
+        };
         // First layer = compute, rest = scalar gain (skip layers via *=).
         let mut strategy: Vec<LayerMode> = vec![LayerMode::Compute(&ffn as &dyn FfnBackend)];
         for _ in 1..fx.weights.num_layers {
@@ -220,7 +227,9 @@ mod tests {
     #[test]
     fn predict_with_strategy_attention_only_skips_ffn() {
         let fx = TestFixtures::build();
-        let ffn = WeightFfn { weights: &fx.weights };
+        let ffn = WeightFfn {
+            weights: &fx.weights,
+        };
         // Mix of compute and attention-only layers.
         let mut strategy: Vec<LayerMode> = Vec::with_capacity(fx.weights.num_layers);
         for layer in 0..fx.weights.num_layers {

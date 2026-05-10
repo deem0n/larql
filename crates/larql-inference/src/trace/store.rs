@@ -570,7 +570,7 @@ mod tests {
         let path = std::env::temp_dir().join("larql_trace_test_bad_magic.trac");
         let mut bytes = [0u8; 64];
         bytes[0..4].copy_from_slice(b"XXXX");
-        std::fs::write(&path, &bytes).expect("write");
+        std::fs::write(&path, bytes).expect("write");
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "bad magic should return error");
         let _ = std::fs::remove_file(&path);
@@ -600,7 +600,7 @@ mod tests {
     fn open_file_smaller_than_header_returns_error() {
         // mmap.len() < HEADER_SIZE — early return before parsing magic.
         let path = std::env::temp_dir().join("larql_trace_test_too_small.trac");
-        std::fs::write(&path, &[0u8; 16]).expect("write tiny file");
+        std::fs::write(&path, [0u8; 16]).expect("write tiny file");
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "file smaller than header must error");
         let _ = std::fs::remove_file(&path);
@@ -620,7 +620,7 @@ mod tests {
             n_tokens: 0,
             _reserved: [0; 44],
         };
-        std::fs::write(&path, &header.to_bytes()).expect("write");
+        std::fs::write(&path, header.to_bytes()).expect("write");
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "unsupported version must error");
         let err = match result {
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn writer_open_rejects_bad_magic() {
         let path = std::env::temp_dir().join("larql_trace_test_writer_open_bad_magic.trac");
-        std::fs::write(&path, &[0u8; HEADER_SIZE]).expect("write");
+        std::fs::write(&path, [0u8; HEADER_SIZE]).expect("write");
         let result = TraceWriter::open(&path);
         assert!(result.is_err(), "bad magic must error on writer open");
         let _ = std::fs::remove_file(&path);
@@ -743,7 +743,7 @@ mod tests {
             n_tokens: 0,
             _reserved: [0; 44],
         };
-        std::fs::write(&path, &header.to_bytes()).expect("write");
+        std::fs::write(&path, header.to_bytes()).expect("write");
         let result = TraceWriter::open(&path);
         assert!(result.is_err(), "writer open must reject unknown version");
         let _ = std::fs::remove_file(&path);

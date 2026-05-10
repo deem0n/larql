@@ -1,0 +1,12 @@
+{
+  "policy_note": "Default policy is 90% line coverage per source file. Per-file entries below are debt baselines — they exist for historical reasons, must only ratchet *upward*, and should disappear over time as files reach the 90% default. New files (not listed) must hit 90% on first commit. Total floor is the workspace baseline at 2026-04-26 (74.2% line) until a fresh measurement supersedes it.",
+  "include_globs": [
+    "crates/larql-server/src/**/*.rs"
+  ],
+  "exclude_globs": [
+    "crates/larql-server/src/main.rs"
+  ],
+  "default_line_min_percent": 90.0,
+  "total_line_min_percent": 74.0,
+  "per_file_line_min_percent": {}
+}

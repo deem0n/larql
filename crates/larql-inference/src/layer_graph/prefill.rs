@@ -55,8 +55,8 @@ pub(super) fn prefill_kv_cache_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{make_test_vindex, make_test_weights};
     use crate::forward::hidden_to_raw_logits;
+    use crate::test_utils::{make_test_vindex, make_test_weights};
     use larql_compute::CpuBackend;
     use larql_models::ModelWeights;
     use std::sync::OnceLock;

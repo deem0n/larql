@@ -7,6 +7,14 @@
 //! All methods default to `None` / no-op; only the GPU backend
 //! implements them today (CPU runs decode through the higher-level
 //! `larql-inference` path, not through `ComputeBackend`).
+//!
+//! All attention geometry (head_dim, num_q_heads, num_kv_heads,
+//! rope_base, sliding_window, etc.) is read per-layer from
+//! `FullPipelineLayer`. The trait surface intentionally does **not**
+//! take scalar geometry parameters — passing them would invite a
+//! single-layer fallback to silently corrupt heterogeneous models
+//! like Gemma 4 31B (50 sliding-attention layers + 10 global-attention
+//! layers, with different head_dim and num_kv_heads on each class).
 
 /// KV-cached generation primitives.
 ///
@@ -24,13 +32,7 @@ pub trait DecodeBackend {
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
         _seq_len: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         _use_qk_norm: bool,
         _softcap: f32,
     ) -> Option<Vec<f32>> {
@@ -51,13 +53,7 @@ pub trait DecodeBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
         target_layer: usize,
@@ -67,21 +63,7 @@ pub trait DecodeBackend {
         // Default: fall back to full pipeline without intervention.
         // Metal backend overrides this with the intervention-aware path.
         let _ = (target_layer, target_head, replacement_delta);
-        self.full_pipeline_q4(
-            layers,
-            x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            seq_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            rope_base,
-            use_qk_norm,
-            softcap,
-        )
+        self.full_pipeline_q4(layers, x, hidden, inter, seq_len, use_qk_norm, softcap)
     }
 
     /// Multi-layer Q4 FFN in one submission: gate → up → GEGLU → down.
@@ -101,6 +83,11 @@ pub trait DecodeBackend {
     }
 
     /// Populate KV cache with prefill K/V data for one layer.
+    ///
+    /// `(num_kv_heads, head_dim)` here are this specific layer's
+    /// geometry — not vestigial scalars. The caller must pass per-layer
+    /// values (e.g. via `arch.num_kv_heads_for_layer(layer)`); a
+    /// uniform-from-layer-0 fallback would corrupt heterogeneous models.
     fn populate_kv_layer(
         &self,
         _layer: usize,
@@ -135,19 +122,12 @@ pub trait DecodeBackend {
     fn preallocate_kv_cache_per_layer(&self, _shapes: &[(usize, usize)], _max_seq: usize) {}
 
     /// Decode one token through all layers with KV cache.
-    #[allow(clippy::too_many_arguments)]
     fn decode_token(
         &self,
         _layers: &[crate::FullPipelineLayer<'_>],
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -155,51 +135,26 @@ pub trait DecodeBackend {
     /// Like `decode_token` but calls `moe_fn(layer, h_post_attn)` for
     /// MoE layers (enables remote expert dispatch). Default delegates
     /// to `decode_token` and ignores the hook.
-    #[allow(clippy::too_many_arguments)]
     fn decode_token_with_moe(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         _moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
-        self.decode_token(
-            layers,
-            x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            rope_base,
-        )
+        self.decode_token(layers, x, hidden, inter)
     }
 
     /// Decode one token while dispatching Q4_K per-layer expert tensors on
     /// the backend. The expert callback returns borrowed `(gate_up, down)`
     /// byte slices for the requested `(layer, expert)` pair.
-    #[allow(clippy::too_many_arguments)]
     fn decode_token_q4k_moe<'w>(
         &self,
         _layers: &[crate::FullPipelineLayer<'_>],
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         _norm_eps: f32,
         _get_expert: &dyn Fn(usize, usize) -> Option<(&'w [u8], &'w [u8])>,
     ) -> Option<Vec<f32>> {
@@ -216,19 +171,12 @@ pub trait DecodeBackend {
     /// Default impl combines the two callbacks into a single synchronous
     /// closure and forwards to `decode_token_with_moe` — backends that don't
     /// support encoder splitting see no behaviour change.
-    #[allow(clippy::too_many_arguments)]
     fn decode_token_with_moe_split(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         moe_fire_fn: &mut dyn FnMut(usize, &[f32]),
         moe_collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
@@ -237,56 +185,21 @@ pub trait DecodeBackend {
             moe_fire_fn(layer, h);
             moe_collect_fn(layer)
         };
-        self.decode_token_with_moe(
-            layers,
-            x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            rope_base,
-            &mut combined,
-        )
+        self.decode_token_with_moe(layers, x, hidden, inter, &mut combined)
     }
 
     /// Like `decode_token` but splits each layer into attn / gate+up /
     /// down command buffers and times each. Returns `(result, attn_ms,
     /// gate_up_ms, down_ms)`. Default delegates to `decode_token` with
     /// zero timings.
-    #[allow(clippy::too_many_arguments)]
     fn decode_token_split_profile(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
     ) -> (Option<Vec<f32>>, f64, f64, f64) {
-        (
-            self.decode_token(
-                layers,
-                x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                rope_base,
-            ),
-            0.0,
-            0.0,
-            0.0,
-        )
+        (self.decode_token(layers, x, hidden, inter), 0.0, 0.0, 0.0)
     }
 
     /// Multi-position prefill with KV-cache population. Stores
@@ -299,13 +212,7 @@ pub trait DecodeBackend {
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
         _seq_len: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         _use_qk_norm: bool,
         _softcap: f32,
     ) -> Option<Vec<f32>> {
@@ -325,13 +232,7 @@ pub trait DecodeBackend {
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
         _seq_len: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         _use_qk_norm: bool,
         _softcap: f32,
         _target_layer: usize,
@@ -353,13 +254,7 @@ pub trait DecodeBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
         target_layer: usize,
@@ -367,20 +262,6 @@ pub trait DecodeBackend {
         replacement_delta: &[f32],
     ) -> Option<Vec<f32>> {
         let _ = (target_layer, target_head, replacement_delta);
-        self.prefill_q4(
-            layers,
-            x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            seq_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            rope_base,
-            use_qk_norm,
-            softcap,
-        )
+        self.prefill_q4(layers, x, hidden, inter, seq_len, use_qk_norm, softcap)
     }
 }

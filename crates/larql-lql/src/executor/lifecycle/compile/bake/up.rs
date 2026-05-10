@@ -140,8 +140,8 @@ fn parse_manifest_for_up(
 ) -> Result<HashMap<usize, (String, u64, u64)>, LqlError> {
     let text = std::fs::read_to_string(manifest_path)
         .map_err(|e| LqlError::exec("read weight_manifest.json", e))?;
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&text)
-        .map_err(|e| LqlError::exec("parse weight_manifest.json", e))?;
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&text).map_err(|e| LqlError::exec("parse weight_manifest.json", e))?;
 
     let mut out: HashMap<usize, (String, u64, u64)> = HashMap::new();
     for entry in &entries {
@@ -255,7 +255,11 @@ mod tests {
         ))
     }
 
-    fn mini_config(num_layers: usize, hidden: usize, intermediate: usize) -> larql_vindex::VindexConfig {
+    fn mini_config(
+        num_layers: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> larql_vindex::VindexConfig {
         larql_vindex::VindexConfig {
             version: 1,
             model: "test".into(),
@@ -402,7 +406,8 @@ mod tests {
         let num_layers = 3;
         let hidden = 4;
         let intermediate = 4;
-        let entries = write_synthetic_up_weights_bin(&src, num_layers, hidden, intermediate, BYTES_PER_F32);
+        let entries =
+            write_synthetic_up_weights_bin(&src, num_layers, hidden, intermediate, BYTES_PER_F32);
         write_manifest(&src, "up_weights.bin", &entries);
 
         let cfg = mini_config(num_layers, hidden, intermediate);
@@ -440,7 +445,8 @@ mod tests {
         let num_layers = 2;
         let hidden = 4;
         let intermediate = 4;
-        let entries = write_synthetic_up_weights_bin(&src, num_layers, hidden, intermediate, BYTES_PER_F16);
+        let entries =
+            write_synthetic_up_weights_bin(&src, num_layers, hidden, intermediate, BYTES_PER_F16);
         write_manifest(&src, "up_weights.bin", &entries);
 
         let cfg = mini_config(num_layers, hidden, intermediate);
@@ -453,7 +459,8 @@ mod tests {
         // Read back as f16.
         let bytes = std::fs::read(dst.join("up_weights.bin")).unwrap();
         let row_bytes = hidden * BYTES_PER_F16;
-        let row_start = 0 * intermediate * row_bytes + 1 * row_bytes;
+        // Layer 0, feature 1 → byte offset = (0 * intermediate + 1) * row_bytes.
+        let row_start = row_bytes;
         for (d, want) in new_row.iter().enumerate() {
             let cell = row_start + d * BYTES_PER_F16;
             let bits = u16::from_le_bytes(bytes[cell..cell + BYTES_PER_F16].try_into().unwrap());
@@ -541,11 +548,7 @@ mod tests {
 
         let cfg = mini_config(1, 4, 4);
         // Length matches neither f32 (64) nor f16 (32) for one 16-element tensor.
-        let entries = vec![(
-            "model.layers.0.mlp.up_proj.weight".to_string(),
-            0u64,
-            50u64,
-        )];
+        let entries = vec![("model.layers.0.mlp.up_proj.weight".to_string(), 0u64, 50u64)];
         std::fs::write(src.join("up_weights.bin"), vec![0u8; 50]).unwrap();
         write_manifest(&src, "up_weights.bin", &entries);
 

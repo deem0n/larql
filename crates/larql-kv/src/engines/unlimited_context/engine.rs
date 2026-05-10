@@ -443,9 +443,6 @@ pub(crate) fn q4k_prefill_metal(
     let h_embed = larql_inference::forward::embed_tokens_pub(weights, token_ids);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
 
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope = arch.rope_base_for_layer(0) as f32;
     let seq_len = token_ids.len();
     let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm = arch.attn_q_norm_key(0).is_some();
@@ -458,21 +455,7 @@ pub(crate) fn q4k_prefill_metal(
         backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
 
-    let h_vec = backend.prefill_q4(
-        &layers,
-        &x,
-        hidden,
-        intermediate,
-        q_dim,
-        kv_dim,
-        seq_len,
-        weights.num_q_heads,
-        weights.num_kv_heads,
-        weights.head_dim,
-        rope,
-        qk_norm,
-        softcap,
-    )?;
+    let h_vec = backend.prefill_q4(&layers, &x, hidden, intermediate, seq_len, qk_norm, softcap)?;
 
     // Return pre-final_norm hidden state — the caller (hidden_to_raw_logits) applies it.
     let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
@@ -499,7 +482,6 @@ pub(crate) fn q4k_decode_token(
         return None;
     };
 
-    let arch = &*weights.arch;
     let hidden = weights.hidden_size;
     let num_layers = weights.num_layers;
     let intermediate = gate_index.num_features(0);
@@ -523,22 +505,7 @@ pub(crate) fn q4k_decode_token(
     let h_tok = larql_inference::forward::embed_tokens_pub(weights, &[token_id]);
     let x_dec: Vec<f32> = h_tok.row(0).to_vec();
 
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope = arch.rope_base_for_layer(0) as f32;
-
-    let h_vec = backend.decode_token(
-        &layers,
-        &x_dec,
-        hidden,
-        intermediate,
-        q_dim,
-        kv_dim,
-        weights.num_q_heads,
-        weights.num_kv_heads,
-        weights.head_dim,
-        rope,
-    )?;
+    let h_vec = backend.decode_token(&layers, &x_dec, hidden, intermediate)?;
 
     // Return pre-final_norm hidden state — the caller (hidden_to_raw_logits) applies it.
     Array2::from_shape_vec((1, hidden), h_vec).ok()

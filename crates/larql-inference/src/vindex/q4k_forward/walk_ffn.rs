@@ -128,7 +128,7 @@ pub fn q4k_ffn_forward_layer_q8k(
     // Guard: intermediate must be Q8K-block-aligned (multiple of the
     // Q4_K/Q8_K super-block size).
     // For non-aligned sizes (rare, non-production) fall back to OnceLock cache.
-    if intermediate % crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS == 0 {
+    if intermediate.is_multiple_of(crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS) {
         let activation_flat = activation.as_slice().expect("activation contiguous");
         let act_q8k = quantize_x_to_q8k(activation_flat);
         let mut out = vec![0.0f32; hidden];

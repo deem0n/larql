@@ -77,7 +77,8 @@ pub(in crate::executor::lifecycle::compile) fn patch_down_weights(
                     buf[cell..cell + BYTES_PER_F32].copy_from_slice(&val.to_le_bytes());
                 } else {
                     let half_bits: u16 = larql_models::quant::half::f32_to_f16(*val);
-                    buf[cell..cell + super::BYTES_PER_F16].copy_from_slice(&half_bits.to_le_bytes());
+                    buf[cell..cell + super::BYTES_PER_F16]
+                        .copy_from_slice(&half_bits.to_le_bytes());
                 }
             }
         }
@@ -189,10 +190,12 @@ mod tests {
         let layer_elems = hidden * intermediate;
         let mut out = Vec::with_capacity(hidden);
         for row in 0..hidden {
-            let cell = (layer * layer_elems + row * intermediate + feature)
-                * super::super::BYTES_PER_F16;
+            let cell =
+                (layer * layer_elems + row * intermediate + feature) * super::super::BYTES_PER_F16;
             let bits = u16::from_le_bytes(
-                bytes[cell..cell + super::super::BYTES_PER_F16].try_into().unwrap(),
+                bytes[cell..cell + super::super::BYTES_PER_F16]
+                    .try_into()
+                    .unwrap(),
             );
             out.push(larql_models::quant::half::f16_to_f32(bits));
         }

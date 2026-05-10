@@ -251,9 +251,6 @@ impl StageCapture {
             ffn_format,
         );
 
-        let q_dim = weights.num_q_heads * weights.head_dim;
-        let kv_dim = weights.num_kv_heads * weights.head_dim;
-        let rope = arch.rope_base_for_layer(0) as f32;
         let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
         let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
@@ -265,13 +262,7 @@ impl StageCapture {
                 &prefill_x,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
                 prefix_ids.len(),
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
                 qk_norm_val,
                 softcap,
             )
@@ -284,18 +275,7 @@ impl StageCapture {
             ENV_STAGE_DUMP_LAYER,
             &layer.to_string(),
             || {
-                let _ = backend.decode_token(
-                    &pipeline_layers,
-                    &dec_x,
-                    hidden,
-                    intermediate,
-                    q_dim,
-                    kv_dim,
-                    weights.num_q_heads,
-                    weights.num_kv_heads,
-                    weights.head_dim,
-                    rope,
-                );
+                let _ = backend.decode_token(&pipeline_layers, &dec_x, hidden, intermediate);
             },
         )?;
         let prefix = decode_layer_prefix(layer);

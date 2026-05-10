@@ -30,7 +30,10 @@ mod tests {
     #[test]
     fn exec_concatenates_context_and_cause() {
         let err = LqlError::exec("loading vindex", "file missing");
-        assert_eq!(err.to_string(), "Execution error: loading vindex: file missing");
+        assert_eq!(
+            err.to_string(),
+            "Execution error: loading vindex: file missing"
+        );
     }
 
     #[test]
@@ -38,7 +41,9 @@ mod tests {
         // Regression: callers need to pass `format!(…)` results directly.
         let url = "http://localhost:8080";
         let err = LqlError::exec(format!("failed to connect to {url}"), "io error");
-        assert!(err.to_string().contains("failed to connect to http://localhost:8080"));
+        assert!(err
+            .to_string()
+            .contains("failed to connect to http://localhost:8080"));
         assert!(err.to_string().contains("io error"));
     }
 

@@ -2,15 +2,21 @@
 
 ## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 904 lib tests | 65.67% line cov (64 of 127 files at ≥90% line cov)
 
-## Recommended next (priority order, 2026-05-09)
+## Recommended next (priority order, 2026-05-10)
 
 Curated from the open work below. Each item links to the section that owns the
 detail.
 
-1. **A1-A3 — heterogeneous attention geometry** — *confirmed blocker*. Until A1-A3
-   land, Gemma 4 31B local Metal is dead (immediate-EOS at L5). Workaround in
-   place via remote-FFN batch but slow (6.5 tok/s on the same machine). See
-   "Open: Model architecture independence hardening".
+1. ~~**A1-A3 — heterogeneous attention geometry**~~ — **shipped 2026-05-10**.
+   Reproduced 31B end-to-end first: it generates correctly. The "L5
+   immediate-EOS" claim was stale — heterogeneous-attention safety had
+   quietly landed via per-layer reads in
+   `metal/decode/setup.rs:DecodeScratch::new`, `LayerBuffers::allocate`,
+   and `ensure_kv_cache_for_layers`. A1 (`Capability::HeterogeneousAttention`
+   runtime gate), A2 (drop vestigial scalar geometry from `DecodeBackend`),
+   and A3 (KV cache audit) landed as the deferred cleanup pass. See
+   `CHANGELOG.md` and "Open: Model architecture independence hardening"
+   below (now ✅ shipped section).
 
 2. **G-3 (= G-4) — flash-attention-style fused attention kernel** — highest
    GPU-fwd lever after G-1/G-2 missed. Stub at
@@ -115,37 +121,36 @@ Acceptance:
 
 ---
 
-## Open: Model architecture independence hardening
+## ✅ Model architecture independence hardening — A1-A3 shipped 2026-05-10
 
-**Status**: Planned as of 2026-05-02.
+**Status**: A1, A2, A3 shipped 2026-05-10 (see CHANGELOG.md). A4 remains
+planned. Original "L5 immediate-EOS" framing turned out to be stale — when
+the work item was reopened, Gemma 4 31B Q4K Metal already generated
+coherent text end-to-end (verified via `larql run gemma4-31b-q4k.vindex`).
+The heterogeneous-attention safety had landed quietly via per-layer reads
+in `metal/decode/setup.rs:DecodeScratch::new` (sized to
+`max(layers[*].q_dim)`), `metal/ops/full_pipeline/buffers.rs` (prefill
+same), and `MetalBackend::ensure_kv_cache_for_layers`. A1-A3 then landed as
+the deferred API/capability cleanup.
 
-The forward stack already routes most behavior through `ModelArchitecture` and
-`FullPipelineLayer`, but a few paths still assume standard decoder attention
-or pass first-layer scalar geometry into backends that now support per-layer
-shape variation.
-
-**Confirmed blocker (2026-05-04):** Gemma 4 31B Q4K has 60 layers split into two
-geometry classes: 50 sliding-attention layers (head_dim=256, num_kv_heads=16,
-sliding_window=1024) and 10 full-attention layers at L5, L11, L17, L23, L29,
-L35, L41, L47, L53, L59 (head_dim=512, num_kv_heads=4). The Metal backend
-currently uses L0's sliding-attention geometry for all 60 layers. This produces
-corrupted KV state at L5 (the first global layer) and causes immediate EOS in
-`larql bench --metal`. A1-A3 are the direct fix path. Until they land, 31B local
-Metal is blocked; remote-FFN batch (§ run_dense_ffn_q4k) gives 6.5 tok/s on the
-same machine.
+Gemma 4 31B Q4K has 60 layers split into two geometry classes: 50
+sliding-attention layers (head_dim=256, num_kv_heads=16,
+sliding_window=1024) and 10 full-attention layers at L5, L11, L17, L23,
+L29, L35, L41, L47, L53, L59 (head_dim=512, num_kv_heads=4). Both classes
+now flow correctly through GPU decode and prefill.
 
 Work items:
 
 | # | Item | Status |
 |---|------|--------|
-| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path; first priority is Gemma 4 31B heterogeneous sliding/global attention (L0 geometry ≠ all-layer geometry) | planned |
-| A2 | Remove scalar `num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base` assumptions from decode/prefill call sites where `FullPipelineLayer` already carries per-layer values | planned |
-| A3 | Ensure all KV cache allocation paths use `layers[*].num_kv_heads` and `layers[*].head_dim`, not the caller's first-layer geometry fallback | planned |
+| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path | shipped 2026-05-10 — `Capability::HeterogeneousAttention` + `gpu_setup::ensure_attention_supported` (see CHANGELOG) |
+| A2 | Remove scalar `num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base` assumptions from decode/prefill call sites | shipped 2026-05-10 — dropped from 10 `DecodeBackend` methods + every `larql-inference` call site; `AttentionGeometry` deleted; bonus: latent `PipelineIntervention` head_dim bug fixed (now per-target-layer) |
+| A3 | Ensure all KV cache allocation paths use `layers[*].num_kv_heads` and `layers[*].head_dim`, not the caller's first-layer geometry fallback | already shipped pre-A1/A2; documented + audited 2026-05-10 — production paths all reach `preallocate_kv_cache_per_layer`; legacy uniform `create_kv_cache` retained only for synthetic tests + `populate_kv_layer` lazy bootstrap |
 | A4 | Add architecture fixtures for heterogeneous geometry and unsupported-attention failures so GPU, CPU, trace, and vindex-backed paths agree | planned |
 
-Acceptance: a heterogeneous model should either run through every selected
-path using per-layer geometry, or fail before decode/extraction with a precise
-unsupported capability error.
+Acceptance (met for A1-A3): a heterogeneous model runs through every
+selected path using per-layer geometry, or fails before decode/extraction
+with a precise unsupported capability error (`GenerateError::UnsupportedBackend`).
 
 ---
 

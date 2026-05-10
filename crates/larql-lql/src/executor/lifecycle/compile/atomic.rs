@@ -37,13 +37,11 @@ pub(super) fn paths_collide(a: &Path, b: &Path) -> Result<bool, LqlError> {
 
 fn canonical_or_absolute(p: &Path) -> Result<PathBuf, LqlError> {
     if p.exists() {
-        return p.canonicalize().map_err(|e| {
-            LqlError::exec(format!("canonicalize {}", p.display()), e)
-        });
+        return p
+            .canonicalize()
+            .map_err(|e| LqlError::exec(format!("canonicalize {}", p.display()), e));
     }
-    std::path::absolute(p).map_err(|e| {
-        LqlError::exec(format!("absolute path {}", p.display()), e)
-    })
+    std::path::absolute(p).map_err(|e| LqlError::exec(format!("absolute path {}", p.display()), e))
 }
 
 /// Sibling staging directory for `final_dir`. Same parent → same
@@ -84,12 +82,8 @@ where
     // (same PID is unlikely but `process::id()` recycles eventually).
     let staging = staging_dir_for(final_dir);
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| {
-        LqlError::exec(
-            format!("create staging dir {}", staging.display()),
-            e,
-        )
-    })?;
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| LqlError::exec(format!("create staging dir {}", staging.display()), e))?;
 
     match work(&staging) {
         Ok(out) => {
@@ -101,7 +95,11 @@ where
                 // leak a half-built tree at `<basename>.tmp.<pid>`.
                 let _ = std::fs::remove_dir_all(&staging);
                 LqlError::exec(
-                    format!("promote staging {} → {}", staging.display(), final_dir.display()),
+                    format!(
+                        "promote staging {} → {}",
+                        staging.display(),
+                        final_dir.display()
+                    ),
                     e,
                 )
             })?;
@@ -208,7 +206,10 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!staging_dir_for(&final_dir).exists(), "staging removed");
-        assert!(!final_dir.exists(), "no partial output at final destination");
+        assert!(
+            !final_dir.exists(),
+            "no partial output at final destination"
+        );
 
         let _ = std::fs::remove_dir_all(&source);
     }
@@ -324,7 +325,10 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(final_dir.join("fresh.bin").exists());
-        assert!(!final_dir.join("stale.bin").exists(), "old contents removed");
+        assert!(
+            !final_dir.join("stale.bin").exists(),
+            "old contents removed"
+        );
 
         let _ = std::fs::remove_dir_all(&source);
         let _ = std::fs::remove_dir_all(&final_dir);

@@ -286,34 +286,47 @@ no string-prefix inheritance of curated band tables.
 ### Residual large-file debt (review finding 2026-05-10)
 **Impact**: Code navigability + future split cost
 **Effort**: Small–Medium per file
-**Status**: Active — opened by 2026-05-10 health pass after the
-"large-file debt closed" claim was found to apply only to files in
-rounds 4–5 work-sets.
+**Status**: ✅ Closed 2026-05-10 — all 7 listed files split or
+documented as won't-split.
 
-Files ≥800 LOC, ranked by tractability:
+Round-6 splits (2026-05-10):
 
-- [ ] `walker/vector_extractor.rs` (1213 L) — multi-stage build
-  pipeline; split per stage (likely highest-leverage win).
-- [ ] `extract/build_helpers.rs` (848 L) — weight extraction
-  utilities; group by family/quantisation.
-- [ ] `format/huggingface/download.rs` (941 L) — separate retry +
-  manifest parsing from the download driver.
-- [ ] `format/huggingface/publish/lfs.rs` (905 L) — split LFS batch
-  protocol from upload driver (mirror of round-5 publish split).
-- [ ] `format/huggingface/discovery.rs` (800 L) — split detection
-  heuristics from resolution.
-- [ ] `index/types/ffn_row.rs` (875 L) — accessor trait impls;
-  split per row type if natural seams exist.
-- [ ] `index/storage/gate_accessors.rs` (845 L) — gate KNN
-  dispatch; revisit after the Step 6/7 migration settles.
+- [x] `walker/vector_extractor.rs` (1213 L) → 7 siblings under
+  `walker/vector_extractor/` (largest 373 L). All siblings ≥94.8%
+  line coverage.
+- [x] `extract/build_helpers.rs` (848 L) → 6 siblings + test_support
+  under `extract/build_helpers/` (largest 264 L). All ≥98%.
+- [x] `format/huggingface/download.rs` (941 L) → minimal 2-way
+  split (`download/mod.rs` 676 L, `download/helpers.rs` 270 L).
+  Pure helpers at 100%; the network-bound mod.rs inherits the 74%
+  baseline as `download/mod.rs:64.0` (HF API hard to mock without
+  significant test infrastructure). `mod.rs` still over 600 LOC by
+  user direction.
+- [x] `format/huggingface/publish/lfs.rs` (905 L) → 4 siblings +
+  test_support under `publish/lfs/` (largest 281 L). All ≥91%; old
+  `lfs.rs:97` debt baseline removed (every sibling at default 90%).
+- [x] `format/huggingface/discovery.rs` (800 L) → 3 siblings +
+  test_support under `discovery/` (largest 386 L). All ≥94%.
+- [x] `index/types/ffn_row.rs` (875 L) → 3 siblings under
+  `index/types/ffn_row/` (largest 444 L). Trait declaration in
+  `mod.rs` (87.1%, debt baseline added), shared `Stub` fixture in
+  `test_support.rs` (84.9%, debt baseline added), tests in
+  `tests.rs`. Production coverage was always at 87% — split made it
+  visible by removing dilution from co-located tests.
+- [x] `index/storage/gate_accessors.rs` (845 L) → 3 siblings under
+  `gate_accessors/` (mod.rs 347 L, accessor_tests.rs 445 L,
+  release_pages_tests.rs 53 L). Production-only mod.rs at 92.3%
+  (up from old 70.5% combined-file baseline).
 - [x] `index/storage/vindex_storage/mmap_storage.rs` (1182 L) —
   **kept as a single file by design**: 12-method trait impl, dense
   per-substore mmap storage. Splitting by trait method fragments
-  without modularity gain. Marked "won't split" once accepted.
+  without modularity gain.
 
-**Acceptance bar**: 7 listed files (excluding `mmap_storage.rs`)
-under the 600-LOC soft threshold, or each carries a documented
-"won't split" rationale matching `mmap_storage`'s.
+**Outcome**: workspace coverage 90.30% (was 90.17% at start of
+round); 104 files at 90% default (was 86); 42 debt baselines (was
+40 — net +2 from ffn_row split). 932 lib tests + 19 integration
+suites pass; clippy clean. No file outside the won't-split list is
+≥800 LOC.
 
 ### Production-path `unwrap`/`expect` triage (review finding 2026-05-10)
 **Impact**: Crash-safety on I/O failures

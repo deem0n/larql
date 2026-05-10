@@ -19,6 +19,7 @@ pub(super) struct PickedToken {
 /// fire `on_token`, and check EOS. Returns `None` when the sampler
 /// rejects the entire distribution (empty hits / all -inf logits) so the
 /// caller can break the loop.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn sample_and_emit<F>(
     sampler: &mut Sampler,
     detok: &mut Detokenizer,
@@ -112,7 +113,10 @@ mod tests {
         assert_eq!(captured.len(), 1, "on_token must fire exactly once");
         assert_eq!(captured[0].0, 7);
         assert!(picked.prob > 0.0 && picked.prob <= 1.0);
-        assert!(!picked.is_eos, "no special EOS token at id=7 in synthetic vocab");
+        assert!(
+            !picked.is_eos,
+            "no special EOS token at id=7 in synthetic vocab"
+        );
     }
 
     #[test]

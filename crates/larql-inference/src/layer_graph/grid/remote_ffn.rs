@@ -20,6 +20,7 @@ use larql_vindex::VectorIndex;
 /// For dense models (not MoE) where the entire FFN should be offloaded to a
 /// remote server (`--ffn URL`). Metal handles attention on the local GPU;
 /// every layer's FFN is a round trip to `remote` via `LayerShardedBackend::forward`.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_with_remote_ffn(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -35,7 +36,6 @@ pub fn generate_with_remote_ffn(
     let norm_offset = arch.norm_weight_offset();
     let setup = build_grid_pipeline_setup(weights, index, RemotePatch::Ffn)?;
     let layers = setup.layers;
-    let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
 
@@ -59,19 +59,7 @@ pub fn generate_with_remote_ffn(
             remote.forward(layer, &x).row(0).to_vec()
         };
 
-        let h = backend.decode_token_with_moe(
-            &layers,
-            &x_tok,
-            hidden,
-            intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
-            &mut moe_fn,
-        );
+        let h = backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut moe_fn);
         last_hidden_vec = h.ok_or_else(|| {
             RemoteMoeError::BadResponse("decode_token_with_moe returned None during prefill".into())
         })?;
@@ -135,19 +123,7 @@ pub fn generate_with_remote_ffn(
         };
 
         let h_vec = backend
-            .decode_token_with_moe(
-                &layers,
-                &x_tok,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                &mut moe_fn,
-            )
+            .decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut moe_fn)
             .ok_or_else(|| {
                 RemoteMoeError::BadResponse("decode_token_with_moe returned None".into())
             })?;
@@ -215,7 +191,7 @@ fn dispatch_ffn_with_q8k_fallback(
     h_capture: &[Vec<f32>],
 ) -> Vec<Vec<f32>> {
     let hidden = h_capture.first().map(|v| v.len()).unwrap_or(0);
-    if hidden == 0 || hidden % crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS != 0 {
+    if hidden == 0 || !hidden.is_multiple_of(crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS) {
         return remote.forward_predispatch_all(h_capture);
     }
 
@@ -238,6 +214,7 @@ fn dispatch_ffn_with_q8k_fallback(
 }
 
 /// Batch pre-dispatch variant of [`generate_with_remote_ffn`].
+#[allow(clippy::too_many_arguments)]
 pub fn generate_with_remote_ffn_batch(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -255,7 +232,6 @@ pub fn generate_with_remote_ffn_batch(
     let norm_offset = arch.norm_weight_offset();
     let setup = build_grid_pipeline_setup(weights, index, RemotePatch::Ffn)?;
     let layers = setup.layers;
-    let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
     let num_layers = setup.num_layers;
@@ -283,19 +259,7 @@ pub fn generate_with_remote_ffn_batch(
                 }
                 vec![0.0f32; hidden]
             };
-            backend.decode_token_with_moe(
-                &layers,
-                &x_tok,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                &mut cap_fn,
-            );
+            backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut cap_fn);
         }
         backend.truncate_kv_cache(kv_len);
 
@@ -314,19 +278,7 @@ pub fn generate_with_remote_ffn_batch(
                     }
                     h2r.get(l).cloned().unwrap_or_else(|| vec![0.0f32; hidden])
                 };
-                backend.decode_token_with_moe(
-                    &layers,
-                    &x_tok,
-                    hidden,
-                    intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
-                    &mut fn_apply,
-                );
+                backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut fn_apply);
                 backend.truncate_kv_cache(kv_len);
                 h_capture = new_cap;
             } else {
@@ -339,12 +291,6 @@ pub fn generate_with_remote_ffn_batch(
                     &x_tok,
                     hidden,
                     intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
                     &mut fn_final,
                 );
             }
@@ -397,19 +343,7 @@ pub fn generate_with_remote_ffn_batch(
                 }
                 vec![0.0f32; hidden]
             };
-            backend.decode_token_with_moe(
-                &layers,
-                &x_tok,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                &mut cap_fn,
-            );
+            backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut cap_fn);
         }
         backend.truncate_kv_cache(kv_len);
 
@@ -432,19 +366,7 @@ pub fn generate_with_remote_ffn_batch(
                     }
                     h2r.get(l).cloned().unwrap_or_else(|| vec![0.0f32; hidden])
                 };
-                backend.decode_token_with_moe(
-                    &layers,
-                    &x_tok,
-                    hidden,
-                    intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
-                    &mut fn_apply,
-                );
+                backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut fn_apply);
                 backend.truncate_kv_cache(kv_len);
                 h_capture = new_h_capture;
             } else {
@@ -457,12 +379,6 @@ pub fn generate_with_remote_ffn_batch(
                     &x_tok,
                     hidden,
                     intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
                     &mut fn_final,
                 );
             }

@@ -39,10 +39,7 @@ pub(super) const BYTES_PER_F16: usize = 2;
 /// Replace `dst` with a fresh writable copy of `src`. Compile bakers
 /// hard-link unchanging files in bulk; calling this before a seek-
 /// write breaks the link so the source vindex is never mutated.
-pub(super) fn copy_for_patch(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> Result<(), LqlError> {
+pub(super) fn copy_for_patch(src: &std::path::Path, dst: &std::path::Path) -> Result<(), LqlError> {
     let _ = std::fs::remove_file(dst);
     std::fs::copy(src, dst)
         .map_err(|e| LqlError::exec(format!("failed to copy {}", src.display()), e))?;

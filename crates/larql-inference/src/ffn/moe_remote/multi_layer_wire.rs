@@ -425,13 +425,17 @@ mod tests {
         MultiLayerTaskQ8K {
             layer,
             hidden,
-            qs: (0..hidden).map(|i| ((i % 256) as i32 - 128) as i8).collect(),
+            qs: (0..hidden)
+                .map(|i| ((i % 256) as i32 - 128) as i8)
+                .collect(),
             d: (0..nb).map(|i| 0.01 * (i as f32 + 1.0)).collect(),
             sums: (0..nb * SUMS_PER_Q8K_BLOCK)
                 .map(|i| (i as i16) - 64)
                 .collect(),
             expert_ids: (0..ne).map(|i| (i as u32) * 17).collect(),
-            weights: (0..ne).map(|i| 1.0 / ne.max(1) as f32 * (i as f32 + 1.0)).collect(),
+            weights: (0..ne)
+                .map(|i| 1.0 / ne.max(1) as f32 * (i as f32 + 1.0))
+                .collect(),
         }
     }
 
@@ -495,8 +499,7 @@ mod tests {
 
     #[test]
     fn truncated_q8k_request_returns_none_at_each_field() {
-        let encoded =
-            encode_multi_layer_request_q8k(&[make_q8k_task(0, ELEMS_PER_Q8K_BLOCK, 1)]);
+        let encoded = encode_multi_layer_request_q8k(&[make_q8k_task(0, ELEMS_PER_Q8K_BLOCK, 1)]);
         for cut in 1..encoded.len() {
             assert!(
                 decode_multi_layer_request_q8k(&encoded[..cut]).is_none(),

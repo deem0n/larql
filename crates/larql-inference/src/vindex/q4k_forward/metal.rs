@@ -17,9 +17,7 @@ pub fn predict_q4k_metal(
     index: &VectorIndex,
     backend: &dyn larql_compute::ComputeBackend,
 ) -> PredictResult {
-    use crate::layer_graph::pipeline_layer::{
-        attention_geometry_for_pipeline_layer, build_arch_params, resolve_attn_weights,
-    };
+    use crate::layer_graph::pipeline_layer::{build_arch_params, resolve_attn_weights};
     use larql_compute::QuantFormat;
 
     let arch = &*weights.arch;
@@ -72,26 +70,13 @@ pub fn predict_q4k_metal(
     let embed = &weights.embed;
     let embed_scale = arch.embed_scale();
 
-    let attention = attention_geometry_for_pipeline_layer(&layers[0]);
-
     let mut h_vec: Vec<f32> = Vec::with_capacity(hidden);
     for &tok in token_ids {
         let row = embed.row(tok as usize);
         let x: Vec<f32> = row.iter().map(|v| v * embed_scale).collect();
 
         let out = backend
-            .decode_token(
-                &layers,
-                &x,
-                hidden,
-                weights.intermediate_size,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-            )
+            .decode_token(&layers, &x, hidden, weights.intermediate_size)
             .expect("backend doesn't support decode_token - need Metal with Q4 kernels");
         h_vec = out;
     }
@@ -115,9 +100,7 @@ pub fn predict_q4k_metal_with_replaced_head_residual_delta(
     target_head: usize,
     replacement_delta: &Array2<f32>,
 ) -> Option<Array2<f32>> {
-    use crate::layer_graph::pipeline_layer::{
-        attention_geometry_for_pipeline_layer, build_arch_params, resolve_attn_weights,
-    };
+    use crate::layer_graph::pipeline_layer::{build_arch_params, resolve_attn_weights};
     use larql_compute::QuantFormat;
 
     let arch = &*weights.arch;
@@ -169,8 +152,6 @@ pub fn predict_q4k_metal_with_replaced_head_residual_delta(
         })
         .collect();
 
-    let attention = attention_geometry_for_pipeline_layer(&layers[0]);
-
     // All token embeddings concatenated: [seq_len × hidden].
     let mut x_all = Vec::with_capacity(seq_len * hidden);
     for &tok in token_ids {
@@ -191,13 +172,7 @@ pub fn predict_q4k_metal_with_replaced_head_residual_delta(
         &x_all,
         hidden,
         weights.intermediate_size,
-        attention.q_dim,
-        attention.kv_dim,
         seq_len,
-        attention.num_q_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
-        attention.rope_base,
         arch.attn_q_norm_key(0).is_some(),
         arch.attn_logit_softcapping().unwrap_or(0.0),
         target_layer,
@@ -222,9 +197,7 @@ pub fn predict_q4k_metal_hidden(
     index: &VectorIndex,
     backend: &dyn larql_compute::ComputeBackend,
 ) -> Option<Array2<f32>> {
-    use crate::layer_graph::pipeline_layer::{
-        attention_geometry_for_pipeline_layer, build_arch_params, resolve_attn_weights,
-    };
+    use crate::layer_graph::pipeline_layer::{build_arch_params, resolve_attn_weights};
     use larql_compute::QuantFormat;
 
     let arch = &*weights.arch;
@@ -276,8 +249,6 @@ pub fn predict_q4k_metal_hidden(
         })
         .collect();
 
-    let attention = attention_geometry_for_pipeline_layer(&layers[0]);
-
     let mut x_all = Vec::with_capacity(seq_len * hidden);
     for &tok in token_ids {
         x_all.extend(
@@ -295,13 +266,7 @@ pub fn predict_q4k_metal_hidden(
         &x_all,
         hidden,
         weights.intermediate_size,
-        attention.q_dim,
-        attention.kv_dim,
         seq_len,
-        attention.num_q_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
-        attention.rope_base,
         arch.attn_q_norm_key(0).is_some(),
         arch.attn_logit_softcapping().unwrap_or(0.0),
         // Setting target_layer to num_layers means the hooks never fire
@@ -327,9 +292,7 @@ pub fn predict_q4k_metal_capture_pre_wo(
     target_layer: usize,
     target_head: usize,
 ) -> Option<Vec<f32>> {
-    use crate::layer_graph::pipeline_layer::{
-        attention_geometry_for_pipeline_layer, build_arch_params, resolve_attn_weights,
-    };
+    use crate::layer_graph::pipeline_layer::{build_arch_params, resolve_attn_weights};
     use larql_compute::QuantFormat;
 
     let arch = &*weights.arch;
@@ -382,8 +345,6 @@ pub fn predict_q4k_metal_capture_pre_wo(
         })
         .collect();
 
-    let attention = attention_geometry_for_pipeline_layer(&layers[0]);
-
     let mut x_all = Vec::with_capacity(seq_len * hidden);
     for &tok in token_ids {
         x_all.extend(
@@ -400,13 +361,7 @@ pub fn predict_q4k_metal_capture_pre_wo(
         &x_all,
         hidden,
         weights.intermediate_size,
-        attention.q_dim,
-        attention.kv_dim,
         seq_len,
-        attention.num_q_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
-        attention.rope_base,
         arch.attn_q_norm_key(0).is_some(),
         arch.attn_logit_softcapping().unwrap_or(0.0),
         target_layer,

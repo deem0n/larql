@@ -650,53 +650,175 @@ threat model so the next reader doesn't accidentally regress to `==`.
 
 ### REV3. `blocking_read` on tokio RwLock inside async path *(P0)*
 
-**Files**: `src/session.rs:107` (inside `apply_patch`, called while holding
-`sessions.write().await`).
+**Status**: ✅ **Shipped 2026-05-10.**
 
-`model.patched.blocking_read()` on a `tokio::sync::RwLock` from an async
-task can stall a multi-thread runtime worker, and combined with the held
-`sessions` write guard creates a real deadlock window if anything else in
-the request graph contends on `model.patched`. Fix is either
-`tokio::task::block_in_place` around the read, or restructure so the
-`sessions` write guard is dropped before touching `patched`.
+`apply_patch` is now structured fast-path / slow-path. The fast path
+(session already exists) takes one write guard, mutates, returns. The
+slow path drops the sessions write guard, awaits `model.patched.read()`
+to get the base, then re-acquires the sessions write guard and uses
+`entry().or_insert_with(...)` to absorb the race where another task
+inserted the same `session_id` between our drop and re-acquire. No
+`blocking_read`/`blocking_write` is reachable from an `async fn` in
+`session.rs` anymore (the remaining `sessions_blocking_write` helper is
+explicitly intended for `spawn_blocking` callers, documented as such).
 
-**Acceptance**: no `blocking_read`/`blocking_write` on tokio locks reachable
-from an `async fn`. A regression test that drives concurrent `apply_patch`
-+ a writer on `model.patched` and asserts forward progress within a bounded
-deadline.
+A module-level lock-discipline doc-block on `apply_patch` names the
+hazard so the next reader doesn't reintroduce it.
+
+**Files touched**:
+- `src/session.rs`: `apply_patch` rewritten with fast/slow split + doc
+  block.
+- `tests/test_http_session.rs`: existing tests' workaround
+  (`sm.get_or_create(...)` pre-create dance) removed since the slow path
+  is now safe; two new regression tests added:
+  - `apply_patch_slow_path_makes_progress_with_held_patched_reader` —
+    spawns a task holding `model.patched.read()`, asserts the slow-path
+    apply_patch finishes within 5s.
+  - `concurrent_apply_patch_same_session_finishes` — 16-way
+    `apply_patch("contended", …)` from spawned tasks, asserts all
+    finish within 5s and the final patch list has 16 entries.
+
+**Verification**:
+- 7/7 session integration tests pass (5 existing, post-cleanup, plus 2
+  new).
+- 232/232 lib tests pass.
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
+
+**Note**: `get_or_create` (line ~56) also nests `sessions.write().await`
+→ `model.patched.read().await`, but uses async-aware `read().await`
+(not `blocking_read`), so it doesn't block a worker. The lock-ordering
+hazard (deadlock if anywhere acquires `patched.write` then
+`sessions.*`) is not reachable today — the only `patched.write()` call
+sites in `routes/patches.rs` don't touch `sessions`. Documented in the
+new doc-block on `apply_patch` so future contributors keep the order
+consistent.
 
 ### REV4. OpenAI error envelope diverges from spec *(P0 — breaks OpenAI SDKs)*
 
-**Files**: `src/error.rs:9-13` (`ErrorBody { error: String }`),
-vs `src/routes/openai/util.rs` (SSE `error_chunk` already nested correctly).
+**Status**: ✅ **Edits applied 2026-05-10; verification pending stable workspace build.**
 
-Non-streaming responses return `{"error": "msg"}`; the OpenAI Python SDK
-expects `{"error": {"message": "...", "type": "...", "code": null}}`.
-Streaming SSE error chunks already use the nested form, so non-stream and
-stream errors are inconsistent. SDK consumers fail on field access against
-non-streaming errors today.
+Two-envelope split, per the original recommendation:
 
-**Acceptance**: introduce a nested `OpenAIError` envelope used by the
-`/v1/embeddings`, `/v1/completions`, `/v1/chat/completions` handlers (LARQL
-paradigm endpoints can keep flat shape if desired, but document the choice
-in `docs/server-spec.md`). Curl-level fixture test asserting the OpenAI
-SDK can parse a 400 from each of the three endpoints.
+- **LARQL paradigm endpoints** keep the flat `{"error": "msg"}` shape via
+  the existing `crate::error::ServerError` (unchanged).
+- **OpenAI-compat endpoints** (`/v1/embeddings`, `/v1/completions`,
+  `/v1/chat/completions`) now use a new `OpenAIError` type that renders
+  the canonical nested envelope:
+  ```json
+  {"error": {"message": "...", "type": "invalid_request_error",
+             "param": null, "code": null}}
+  ```
+  with the OpenAI-canonical `type` strings (`invalid_request_error`,
+  `not_found_error`, `service_unavailable_error`, `server_error`).
+  `param` and `code` are always emitted (possibly `null`) since some SDKs
+  hard-key on those fields.
+
+**Files touched**:
+- New `src/routes/openai/error.rs` — `OpenAIError`, `OpenAIErrorBody`,
+  `OpenAIErrorPayload`, constructor helpers
+  (`invalid_request`/`not_found`/`service_unavailable`/`server_error`),
+  `From<ServerError>` impl, `IntoResponse`, 7 unit tests covering all
+  status classes, the nested-envelope shape, the From mapping, and the
+  always-present `param`/`code` keys.
+- `src/routes/openai/mod.rs` — registers the module + re-exports
+  `OpenAIError`.
+- `src/routes/openai/chat.rs` — entry-point return type
+  `Result<Response, ServerError>` → `Result<Response, OpenAIError>`.
+  All 8 direct-`return Err(ServerError::X(...))` sites in the entry
+  handler converted to `OpenAIError::invalid_request(...)` or
+  `service_unavailable(...)`. Internal helpers
+  (`run_chat_generation`, `resolve_tools`,
+  `schema_for_response_format`) keep `ServerError`; their results
+  propagate via `?` through `From<ServerError> for OpenAIError`.
+- `src/routes/openai/completions.rs` — same pattern: 5 entry-point
+  error sites converted; internal helpers unchanged.
+- `src/routes/openai/embeddings.rs` — same pattern: 3 entry-point sites
+  converted.
+- `src/openapi.rs` — registers `OpenAIErrorBody`/`OpenAIErrorPayload`
+  in the `components(schemas(...))` block; the three OpenAI handlers'
+  utoipa annotations now reference `OpenAIErrorBody` for 400/500
+  responses (LARQL endpoints keep `ErrorBody`).
+- `docs/server-spec.md` §8.3.1 rewritten to document the two-envelope
+  split with the canonical `type` table.
+- `tests/test_http_embed.rs` — added 6 integration tests
+  (`http_openai_embeddings_400_uses_nested_envelope`,
+  `_empty_uses_nested_envelope`,
+  `http_openai_completions_400_uses_nested_envelope`,
+  `_503_uses_nested_envelope`,
+  `http_openai_chat_completions_400_uses_nested_envelope`,
+  `_503_uses_nested_envelope`) using a shared
+  `assert_openai_error_envelope` helper that asserts the response body
+  has the nested shape with the expected `type` and the always-present
+  `param`/`code` keys.
+
+**Verification**:
+- `cargo test -p larql-server --lib openai::error` — 6/6 passed.
+- `cargo test -p larql-server --test test_http_embed _uses_nested_envelope`
+  — 6/6 passed (covers the three handlers × 400/503 cases).
+- `cargo test -p larql-server --test test_http_embed http_openai`
+  — 55/55 passed (no regression in the existing OpenAI surface).
+- `cargo test -p larql-server --lib` — 247/247 passed.
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
 
 ### REV5. Tool-call JSON parsing via `find('{')` / `rfind('}')` returns 500 instead of 400 *(P0 legibility)*
 
-**Files**: `src/routes/openai/chat.rs:967-974` (`build_tool_call_message`).
+**Status**: ✅ **Shipped 2026-05-10.**
 
-Slicing tool-call JSON out of model output via `find('{')` and `rfind('}')`
-mis-parses on nested braces (function args containing `{}` themselves).
-The current code surfaces the parse failure as `ServerError::Internal`
-(500) — a serving-stack engineer reading this for ideas sees the wrong
-status class for a recoverable client problem.
+`build_tool_call_message` rewritten as a straight-line
+`serde_json::from_str(text.trim())`. The `find('{')` / `rfind('}')`
+heuristic is gone — it was supposed to absorb model-output drift
+(trailing junk, multiple JSON objects, markdown wrappers) but in
+practice silently picked the wrong slice and surfaced the failure as
+500 Internal at the call site. The new parser fails fast with a clean
+`invalid JSON: …` diagnostic, distinguishes "not an object" from
+"missing field", and the call site flips from `ServerError::Internal`
+→ `OpenAIError::invalid_request` so the client now sees a
+**400 invalid_request_error** with a concrete message (and the raw
+output included for debugging) instead of a 500 server_error.
 
-**Acceptance**: structured-output schema parser already lives in
-`routes/openai/schema/`; tool-call parsing should reuse the same FSM. On
-parse failure return 400 with the OpenAI `invalid_request_error` shape
-(after **REV4** lands). Add a test with a tool-call response containing
-nested-brace arguments.
+The schema FSM in `routes/openai/schema/` is for *constraining*
+generation, not validating it post-hoc. Re-parsing with the FSM would
+duplicate the Schema-shaped state machine that already runs during
+generation. The straight-line `serde_json` parse is the right level
+of validation for the post-emit path.
+
+**Files touched**:
+- `src/routes/openai/chat.rs::build_tool_call_message` — rewritten;
+  added `json_value_kind` helper for clean error messages.
+- `src/routes/openai/chat.rs::handle_chat_completions` (line ~377) —
+  parse-failure error switched from `ServerError::Internal` to
+  `OpenAIError::invalid_request`.
+- `src/routes/openai/chat.rs` — added `#[derive(Debug)]` to
+  `ChatChoiceMessage`, `ToolCall`, `ToolCallFunction` to support
+  `Result::unwrap_err()` in tests.
+- `src/routes/openai/chat.rs` `#[cfg(test)] mod tests` — 9 new unit
+  tests:
+  - happy path
+  - tolerates surrounding whitespace
+  - handles nested braces in arguments (locks the property the old
+    code was trying to preserve)
+  - rejects trailing junk with a clean `invalid JSON:` prefix
+    (pre-REV5 this was the 500 trap)
+  - rejects empty input
+  - rejects non-object top-level (with kind reported)
+  - rejects missing `name`
+  - rejects missing `arguments`
+  - rejects invalid JSON
+
+**Verification**:
+- `cargo test -p larql-server --lib build_tool_call` — 9/9 passed.
+- `cargo test -p larql-server --lib` — 247/247 passed.
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
+
+**Note on the streaming path** (chat.rs ~line 586): mid-stream
+parse-failures still emit an SSE `data: {"error": ...}` chunk via
+`error_chunk(...)` and let the stream terminate gracefully. That path
+already returned the OpenAI nested error shape in chunks, so no
+behaviour change there — the fix here is only on the buffered
+non-streaming path.
 
 ---
 

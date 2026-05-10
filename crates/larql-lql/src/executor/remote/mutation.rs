@@ -41,10 +41,7 @@ impl Session {
         ])
     }
 
-    pub(crate) fn remote_delete(
-        &self,
-        conditions: &[Condition],
-    ) -> Result<Vec<String>, LqlError> {
+    pub(crate) fn remote_delete(&self, conditions: &[Condition]) -> Result<Vec<String>, LqlError> {
         let (layer, feature) = require_layer_feature(conditions, "DELETE")?;
 
         let ops = vec![larql_vindex::PatchOp::Delete {
@@ -143,10 +140,7 @@ impl Session {
 
     // ── Local patch management (client-side overlay) ─────────────
 
-    pub(crate) fn remote_apply_local_patch(
-        &mut self,
-        path: &str,
-    ) -> Result<Vec<String>, LqlError> {
+    pub(crate) fn remote_apply_local_patch(&mut self, path: &str) -> Result<Vec<String>, LqlError> {
         let patch_path = std::path::PathBuf::from(path);
         if !patch_path.exists() {
             return Err(LqlError::Execution(format!("patch not found: {path}")));
@@ -248,6 +242,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn remote_default_confidence_is_finite() {
         assert!(REMOTE_DEFAULT_CONFIDENCE.is_finite());
         assert!(REMOTE_DEFAULT_CONFIDENCE > 0.0);
@@ -255,8 +250,8 @@ mod tests {
 
     // ── Mockito end-to-end tests for the mutation forwarders ────────
 
-    use crate::ast::{Assignment, CompareOp, Condition, Value};
     use super::super::ENDPOINT_STATS;
+    use crate::ast::{Assignment, CompareOp, Condition, Value};
 
     fn stats_body() -> String {
         serde_json::json!({
@@ -641,7 +636,9 @@ mod tests {
             .with_body(stats_body())
             .create();
         let mut session = connect(&server.url());
-        let err = session.remote_remove_local_patch("does-not-exist").unwrap_err();
+        let err = session
+            .remote_remove_local_patch("does-not-exist")
+            .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 

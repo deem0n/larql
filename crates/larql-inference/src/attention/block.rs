@@ -647,10 +647,7 @@ mod tests {
         let (h_post, pre_o) = run_attention_block_with_pre_o(&weights, &h, 0).unwrap();
         assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
         // pre_o is `[seq, num_q * head_dim]`.
-        assert_eq!(
-            pre_o.shape(),
-            &[2, weights.num_q_heads * weights.head_dim]
-        );
+        assert_eq!(pre_o.shape(), &[2, weights.num_q_heads * weights.head_dim]);
     }
 
     #[test]
@@ -671,10 +668,9 @@ mod tests {
     fn attention_block_with_all_attention_weights_returns_per_position_dist() {
         let weights = make_test_weights();
         let h = hidden(3, weights.hidden_size);
-        let (_, _, all) = run_attention_block_with_pre_o_and_all_attention_weights(
-            &weights, &h, 0, None,
-        )
-        .unwrap();
+        let (_, _, all) =
+            run_attention_block_with_pre_o_and_all_attention_weights(&weights, &h, 0, None)
+                .unwrap();
         assert_eq!(all.heads.len(), weights.num_q_heads);
         for head in &all.heads {
             assert_eq!(head.len(), 3); // one distribution per Q position
@@ -686,11 +682,7 @@ mod tests {
         let weights = make_test_weights();
         let h = hidden(2, weights.hidden_size);
         let (_, _, all) = run_attention_block_with_pre_o_and_reduced_qk_attention_weights(
-            &weights,
-            &h,
-            0,
-            None,
-            /*qk_rank=*/ 4, // half of head_dim=8
+            &weights, &h, 0, None, /*qk_rank=*/ 4, // half of head_dim=8
         )
         .unwrap();
         assert_eq!(all.heads.len(), weights.num_q_heads);
@@ -769,10 +761,9 @@ mod tests {
         let weights = make_test_weights();
         let h = hidden(2, weights.hidden_size);
         let zero_delta = Array2::<f32>::zeros((2, weights.hidden_size));
-        let (with_delta, _) = run_attention_block_replace_head_residual_delta(
-            &weights, &h, 0, 0, &zero_delta, None,
-        )
-        .unwrap();
+        let (with_delta, _) =
+            run_attention_block_replace_head_residual_delta(&weights, &h, 0, 0, &zero_delta, None)
+                .unwrap();
         let (zeroed, _) =
             run_attention_block_zero_pre_o_heads(&weights, &h, 0, &[0], None).unwrap();
         for (a, b) in with_delta.iter().zip(zeroed.iter()) {
@@ -792,14 +783,9 @@ mod tests {
         let bogus_layer = weights.num_layers + 5;
         assert!(run_attention_block(&weights, &h, bogus_layer, false).is_none());
         assert!(run_attention_block_with_pre_o(&weights, &h, bogus_layer).is_none());
-        assert!(run_attention_block_zero_pre_o_heads(
-            &weights,
-            &h,
-            bogus_layer,
-            &[0],
-            None
-        )
-        .is_none());
+        assert!(
+            run_attention_block_zero_pre_o_heads(&weights, &h, bogus_layer, &[0], None).is_none()
+        );
     }
 
     // ── Gemma3-arch fixture (post-norms, QK norm, gelu_tanh) ───────────

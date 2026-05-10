@@ -167,9 +167,6 @@ impl ResidualCapture {
             ffn_format,
         );
 
-        let q_dim = weights.num_q_heads * weights.head_dim;
-        let kv_dim = weights.num_kv_heads * weights.head_dim;
-        let rope = arch.rope_base_for_layer(0) as f32;
         let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
         let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
@@ -183,13 +180,7 @@ impl ResidualCapture {
                 &prefill_x,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
                 prefix_ids.len(),
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
                 qk_norm_val,
                 softcap,
             )
@@ -199,18 +190,7 @@ impl ResidualCapture {
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[new_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
         let dir = run_with_dump_dir(ENV_DECODE_DUMP_LAYERS, || {
-            let _ = backend.decode_token(
-                &layers,
-                &dec_x,
-                hidden,
-                intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
-            );
+            let _ = backend.decode_token(&layers, &dec_x, hidden, intermediate);
         })?;
 
         let layer_dumps = (0..num_layers)
@@ -282,9 +262,6 @@ impl ResidualCapture {
             ffn_format,
         );
 
-        let q_dim = weights.num_q_heads * weights.head_dim;
-        let kv_dim = weights.num_kv_heads * weights.head_dim;
-        let rope = arch.rope_base_for_layer(0) as f32;
         let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
         let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
@@ -296,13 +273,7 @@ impl ResidualCapture {
                 &prefill_x,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
                 prefix_ids.len(),
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
                 qk_norm_val,
                 softcap,
             )
@@ -314,36 +285,14 @@ impl ResidualCapture {
         for &id in &new_ids[..new_ids.len() - 1] {
             let dec_embed = crate::forward::embed_tokens_pub(weights, &[id]);
             let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
-            let _ = backend.decode_token(
-                &layers,
-                &dec_x,
-                hidden,
-                intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
-            );
+            let _ = backend.decode_token(&layers, &dec_x, hidden, intermediate);
         }
 
         let last_id = *new_ids.last().unwrap();
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[last_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
         let dir = run_with_dump_dir(ENV_DECODE_DUMP_LAYERS, || {
-            let _ = backend.decode_token(
-                &layers,
-                &dec_x,
-                hidden,
-                intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
-            );
+            let _ = backend.decode_token(&layers, &dec_x, hidden, intermediate);
         })?;
 
         let layer_dumps = (0..num_layers)

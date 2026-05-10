@@ -269,15 +269,36 @@ pub fn make_gemma3_test_weights() -> ModelWeights {
 
     for layer in 0..NUM_LAYERS {
         // Attention projections
-        tensors.insert(arch.attn_q_key(layer), rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.attn_k_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.attn_v_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.attn_o_key(layer), rand_mat_seeded(HIDDEN, q_dim, 0.1, next_seed()));
+        tensors.insert(
+            arch.attn_q_key(layer),
+            rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_k_key(layer),
+            rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_v_key(layer),
+            rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_o_key(layer),
+            rand_mat_seeded(HIDDEN, q_dim, 0.1, next_seed()),
+        );
 
         // FFN
-        tensors.insert(arch.ffn_gate_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.ffn_up_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.ffn_down_key(layer), rand_mat_seeded(HIDDEN, INTER, 0.1, next_seed()));
+        tensors.insert(
+            arch.ffn_gate_key(layer),
+            rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_up_key(layer),
+            rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_down_key(layer),
+            rand_mat_seeded(HIDDEN, INTER, 0.1, next_seed()),
+        );
 
         // Layer norms — input + post-attention. norm_weight_offset=1.0
         // means saved weights are deltas; zeros = identity.
@@ -378,10 +399,22 @@ pub fn make_starcoder2_test_weights() -> ModelWeights {
 
     for layer in 0..NUM_LAYERS {
         // Attention projections
-        tensors.insert(arch.attn_q_key(layer), rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.attn_k_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.attn_v_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.attn_o_key(layer), rand_mat_seeded(HIDDEN, q_dim, 0.1, next_seed()));
+        tensors.insert(
+            arch.attn_q_key(layer),
+            rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_k_key(layer),
+            rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_v_key(layer),
+            rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_o_key(layer),
+            rand_mat_seeded(HIDDEN, q_dim, 0.1, next_seed()),
+        );
 
         // Attention biases — Starcoder2 has them.
         if let Some(k) = arch.attn_q_bias_key(layer) {
@@ -398,10 +431,19 @@ pub fn make_starcoder2_test_weights() -> ModelWeights {
         }
 
         // FFN — non-gated, so up + down only. No gate matrix.
-        tensors.insert(arch.ffn_up_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
-        tensors.insert(arch.ffn_down_key(layer), rand_mat_seeded(HIDDEN, INTER, 0.1, next_seed()));
+        tensors.insert(
+            arch.ffn_up_key(layer),
+            rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_down_key(layer),
+            rand_mat_seeded(HIDDEN, INTER, 0.1, next_seed()),
+        );
         // Add gate too — code may probe regardless of ffn_type for some paths.
-        tensors.insert(arch.ffn_gate_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
+        tensors.insert(
+            arch.ffn_gate_key(layer),
+            rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()),
+        );
 
         // FFN biases — Starcoder2 has them.
         if let Some(k) = arch.ffn_up_bias_key(layer) {

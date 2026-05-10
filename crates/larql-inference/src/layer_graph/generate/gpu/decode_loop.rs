@@ -12,10 +12,9 @@ use crate::layer_graph::generate::eos::EosConfig;
 use crate::layer_graph::generate::lm_head::lm_head_topk_with_policy;
 use crate::layer_graph::generate::policy::GenerationRuntimeConfig;
 use crate::layer_graph::generate::sampling::Sampler;
-use crate::layer_graph::pipeline_layer::AttentionGeometry;
-use larql_compute::FullPipelineLayer;
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
+use larql_compute::FullPipelineLayer;
 
 /// Aggregated output of the decode-loop phase.
 pub(super) struct DecodeLoopOutcome {
@@ -47,7 +46,6 @@ pub(super) fn run_decode_loop<F>(
     index: &larql_vindex::VectorIndex,
     backend: &dyn ComputeBackend,
     layers: &[FullPipelineLayer],
-    attention: AttentionGeometry,
     hidden: usize,
     intermediate: usize,
     norm_offset: f32,
@@ -125,7 +123,6 @@ where
             weights,
             backend,
             layers,
-            attention,
             hidden,
             intermediate,
             &x_dec,
@@ -146,9 +143,7 @@ where
             // a single decode step. Treat as early-stop rather than re-run
             // the O(N²) CPU path mid-loop without a kept id list.
             if profile {
-                eprintln!(
-                    "[profile] step={step} — GPU decode returned None; stopping generation"
-                );
+                eprintln!("[profile] step={step} — GPU decode returned None; stopping generation");
             }
             break;
         };
@@ -173,7 +168,14 @@ where
 
         let t4 = std::time::Instant::now();
         let Some(picked) = sample_and_emit(
-            sampler, detok, tokenizer, weights, eos, &hits, generated_ids, on_token,
+            sampler,
+            detok,
+            tokenizer,
+            weights,
+            eos,
+            &hits,
+            generated_ids,
+            on_token,
         ) else {
             if profile {
                 eprintln!("[profile] step={step} — lm_head returned empty; break");
@@ -238,7 +240,6 @@ fn run_one_decode_step(
     weights: &ModelWeights,
     backend: &dyn ComputeBackend,
     layers: &[FullPipelineLayer],
-    attention: AttentionGeometry,
     hidden: usize,
     intermediate: usize,
     x_dec: &[f32],
@@ -247,53 +248,24 @@ fn run_one_decode_step(
 ) -> Option<Vec<f32>> {
     if profile_split && step == 2 {
         // Step 2 is post-JIT warm — run split profiling once and print.
-        let (r, _ta, _tgu, _td) = backend.decode_token_split_profile(
+        let (r, _ta, _tgu, _td) =
+            backend.decode_token_split_profile(layers, x_dec, hidden, intermediate);
+        return r;
+    }
+    if weights.has_per_layer_ffn() && backend.supports(Capability::DecodeQ4KMoe) {
+        let norm_eps = weights.arch.norm_eps();
+        let get_expert =
+            |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx);
+        return backend.decode_token_q4k_moe(
             layers,
             x_dec,
             hidden,
             intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
+            norm_eps,
+            &get_expert,
         );
-        return r;
     }
-    if weights.has_per_layer_ffn() {
-        if backend.supports(Capability::DecodeQ4KMoe) {
-            let norm_eps = weights.arch.norm_eps();
-            let get_expert =
-                |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx);
-            return backend.decode_token_q4k_moe(
-                layers,
-                x_dec,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                norm_eps,
-                &get_expert,
-            );
-        }
-    }
-    backend.decode_token(
-        layers,
-        x_dec,
-        hidden,
-        intermediate,
-        attention.q_dim,
-        attention.kv_dim,
-        attention.num_q_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
-        attention.rope_base,
-    )
+    backend.decode_token(layers, x_dec, hidden, intermediate)
 }
 
 fn log_step_diagnostic(step: usize, h_out: Option<&[f32]>) {

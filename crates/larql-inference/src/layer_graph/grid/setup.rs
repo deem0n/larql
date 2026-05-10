@@ -1,8 +1,7 @@
 use crate::ffn::moe_remote::RemoteMoeError;
 use crate::layer_graph::pipeline_layer::{
-    attention_geometry_for_arch_layer, build_pipeline_layers, kv_cache_shapes_for_arch,
-    patch_pipeline_layers_for_remote_ffn, patch_pipeline_layers_for_remote_moe, AttentionGeometry,
-    DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+    build_pipeline_layers, kv_cache_shapes_for_arch, patch_pipeline_layers_for_remote_ffn,
+    patch_pipeline_layers_for_remote_moe, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
 };
 use larql_compute::{prelude::ComputeBackend, FullPipelineLayer};
 use larql_models::ModelWeights;
@@ -16,7 +15,6 @@ pub(super) enum RemotePatch {
 
 pub(super) struct GridPipelineSetup<'a> {
     pub layers: Vec<FullPipelineLayer<'a>>,
-    pub attention: AttentionGeometry,
     pub hidden: usize,
     pub intermediate: usize,
     pub num_layers: usize,
@@ -61,7 +59,6 @@ pub(super) fn build_grid_pipeline_setup<'a>(
 
     Ok(GridPipelineSetup {
         layers,
-        attention: attention_geometry_for_arch_layer(weights, 0),
         hidden,
         intermediate,
         num_layers,

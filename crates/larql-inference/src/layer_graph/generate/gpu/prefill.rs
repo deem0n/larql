@@ -17,10 +17,9 @@
 
 use crate::layer_graph::generate::gpu_setup::prefill_q4_prompt;
 use crate::layer_graph::generate::types::GenerateError;
-use crate::layer_graph::pipeline_layer::AttentionGeometry;
-use larql_compute::FullPipelineLayer;
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
+use larql_compute::FullPipelineLayer;
 
 /// Run the prefill phase for streaming Q4 generation.
 ///
@@ -33,7 +32,6 @@ pub(super) fn prefill_for_streaming(
     weights: &ModelWeights,
     backend: &dyn ComputeBackend,
     layers: &[FullPipelineLayer],
-    attention: AttentionGeometry,
     hidden: usize,
     intermediate: usize,
     token_ids: &[u32],
@@ -52,18 +50,7 @@ pub(super) fn prefill_for_streaming(
             let x_pos: Vec<f32> = x[pos * hidden..(pos + 1) * hidden].to_vec();
             upload_ple(metal, token_ids[pos], &x_pos);
             last_h = backend
-                .decode_token(
-                    layers,
-                    &x_pos,
-                    hidden,
-                    intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
-                )
+                .decode_token(layers, &x_pos, hidden, intermediate)
                 .unwrap_or_else(|| vec![0.0f32; hidden]);
         }
         let mut out = vec![0.0f32; seq_len * hidden];
@@ -73,16 +60,7 @@ pub(super) fn prefill_for_streaming(
 
     // Branch 2: per-layer Q4_K MoE format.
     if weights.has_per_layer_ffn() {
-        return prefill_q4k_moe(
-            weights,
-            backend,
-            layers,
-            attention,
-            hidden,
-            intermediate,
-            token_ids,
-            x,
-        );
+        return prefill_q4k_moe(weights, backend, layers, hidden, intermediate, token_ids, x);
     }
 
     // Branch 3: standard fused prefill.
@@ -92,7 +70,6 @@ pub(super) fn prefill_for_streaming(
         x,
         hidden,
         intermediate,
-        attention,
         seq_len,
         qk_norm_val,
         softcap_val,
@@ -107,7 +84,6 @@ pub(super) fn prefill_for_streaming(
     weights: &ModelWeights,
     backend: &dyn ComputeBackend,
     layers: &[FullPipelineLayer],
-    attention: AttentionGeometry,
     hidden: usize,
     intermediate: usize,
     token_ids: &[u32],
@@ -118,16 +94,7 @@ pub(super) fn prefill_for_streaming(
     let seq_len = token_ids.len();
 
     if weights.has_per_layer_ffn() {
-        return prefill_q4k_moe(
-            weights,
-            backend,
-            layers,
-            attention,
-            hidden,
-            intermediate,
-            token_ids,
-            x,
-        );
+        return prefill_q4k_moe(weights, backend, layers, hidden, intermediate, token_ids, x);
     }
 
     prefill_q4_prompt(
@@ -136,7 +103,6 @@ pub(super) fn prefill_for_streaming(
         x,
         hidden,
         intermediate,
-        attention,
         seq_len,
         qk_norm_val,
         softcap_val,
@@ -152,7 +118,6 @@ fn prefill_q4k_moe(
     weights: &ModelWeights,
     backend: &dyn ComputeBackend,
     layers: &[FullPipelineLayer],
-    attention: AttentionGeometry,
     hidden: usize,
     intermediate: usize,
     token_ids: &[u32],
@@ -171,20 +136,7 @@ fn prefill_q4k_moe(
         let get_expert =
             |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx);
         last_h = backend
-            .decode_token_q4k_moe(
-                layers,
-                &x_pos,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                norm_eps,
-                &get_expert,
-            )
+            .decode_token_q4k_moe(layers, &x_pos, hidden, intermediate, norm_eps, &get_expert)
             .unwrap_or_else(|| vec![0.0f32; hidden]);
     }
     let mut out = vec![0.0f32; seq_len * hidden];
@@ -202,23 +154,11 @@ mod tests {
     use super::*;
     use crate::test_utils::make_test_weights;
 
-    fn synth_attention(weights: &crate::model::ModelWeights) -> AttentionGeometry {
-        AttentionGeometry {
-            q_dim: weights.num_q_heads * weights.head_dim,
-            kv_dim: weights.num_kv_heads * weights.head_dim,
-            num_q_heads: weights.num_q_heads,
-            num_kv_heads: weights.num_kv_heads,
-            head_dim: weights.head_dim,
-            rope_base: weights.rope_base as f32,
-        }
-    }
-
     #[test]
     fn prefill_q4k_moe_rejects_backend_without_decode_q4k_moe_capability() {
         // CpuBackend doesn't support `Capability::DecodeQ4KMoe` → the
         // guard fires and returns Err before touching layers.
         let weights = make_test_weights();
-        let attention = synth_attention(&weights);
         let layers: Vec<FullPipelineLayer<'_>> = Vec::new();
         let token_ids = vec![0u32, 1];
         let x = vec![0.0f32; 2 * weights.hidden_size];
@@ -226,7 +166,6 @@ mod tests {
             &weights,
             &larql_compute::CpuBackend,
             &layers,
-            attention,
             weights.hidden_size,
             weights.intermediate_size,
             &token_ids,

@@ -18,6 +18,15 @@ pub(crate) const DEFAULT_KV_CACHE_MAX_SEQ: usize = 4096;
 
 impl MetalBackend {
     /// Create a KV cache for decode mode with uniform per-layer dims.
+    ///
+    /// Production decode/prefill should use [`Self::create_kv_cache_per_layer`]
+    /// (or, on the trait surface, `preallocate_kv_cache_per_layer`) so models
+    /// like Gemma 4 31B with sliding/global geometry alternation are sized
+    /// correctly. This uniform helper is retained for synthetic-architecture
+    /// tests and the lazy bootstrap inside `populate_kv_layer`, where the
+    /// caller passes a single layer's `(num_kv_heads, head_dim)` and any
+    /// subsequent layers are pushed via `kv.layers.push(...)` with their own
+    /// per-layer dims.
     pub fn create_kv_cache(
         &self,
         num_layers: usize,
@@ -696,6 +705,51 @@ impl MetalBackend {
             cmd.commit();
             cmd.wait_until_completed();
             gpu_time.record(&cmd);
+        }
+
+        // Diagnostic: dump per-call h after each layer, gated on
+        // LARQL_PERCALL_LAYER_DUMP_DIR. Filename includes the call index
+        // and layer index. Useful for pinpointing which call+layer
+        // first diverges from CPU.
+        if let Ok(dir) = std::env::var("LARQL_PERCALL_LAYER_DUMP_DIR") {
+            for (idx, kv_layer) in kv_cache.layers.iter().enumerate() {
+                if kv_layer.current_len == 0 {
+                    continue;
+                }
+                let total = kv_layer.current_len * kv_layer.num_kv_heads * kv_layer.head_dim;
+                let k_floats = super::buffers::read_buffer_f32(&kv_layer.k_cache, total);
+                let k_bytes: Vec<u8> = k_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(
+                    format!("{dir}/metal_call{call_n:03}_L{idx:02}_K.f32"),
+                    &k_bytes,
+                );
+            }
+            // Dump h_buf (layer-output residual fed into next decode).
+            let h_floats = super::buffers::read_buffer_f32(h_buf, hidden);
+            let h_bytes: Vec<u8> = h_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/metal_call{call_n:03}_h_final.f32"), &h_bytes);
+            // Dump x (the input embed for this call) for comparison vs CPU
+            // batched-prefill embed at the same position.
+            let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/metal_call{call_n:03}_x_input.f32"), &x_bytes);
+        }
+        // Diagnostic: dump source-layer K/V caches when LARQL_KV_CACHE_DUMP_DIR
+        // is set. Fires at the end of every decode_token call (file gets
+        // overwritten — last call wins). Useful for byte-level comparison
+        // against CPU's k_rope/v_final output for the same prompt.
+        if let Ok(dir) = std::env::var("LARQL_KV_CACHE_DUMP_DIR") {
+            for (idx, kv_layer) in kv_cache.layers.iter().enumerate() {
+                if kv_layer.current_len == 0 {
+                    continue;
+                }
+                let total = kv_layer.current_len * kv_layer.num_kv_heads * kv_layer.head_dim;
+                let k_floats = super::buffers::read_buffer_f32(&kv_layer.k_cache, total);
+                let v_floats = super::buffers::read_buffer_f32(&kv_layer.v_cache, total);
+                let k_bytes: Vec<u8> = k_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let v_bytes: Vec<u8> = v_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("{dir}/metal_L{idx:02}_K_cache.f32"), &k_bytes);
+                let _ = std::fs::write(format!("{dir}/metal_L{idx:02}_V_cache.f32"), &v_bytes);
+            }
         }
 
         let result = super::buffers::read_buffer_f32(h_buf, hidden);

@@ -188,9 +188,9 @@ pub fn patch_and_trace_with_ffn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_test_weights;
     use crate::forward::trace::trace_forward_full;
     use crate::model::ModelWeights;
+    use crate::test_utils::make_test_weights;
     use std::sync::OnceLock;
 
     fn shared_weights() -> &'static ModelWeights {
@@ -370,8 +370,8 @@ mod tests {
         // and the coord is silently dropped (the `continue` branch).
         let weights = shared_weights();
         let coords = vec![
-            (0usize, 0usize),                // valid
-            (weights.num_layers + 9, 0),     // beyond model depth — None branch
+            (0usize, 0usize),            // valid
+            (weights.num_layers + 9, 0), // beyond model depth — None branch
         ];
         let donor = capture_donor_state(weights, &[0u32, 1], &coords);
         assert!(donor.records.contains_key(&(0, 0)));

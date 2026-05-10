@@ -55,6 +55,7 @@ fn build_router<'a>(
 /// Requires a Metal (or Q4-capable) backend — attention and dense FFN run on
 /// the GPU exactly as in the normal `generate()` path.  Expert blocks are
 /// dispatched to `remote` instead of running locally.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_with_remote_moe(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -71,7 +72,6 @@ pub fn generate_with_remote_moe(
     let eps = arch.norm_eps();
     let setup = build_grid_pipeline_setup(weights, index, RemotePatch::Moe)?;
     let layers = setup.layers;
-    let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
 
@@ -161,19 +161,7 @@ pub fn generate_with_remote_moe(
             }
         };
 
-        let h = backend.decode_token_with_moe(
-            &layers,
-            &x_tok,
-            hidden,
-            intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
-            &mut moe_fn,
-        );
+        let h = backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut moe_fn);
         if let Some(err) = step_error {
             return Err(err);
         }
@@ -290,19 +278,7 @@ pub fn generate_with_remote_moe(
                     }
                 }
             };
-            backend.decode_token_with_moe(
-                &layers,
-                &x_tok,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                &mut moe_fn,
-            )
+            backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut moe_fn)
         } else {
             // Split path: shared inflight handle + step_error via RefCell
             // because both closures capture them and can't both have unique
@@ -375,12 +351,6 @@ pub fn generate_with_remote_moe(
                 &x_tok,
                 hidden,
                 intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
                 &mut fire_fn,
                 &mut collect_fn,
             );
@@ -504,6 +474,7 @@ pub fn generate_with_remote_moe(
 ///
 /// Values above 2 have diminishing returns. 1 is the speed default; 2 is
 /// the quality default.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_with_remote_moe_batch(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -522,7 +493,6 @@ pub fn generate_with_remote_moe_batch(
     let eps = arch.norm_eps();
     let setup = build_grid_pipeline_setup(weights, index, RemotePatch::Moe)?;
     let layers = setup.layers;
-    let attention = setup.attention;
     let hidden = setup.hidden;
     let intermediate = setup.intermediate;
     let num_layers = setup.num_layers;
@@ -558,19 +528,7 @@ pub fn generate_with_remote_moe_batch(
                 }
                 vec![0.0f32; hidden]
             };
-            backend.decode_token_with_moe(
-                &layers,
-                &x_tok,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                &mut moe_pass0,
-            );
+            backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut moe_pass0);
         }
         if !skip_moe {
             backend.truncate_kv_cache(kv_len);
@@ -598,19 +556,7 @@ pub fn generate_with_remote_moe_batch(
                     }
                     h2r.get(l).cloned().unwrap_or_else(|| vec![0.0f32; hidden])
                 };
-                backend.decode_token_with_moe(
-                    &layers,
-                    &x_tok,
-                    hidden,
-                    intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
-                    &mut fn_apply,
-                );
+                backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut fn_apply);
                 backend.truncate_kv_cache(kv_len);
                 h_capture = new_cap;
             } else {
@@ -623,12 +569,6 @@ pub fn generate_with_remote_moe_batch(
                     &x_tok,
                     hidden,
                     intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
                     &mut fn_final,
                 );
             }
@@ -707,19 +647,7 @@ pub fn generate_with_remote_moe_batch(
                 }
                 vec![0.0f32; hidden]
             };
-            backend.decode_token_with_moe(
-                &layers,
-                &x_tok,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-                &mut moe_pass0,
-            );
+            backend.decode_token_with_moe(&layers, &x_tok, hidden, intermediate, &mut moe_pass0);
         }
         if !skip_moe {
             // Roll back KV — only the final apply pass should advance it.
@@ -735,12 +663,6 @@ pub fn generate_with_remote_moe_batch(
                     &x_tok,
                     hidden,
                     intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
                     &mut |_layer: usize, _h: &[f32]| vec![0.0f32; hidden],
                 )
                 .ok_or_else(|| RemoteMoeError::BadResponse("skip_moe pass returned None".into()))?;
@@ -800,12 +722,6 @@ pub fn generate_with_remote_moe_batch(
                     &x_tok,
                     hidden,
                     intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
                     &mut moe_apply,
                 );
                 backend.truncate_kv_cache(kv_len);
@@ -824,12 +740,6 @@ pub fn generate_with_remote_moe_batch(
                     &x_tok,
                     hidden,
                     intermediate,
-                    attention.q_dim,
-                    attention.kv_dim,
-                    attention.num_q_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                    attention.rope_base,
                     &mut moe_final,
                 );
             }

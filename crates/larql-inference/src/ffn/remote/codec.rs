@@ -138,7 +138,7 @@ pub fn decode_binary_single(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
     let layer = marker as usize;
     // bytes 4-7: seq_len (ignored here — caller validates against expected shape)
     // bytes 8-11: latency f32
-    if (body.len() - 12) % 4 != 0 {
+    if !(body.len() - 12).is_multiple_of(4) {
         return Err("binary response: output byte length is not a multiple of f32".into());
     }
     let floats: Vec<f32> = body[12..]
@@ -208,7 +208,7 @@ pub fn decode_binary_single_f16(body: &[u8]) -> Result<(usize, Vec<f32>), String
         return Err("expected single-layer f16 response but got batch marker".into());
     }
     let layer = marker as usize;
-    if (body.len() - 12) % 2 != 0 {
+    if !(body.len() - 12).is_multiple_of(2) {
         return Err("f16 binary response: output byte length is not a multiple of f16".into());
     }
     let floats: Vec<f32> = body[12..]
@@ -709,10 +709,8 @@ mod tests {
         buf
     }
 
-    fn make_batch_response_i8(
-        latency: f32,
-        entries: &[(u32, u32, &[(f32, &[i8])])],
-    ) -> Vec<u8> {
+    #[allow(clippy::type_complexity)]
+    fn make_batch_response_i8(latency: f32, entries: &[(u32, u32, &[(f32, &[i8])])]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&BATCH_MARKER.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -738,8 +736,7 @@ mod tests {
     #[test]
     fn decode_single_i8_round_trip_one_position() {
         let hidden = 4;
-        let body =
-            make_single_response_i8(5, 1, 1.0, &[(0.5, &[2i8, -4, 8, -8])]);
+        let body = make_single_response_i8(5, 1, 1.0, &[(0.5, &[2i8, -4, 8, -8])]);
         let (layer, floats) = decode_binary_single_i8(&body, hidden).unwrap();
         assert_eq!(layer, 5);
         assert_eq!(floats, vec![1.0f32, -2.0, 4.0, -4.0]);
@@ -752,11 +749,7 @@ mod tests {
             0,
             3,
             0.0,
-            &[
-                (1.0, &[10i8, 20]),
-                (0.25, &[-4i8, 8]),
-                (2.0, &[1i8, -1]),
-            ],
+            &[(1.0, &[10i8, 20]), (0.25, &[-4i8, 8]), (2.0, &[1i8, -1])],
         );
         let (_, floats) = decode_binary_single_i8(&body, hidden).unwrap();
         assert_eq!(floats, vec![10.0, 20.0, -1.0, 2.0, 2.0, -2.0]);

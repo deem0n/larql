@@ -240,7 +240,6 @@ pub fn predict_with_ffn_trace(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +248,7 @@ mod tests {
 
     #[test]
     fn cmp_desc_nan_last_orders_descending_with_nan_last() {
-        let mut v = vec![(0, 1.0f32), (1, 3.0), (2, f32::NAN), (3, 2.0)];
+        let mut v = [(0, 1.0f32), (1, 3.0), (2, f32::NAN), (3, 2.0)];
         v.sort_by(cmp_desc_nan_last);
         // 3.0 first (highest), 2.0, 1.0, NaN last.
         let order: Vec<usize> = v.iter().map(|(i, _)| *i).collect();
@@ -337,9 +336,7 @@ mod tests {
         let r_pub = logits_to_predictions_pub(&fx.weights, &h, &fx.tokenizer, 5, 1.0);
         let r_priv = logits_to_predictions(&fx.weights, &h, &fx.tokenizer, 5, 1.0);
         assert_eq!(r_pub.predictions.len(), r_priv.predictions.len());
-        for ((a_t, a_p), (b_t, b_p)) in
-            r_pub.predictions.iter().zip(r_priv.predictions.iter())
-        {
+        for ((a_t, a_p), (b_t, b_p)) in r_pub.predictions.iter().zip(r_priv.predictions.iter()) {
             assert_eq!(a_t, b_t);
             assert!((a_p - b_p).abs() < 1e-6);
         }

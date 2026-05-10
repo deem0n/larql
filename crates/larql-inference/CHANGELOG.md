@@ -9,6 +9,100 @@ pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 Entries migrated from ROADMAP.md on 2026-05-10; pre-2026-05-10 entries
 preserve the date and voice they were originally written in.
 
+## [2026-05-10] — A1+A2+A3 model architecture independence hardening
+
+Closed the "Open: Model architecture independence hardening" section of
+ROADMAP.md. Reproduced Gemma 4 31B Q4K Metal end-to-end first — it
+generates correctly ("The capital of France is" → "Paris...";
+"Write a haiku about ocean waves." → "Blue walls rise up high, /
+Crashing down in salty foam, / Returning to sea."). The roadmap's
+"L5 immediate-EOS" claim was stale: the heterogeneous-attention safety
+had quietly landed via per-layer reads in
+`metal/decode/setup.rs:DecodeScratch::new` (q_out / k_out / v_out
+sized to `max(layers[*].q_dim)`),
+`metal/ops/full_pipeline/buffers.rs:LayerBuffers::allocate` (prefill
+same), and `MetalBackend::ensure_kv_cache_for_layers` (KV cache
+per-layer). A1/A2/A3 are now the deferred cleanup pass on top.
+
+### A1 — `Capability::HeterogeneousAttention` runtime gate
+
+- Added `Capability::HeterogeneousAttention` to
+  `crates/larql-compute/src/backend/capability.rs`. Default
+  `ComputeBackend::supports` returns `false`; `MetalBackend` opts in.
+- `crates/larql-inference/src/layer_graph/generate/gpu_setup.rs`
+  exposes `has_heterogeneous_attention(weights)` (probes
+  `head_dim_for_layer`, `num_kv_heads_for_layer`, `num_q_heads_for_layer`,
+  `rope_base_for_layer`, `rotary_fraction_for_layer`, and
+  `is_sliding_window_layer` against layer 0) plus
+  `ensure_attention_supported(weights, backend)`. The gate fires inside
+  `build_gpu_decode_setup` before the first decode dispatch, so a
+  future non-Metal Q4 backend that hasn't audited heterogeneous
+  geometry returns a precise `GenerateError::UnsupportedBackend`
+  instead of silently corrupting KV state at the first non-uniform
+  layer.
+
+### A2 — drop vestigial scalar geometry from `DecodeBackend`
+
+The trait surface previously took `q_dim`, `kv_dim`, `num_q_heads`,
+`num_kv_heads`, `head_dim`, and `rope_base` on every decode/prefill
+method. Every implementation already underscored them in favour of
+per-layer reads from `FullPipelineLayer`; the scalars were dead weight
+that invited future regressions. Dropped from these methods:
+
+- `full_pipeline_q4`, `full_pipeline_q4_with_head_replacement`,
+  `full_pipeline_q4_capture_pre_wo`
+- `decode_token`, `decode_token_with_moe`, `decode_token_q4k_moe`,
+  `decode_token_with_moe_split`, `decode_token_split_profile`
+- `prefill_q4`, `prefill_q4_with_head_replacement`
+
+`populate_kv_layer` retained `(num_kv_heads, head_dim)` because those
+**are** per-layer geometry for the layer being populated, not vestigial
+scalars; callers (prefill, honest predict) already pass per-layer
+values via `arch.num_kv_heads_for_layer(layer)`.
+
+The Metal trait impl forwards to the existing inner free-fns
+(`MetalBackend::decode_token`, `dispatch_full_pipeline`, etc.) by
+synthesising legacy values from `layers[0]` so the inner free-fns and
+their existing test/example callers stay source-stable. Inside the
+Metal trait impl the `PipelineIntervention` head_dim / num_q_heads
+fields now come from `layers[target_layer]` (per-layer correct) rather
+than `layers[0]` — silently fixed a latent bug for head intervention
+on global-attention layers of Gemma 4.
+
+Inference-side cleanup: `AttentionGeometry` and the helpers
+`attention_geometry_for_arch_layer` /
+`attention_geometry_for_pipeline_layer` are deleted (zero remaining
+users). All threading through `gpu_setup`, `gpu/{decode_loop,
+prefill, forced_logits, mod}`, `constrained`, `grid/{remote_ffn,
+remote_moe, setup}`, `predict/honest`, `residual_diff/{capture,
+stages}`, and `vindex/q4k_forward/metal` simplified.
+`larql-kv::engines::unlimited_context::engine` updated for the same
+shape.
+
+### A3 — KV cache audit (already shipped, documented)
+
+Production decode/prefill all reach the per-layer KV cache via
+`reset_and_preallocate_kv_cache` →
+`ComputeBackend::preallocate_kv_cache_per_layer`, and any later
+`populate_kv_layer` calls take the layer's own `(num_kv_heads,
+head_dim)`. `MetalBackend::create_kv_cache` (the legacy uniform
+helper) is now used only by synthetic-architecture tests + the lazy
+bootstrap inside `populate_kv_layer`; added a doc-comment to
+`metal/decode/mod.rs` steering future readers to
+`create_kv_cache_per_layer`.
+
+### Tests
+
+- `larql-inference --lib`: 907 passed (was 904) after A1 helpers and
+  the import fix in `pipeline_layer.rs::tests`.
+- `larql-compute --lib`: 162 passed.
+- `larql-compute --tests`: green except a pre-existing
+  `quant_matvec_defaults_forward_and_dequantise_q8_tail` failure that
+  also fails on HEAD (unrelated to A1-A3).
+- `larql-kv --lib`: 200 passed.
+- 31B end-to-end smoke: `larql run` on `gemma4-31b-q4k.vindex`
+  generates coherent text through the new trait surface (post-A1/A2/A3).
+
 ## [2026-05-10] — Coverage push round 2: 52.80% → 65.67% line (+12.87 pp), 2 bug fixes
 
 Continued the targeted-test sweep with **MockArch fixtures** (Gemma3-style

@@ -346,13 +346,7 @@ impl DecodeBackend for ForwardingDecodeBackend {
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
         seq_len: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         _use_qk_norm: bool,
         _softcap: f32,
     ) -> Option<Vec<f32>> {
@@ -367,12 +361,6 @@ impl DecodeBackend for ForwardingDecodeBackend {
         x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
     ) -> Option<Vec<f32>> {
         self.decode_calls.set(self.decode_calls.get() + 1);
         Some(x.to_vec())
@@ -384,12 +372,6 @@ impl DecodeBackend for ForwardingDecodeBackend {
         x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
         self.moe_calls.set(self.moe_calls.get() + 1);
@@ -402,13 +384,7 @@ impl DecodeBackend for ForwardingDecodeBackend {
         x: &[f32],
         _hidden: usize,
         _inter: usize,
-        _q_dim: usize,
-        _kv_dim: usize,
         seq_len: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _rope_base: f32,
         _use_qk_norm: bool,
         _softcap: f32,
     ) -> Option<Vec<f32>> {
@@ -468,33 +444,19 @@ fn decode_defaults_forward_to_specialized_entrypoints() {
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
 
     assert_eq!(
-        be.full_pipeline_q4_with_head_replacement(
-            &layers, &x, 4, 8, 4, 4, 3, 1, 1, 4, 10_000.0, false, 0.0, 2, 0, &x,
-        )
-        .unwrap(),
+        be.full_pipeline_q4_with_head_replacement(&layers, &x, 4, 8, 3, false, 0.0, 2, 0, &x,)
+            .unwrap(),
         vec![3.0]
     );
     assert_eq!(be.full_pipeline_calls.get(), 1);
 
     let mut ignored = 0usize;
     assert_eq!(
-        be.decode_token_with_moe(
-            &layers,
-            &x,
-            4,
-            8,
-            4,
-            4,
-            1,
-            1,
-            4,
-            10_000.0,
-            &mut |layer, h| {
-                ignored += layer + h.len();
-                vec![9.0; h.len()]
-            },
-        )
-        .unwrap(),
+        be.decode_token_with_moe(&layers, &x, 4, 8, &mut |layer, h| {
+            ignored += layer + h.len();
+            vec![9.0; h.len()]
+        },)
+            .unwrap(),
         vec![9.0; 4]
     );
     assert_eq!(be.moe_calls.get(), 1);
@@ -508,12 +470,6 @@ fn decode_defaults_forward_to_specialized_entrypoints() {
             &x,
             4,
             8,
-            4,
-            4,
-            1,
-            1,
-            4,
-            10_000.0,
             &mut |layer, h| fired += layer + h.len(),
             &mut |layer| {
                 collected += layer;
@@ -526,16 +482,14 @@ fn decode_defaults_forward_to_specialized_entrypoints() {
     assert_eq!((fired, collected), (11, 7));
 
     assert_eq!(
-        be.decode_token_split_profile(&layers, &x, 4, 8, 4, 4, 1, 1, 4, 10_000.0),
+        be.decode_token_split_profile(&layers, &x, 4, 8),
         (Some(x.clone()), 0.0, 0.0, 0.0)
     );
     assert_eq!(be.decode_calls.get(), 1);
 
     assert_eq!(
-        be.prefill_q4_with_head_replacement(
-            &layers, &x, 4, 8, 4, 4, 2, 1, 1, 4, 10_000.0, false, 0.0, 0, 0, &x,
-        )
-        .unwrap(),
+        be.prefill_q4_with_head_replacement(&layers, &x, 4, 8, 2, false, 0.0, 0, 0, &x,)
+            .unwrap(),
         vec![1.0, 2.0]
     );
     assert_eq!(be.prefill_calls.get(), 1);
@@ -632,37 +586,21 @@ fn default_decode_stubs() {
     be.truncate_kv_cache(0);
     be.reset_kv_cache(); // default no-op, must not panic
     assert!(be
-        .full_pipeline_q4(&layers, &x, 4, 8, 4, 4, 1, 1, 1, 4, 10_000.0, false, 0.0)
+        .full_pipeline_q4(&layers, &x, 4, 8, 1, false, 0.0)
         .is_none());
     assert!(be
-        .full_pipeline_q4_with_head_replacement(
-            &layers, &x, 4, 8, 4, 4, 1, 1, 1, 4, 10_000.0, false, 0.0, 0, 0, &x,
-        )
+        .full_pipeline_q4_with_head_replacement(&layers, &x, 4, 8, 1, false, 0.0, 0, 0, &x,)
         .is_none());
     assert!(be.multi_layer_q4_ffn(&[], &x, 8, 4).is_none());
-    assert!(be
-        .decode_token(&layers, &x, 4, 8, 4, 4, 1, 1, 4, 10_000.0)
-        .is_none());
+    assert!(be.decode_token(&layers, &x, 4, 8).is_none());
 
     let mut fired = 0usize;
     let mut collected = 0usize;
     assert!(be
-        .decode_token_with_moe(
-            &layers,
-            &x,
-            4,
-            8,
-            4,
-            4,
-            1,
-            1,
-            4,
-            10_000.0,
-            &mut |layer, h| {
-                fired += layer + h.len();
-                vec![1.0; h.len()]
-            },
-        )
+        .decode_token_with_moe(&layers, &x, 4, 8, &mut |layer, h| {
+            fired += layer + h.len();
+            vec![1.0; h.len()]
+        },)
         .is_none());
     assert!(be
         .decode_token_with_moe_split(
@@ -670,12 +608,6 @@ fn default_decode_stubs() {
             &x,
             4,
             8,
-            4,
-            4,
-            1,
-            1,
-            4,
-            10_000.0,
             &mut |layer, h| {
                 fired += layer + h.len();
             },
@@ -687,20 +619,14 @@ fn default_decode_stubs() {
         .is_none());
     assert_eq!((fired, collected), (0, 0));
     assert_eq!(
-        be.decode_token_split_profile(&layers, &x, 4, 8, 4, 4, 1, 1, 4, 10_000.0),
+        be.decode_token_split_profile(&layers, &x, 4, 8),
         (None, 0.0, 0.0, 0.0)
     );
+    assert!(be.prefill_q4(&layers, &x, 4, 8, 1, false, 0.0).is_none());
     assert!(be
-        .prefill_q4(&layers, &x, 4, 8, 4, 4, 1, 1, 1, 4, 10_000.0, false, 0.0)
+        .full_pipeline_q4_capture_pre_wo(&layers, &x, 4, 8, 1, false, 0.0, 0, 0,)
         .is_none());
     assert!(be
-        .full_pipeline_q4_capture_pre_wo(
-            &layers, &x, 4, 8, 4, 4, 1, 1, 1, 4, 10_000.0, false, 0.0, 0, 0,
-        )
-        .is_none());
-    assert!(be
-        .prefill_q4_with_head_replacement(
-            &layers, &x, 4, 8, 4, 4, 1, 1, 1, 4, 10_000.0, false, 0.0, 0, 0, &x,
-        )
+        .prefill_q4_with_head_replacement(&layers, &x, 4, 8, 1, false, 0.0, 0, 0, &x,)
         .is_none());
 }

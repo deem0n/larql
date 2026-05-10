@@ -279,8 +279,8 @@ pub fn run_layer_with_capture_hooked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
+    use crate::test_utils::make_test_weights;
     use ndarray::Array2;
 
     fn h(rows: usize, hidden: usize) -> Array2<f32> {
@@ -353,7 +353,10 @@ mod tests {
         let inner_out = run_attention(&weights, &input, 0).unwrap();
         assert_eq!(pub_out.shape(), inner_out.shape());
         for (a, b) in pub_out.iter().zip(inner_out.iter()) {
-            assert!((a - b).abs() < 1e-6, "public/inner attention differ: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "public/inner attention differ: {a} vs {b}"
+            );
         }
     }
 

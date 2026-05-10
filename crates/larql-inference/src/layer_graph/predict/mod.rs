@@ -20,7 +20,7 @@ mod split;
 pub use honest::predict_honest;
 pub use split::{predict_split_cached, predict_split_pass};
 
-use super::{LayerGraph};
+use super::LayerGraph;
 use crate::model::ModelWeights;
 
 // Re-export moved functions for backward compatibility.
@@ -220,8 +220,8 @@ mod tests {
     fn predict_with_ffn_returns_predictions() {
         let f = fx();
         let (weights, tokenizer) = (&f.weights, &f.tokenizer);
-        let ffn = WeightFfn { weights: &weights };
-        let result = crate::forward::predict_with_ffn(&weights, &tokenizer, &[0u32, 1], 3, &ffn);
+        let ffn = WeightFfn { weights };
+        let result = crate::forward::predict_with_ffn(weights, tokenizer, &[0u32, 1], 3, &ffn);
         assert!(result.token_ids.len() <= 3);
         assert_eq!(result.predictions.len(), result.token_ids.len());
         assert!(result
@@ -234,8 +234,8 @@ mod tests {
     fn predict_with_ffn_single_token() {
         let f = fx();
         let (weights, tokenizer) = (&f.weights, &f.tokenizer);
-        let ffn = WeightFfn { weights: &weights };
-        let result = crate::forward::predict_with_ffn(&weights, &tokenizer, &[5u32], 1, &ffn);
+        let ffn = WeightFfn { weights };
+        let result = crate::forward::predict_with_ffn(weights, tokenizer, &[5u32], 1, &ffn);
         assert!(result.token_ids.len() <= 1);
     }
 
@@ -249,11 +249,11 @@ mod tests {
         let num_layers = weights.num_layers;
         // predict_honest falls through to CPU path (no Q4K data in synthetic vindex)
         let result = predict_honest(
-            &weights,
-            &tokenizer,
+            weights,
+            tokenizer,
             &[0u32, 1, 2],
             5,
-            &index,
+            index,
             &CpuBackend,
             &cached,
             0..num_layers,
@@ -269,11 +269,11 @@ mod tests {
         let cached = CachedLayerGraph::from_residuals(vec![]);
         let num_layers = weights.num_layers;
         let result = predict_honest(
-            &weights,
-            &tokenizer,
+            weights,
+            tokenizer,
             &[3u32],
             3,
-            &index,
+            index,
             &CpuBackend,
             &cached,
             0..num_layers,
@@ -285,16 +285,16 @@ mod tests {
     fn predict_honest_with_cached_layers() {
         let f = fx();
         let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
-        let ffn = WeightFfn { weights: &weights };
+        let ffn = WeightFfn { weights };
         // Pre-cache layer 0
-        let cached = CachedLayerGraph::build(&weights, &[0u32], &[0], &ffn);
+        let cached = CachedLayerGraph::build(weights, &[0u32], &[0], &ffn);
         let num_layers = weights.num_layers;
         let result = predict_honest(
-            &weights,
-            &tokenizer,
+            weights,
+            tokenizer,
             &[0u32],
             3,
-            &index,
+            index,
             &CpuBackend,
             &cached,
             0..num_layers,
@@ -308,7 +308,7 @@ mod tests {
     fn dense_layer_graph_forward_runs() {
         use crate::layer_graph::{DenseLayerGraph, LayerGraph};
         let weights = &fx().weights;
-        let ffn = WeightFfn { weights: &weights };
+        let ffn = WeightFfn { weights };
         let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.1f32);
         let g = DenseLayerGraph {
             ffn: &ffn,
@@ -316,7 +316,7 @@ mod tests {
             capture_activation: false,
             capture_attention: false,
         };
-        let out = g.forward_layer(&weights, &h, 0);
+        let out = g.forward_layer(weights, &h, 0);
         assert!(out.is_some(), "DenseLayerGraph should forward layer 0");
         assert_eq!(out.unwrap().residual.shape(), &[2, weights.hidden_size]);
     }
@@ -325,7 +325,7 @@ mod tests {
     fn dense_layer_graph_all_layers() {
         use crate::layer_graph::{DenseLayerGraph, LayerGraph};
         let weights = &fx().weights;
-        let ffn = WeightFfn { weights: &weights };
+        let ffn = WeightFfn { weights };
         let h = ndarray::Array2::from_elem((1, weights.hidden_size), 0.5f32);
         let g = DenseLayerGraph {
             ffn: &ffn,
@@ -334,7 +334,7 @@ mod tests {
             capture_attention: false,
         };
         for layer in 0..weights.num_layers {
-            let out = g.forward_layer(&weights, &h, layer);
+            let out = g.forward_layer(weights, &h, layer);
             assert!(out.is_some(), "layer {layer} should succeed");
         }
     }
@@ -345,13 +345,13 @@ mod tests {
     fn walk_layer_graph_forward_runs() {
         use crate::layer_graph::{LayerGraph, WalkLayerGraph};
         let weights = &fx().weights;
-        let ffn = WeightFfn { weights: &weights };
+        let ffn = WeightFfn { weights };
         let g = WalkLayerGraph {
             ffn: &ffn,
             backend: None,
         };
         let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.1f32);
-        let out = g.forward_layer(&weights, &h, 0);
+        let out = g.forward_layer(weights, &h, 0);
         assert!(out.is_some());
         assert_eq!(out.unwrap().residual.shape(), &[2, weights.hidden_size]);
     }
@@ -363,14 +363,14 @@ mod tests {
         use crate::layer_graph::LayerGraph;
         let f = fx();
         let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
-        let ffn = WeightFfn { weights: &weights };
+        let ffn = WeightFfn { weights };
         let g = crate::layer_graph::WalkLayerGraph {
             ffn: &ffn,
             backend: None,
         };
         let graph: &dyn LayerGraph = &g;
         // predict_pipeline takes Option<&VectorIndex>
-        let result = predict_pipeline(&weights, &tokenizer, &[0u32, 1], 3, graph, Some(&index));
+        let result = predict_pipeline(weights, tokenizer, &[0u32, 1], 3, graph, Some(index));
         assert!(result.token_ids.len() <= 3);
     }
 
@@ -381,13 +381,13 @@ mod tests {
         use crate::layer_graph::LayerGraph;
         let f = fx();
         let (weights, tokenizer) = (&f.weights, &f.tokenizer);
-        let ffn = WeightFfn { weights: &weights };
+        let ffn = WeightFfn { weights };
         let g = crate::layer_graph::WalkLayerGraph {
             ffn: &ffn,
             backend: None,
         };
         let graph: &dyn LayerGraph = &g;
-        let result = predict_pipeline(&weights, &tokenizer, &[0u32], 3, graph, None);
+        let result = predict_pipeline(weights, tokenizer, &[0u32], 3, graph, None);
         assert!(result.predictions.len() <= 3);
     }
 
@@ -406,8 +406,7 @@ mod tests {
         };
         let graph: &dyn LayerGraph = &g;
         // Synthetic index has no lm_head data populated.
-        let result =
-            predict_pipeline(&f.weights, &f.tokenizer, &[0u32], 3, graph, Some(&f.index));
+        let result = predict_pipeline(&f.weights, &f.tokenizer, &[0u32], 3, graph, Some(&f.index));
         assert!(result.predictions.len() <= 3);
     }
 
@@ -439,12 +438,7 @@ mod tests {
             backend: None,
         };
         let graph: &dyn LayerGraph = &g;
-        let trace = trace_with_graph(
-            &f.weights,
-            &[0u32, 1, 2],
-            &[0, 1],
-            graph,
-        );
+        let trace = trace_with_graph(&f.weights, &[0u32, 1, 2], &[0, 1], graph);
         assert_eq!(trace.residuals.len(), 2);
         assert_eq!(trace.residuals[0].0, 0);
         assert_eq!(trace.residuals[1].0, 1);

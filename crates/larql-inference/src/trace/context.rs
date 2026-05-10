@@ -538,16 +538,9 @@ mod tests {
         let path = fresh_path("ffn_deltas");
         let hidden = 4;
         let critical = vec![0usize, 1, 2];
-        let mut w = ContextWriter::create(
-            &path,
-            hidden,
-            3,
-            10,
-            ContextTier::FfnDeltas,
-            &critical,
-            5,
-        )
-        .unwrap();
+        let mut w =
+            ContextWriter::create(&path, hidden, 3, 10, ContextTier::FfnDeltas, &critical, 5)
+                .unwrap();
         let residual = vec![1.0f32; hidden];
         let ffn_deltas: Vec<Vec<f32>> = (0..critical.len())
             .map(|i| (0..hidden).map(|j| (i * 10 + j) as f32).collect())
@@ -561,8 +554,8 @@ mod tests {
         for cl in 0..critical.len() {
             let d = store.ffn_delta(0, cl).expect("ffn delta");
             assert_eq!(d.len(), hidden);
-            for j in 0..hidden {
-                assert!((d[j] - (cl * 10 + j) as f32).abs() < 1e-6);
+            for (j, &v) in d.iter().enumerate().take(hidden) {
+                assert!((v - (cl * 10 + j) as f32).abs() < 1e-6);
             }
         }
         // Out-of-range cl_idx → None.
@@ -577,10 +570,8 @@ mod tests {
         let path = fresh_path("full");
         let hidden = 4;
         let critical = vec![0usize, 1];
-        let mut w = ContextWriter::create(
-            &path, hidden, 2, 10, ContextTier::Full, &critical, 5,
-        )
-        .unwrap();
+        let mut w =
+            ContextWriter::create(&path, hidden, 2, 10, ContextTier::Full, &critical, 5).unwrap();
         let residual = vec![2.0f32; hidden];
         let ffn: Vec<Vec<f32>> = (0..critical.len())
             .map(|i| (0..hidden).map(|j| (100 + i * 10 + j) as f32).collect())
@@ -606,10 +597,8 @@ mod tests {
     fn token_range_and_boundary_for_token() {
         let path = fresh_path("ranges");
         let hidden = 4;
-        let mut w = ContextWriter::create(
-            &path, hidden, 1, 100, ContextTier::Residual, &[], 50,
-        )
-        .unwrap();
+        let mut w =
+            ContextWriter::create(&path, hidden, 1, 100, ContextTier::Residual, &[], 50).unwrap();
         // Two windows: [0..50) and [50..100).
         w.append(0, 50, &vec![0.0; hidden], &[], &[]).unwrap();
         w.append(50, 50, &vec![0.0; hidden], &[], &[]).unwrap();
@@ -666,8 +655,7 @@ mod tests {
         let path = fresh_path("oob");
         let hidden = 4;
         let mut w =
-            ContextWriter::create(&path, hidden, 1, 10, ContextTier::Residual, &[], 5)
-                .unwrap();
+            ContextWriter::create(&path, hidden, 1, 10, ContextTier::Residual, &[], 5).unwrap();
         w.append(0, 10, &vec![1.0f32; hidden], &[], &[]).unwrap();
         w.finish().unwrap();
 

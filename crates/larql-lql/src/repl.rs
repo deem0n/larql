@@ -502,12 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn banner_constant_is_non_empty() {
-        // Sanity: BANNER is rendered at REPL start-up; an empty banner
-        // would point to a refactor regression on the constants block.
-        assert!(!super::BANNER.is_empty());
+    fn banner_constants_have_expected_shape() {
+        // Sanity: BANNER is rendered at REPL start-up; the PROMPT
+        // ends with "> " so users can tell the REPL is taking input,
+        // and CONTINUATION is at least as wide so multi-line entries
+        // visually line up with the continuation prompt.
+        assert!(super::BANNER.contains("Lazarus") || super::BANNER.contains("LARQL"));
         assert!(super::PROMPT.contains(">"));
-        assert!(!super::CONTINUATION.is_empty());
+        assert_eq!(super::PROMPT.len(), super::CONTINUATION.len());
     }
 
     // ── History-path helpers ───────────────────────────────────────

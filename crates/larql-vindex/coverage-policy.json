@@ -43,6 +43,8 @@
     "crates/larql-vindex/src/index/storage/ffn_store/q4k_cache.rs": 80.0,
     "crates/larql-vindex/src/index/storage/gate_store.rs": 89.0,
     "crates/larql-vindex/src/index/storage/lm_head/knn.rs": 84.0,
+    "crates/larql-vindex/src/index/types/ffn_row/mod.rs": 87.0,
+    "crates/larql-vindex/src/index/types/ffn_row/test_support.rs": 84.0,
     "crates/larql-vindex/src/patch/overlay.rs": 82.0,
     "crates/larql-vindex/src/quant/convert.rs": 81.9,
     "crates/larql-vindex/src/quant/convert_q4k.rs": 56.1,

@@ -4,27 +4,54 @@
 //! prefill paths. Most of them delegate to dispatchers under
 //! `metal::ops::full_pipeline` or to inherent helpers on
 //! `MetalBackend` (e.g. `decode_token`, `decode_token_with_moe_fn`).
+//!
+//! The trait surface intentionally takes no scalar attention geometry —
+//! all geometry is read per-layer from `FullPipelineLayer` inside the
+//! dispatchers. The inner free-fns under `metal::decode` and
+//! `metal::ops::full_pipeline` retain their existing scalar parameters
+//! for synthetic-architecture tests; here we synthesise those values
+//! from `layers[0]` since the dispatchers ignore them on production
+//! paths anyway (per-layer reads are authoritative — see
+//! `metal/decode/setup.rs:DecodeScratch::new` and
+//! `metal/ops/full_pipeline/buffers.rs:LayerBuffers::allocate`).
 
 use crate::backend::DecodeBackend;
 use crate::metal::{ops, MetalBackend};
 
+/// `(q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base)` for
+/// layer 0 — passed to the inner dispatchers as legacy scalars. Only
+/// `q_dim` is read on a non-empty-layers path (as the empty-layers
+/// fallback for scratch sizing); the rest are underscored downstream.
+fn legacy_l0_geometry(
+    layers: &[crate::FullPipelineLayer<'_>],
+) -> (usize, usize, usize, usize, usize, f32) {
+    match layers.first() {
+        Some(l) => (
+            l.num_q_heads * l.head_dim,
+            l.num_kv_heads * l.head_dim,
+            l.num_q_heads,
+            l.num_kv_heads,
+            l.head_dim,
+            l.rope_base,
+        ),
+        None => (0, 0, 0, 0, 0, 0.0),
+    }
+}
+
 impl DecodeBackend for MetalBackend {
+    #[allow(clippy::too_many_arguments)]
     fn full_pipeline_q4(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let geglu = if layers
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
@@ -87,13 +114,7 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
         target_layer: usize,
@@ -101,6 +122,8 @@ impl DecodeBackend for MetalBackend {
         replacement_delta: &[f32],
     ) -> Option<Vec<f32>> {
         use ops::full_pipeline::{dispatch_full_pipeline, PipelineIntervention};
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let geglu = if layers
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
@@ -109,11 +132,17 @@ impl DecodeBackend for MetalBackend {
         } else {
             &self.ffn.geglu_pipeline
         };
+        // Intervention geometry must match the target layer (head_dim and
+        // num_q_heads can differ across sliding/global layers on Gemma 4).
+        let (target_head_dim, target_num_q_heads) = layers
+            .get(target_layer)
+            .map(|l| (l.head_dim, l.num_q_heads))
+            .unwrap_or((head_dim, num_q_heads));
         let intervention = PipelineIntervention {
             target_layer,
             target_head,
-            head_dim,
-            num_q_heads,
+            head_dim: target_head_dim,
+            num_q_heads: target_num_q_heads,
             replacement_delta,
             pre_wo_capture: std::cell::RefCell::new(Vec::new()),
             stop_after_capture: false,
@@ -178,22 +207,19 @@ impl DecodeBackend for MetalBackend {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prefill_q4(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let mut cache_guard = self.kv_cache.lock().unwrap();
         let kv = self.ensure_kv_cache_for_layers(
             &mut cache_guard,
@@ -336,19 +362,15 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
         target_layer: usize,
         target_head: usize,
     ) -> Option<Vec<f32>> {
         use ops::full_pipeline::{dispatch_full_pipeline, PipelineIntervention};
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let geglu = if layers
             .first()
             .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
@@ -357,11 +379,16 @@ impl DecodeBackend for MetalBackend {
         } else {
             &self.ffn.geglu_pipeline
         };
+        // Capture geometry must match the target layer.
+        let (target_head_dim, target_num_q_heads) = layers
+            .get(target_layer)
+            .map(|l| (l.head_dim, l.num_q_heads))
+            .unwrap_or((head_dim, num_q_heads));
         let intervention = PipelineIntervention {
             target_layer,
             target_head,
-            head_dim,
-            num_q_heads,
+            head_dim: target_head_dim,
+            num_q_heads: target_num_q_heads,
             replacement_delta: &[], // unused — stop_after_capture returns before hook B
             pre_wo_capture: std::cell::RefCell::new(Vec::new()),
             stop_after_capture: true, // stop after capture, return pre_wo via RefCell
@@ -427,19 +454,15 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         use_qk_norm: bool,
         softcap: f32,
         target_layer: usize,
         target_head: usize,
         replacement_delta: &[f32],
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let mut cache_guard = self.kv_cache.lock().unwrap();
         let kv = self.ensure_kv_cache_for_layers(
             &mut cache_guard,
@@ -450,21 +473,7 @@ impl DecodeBackend for MetalBackend {
         if has_moe {
             // MoE + intervention not yet supported — fall back to non-intervention prefill.
             drop(cache_guard);
-            return self.prefill_q4(
-                layers,
-                x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                seq_len,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                rope_base,
-                use_qk_norm,
-                softcap,
-            );
+            return self.prefill_q4(layers, x, hidden, inter, seq_len, use_qk_norm, softcap);
         }
         let geglu = if layers
             .first()
@@ -474,11 +483,16 @@ impl DecodeBackend for MetalBackend {
         } else {
             &self.ffn.geglu_pipeline
         };
+        // Intervention geometry must match the target layer.
+        let (target_head_dim, target_num_q_heads) = layers
+            .get(target_layer)
+            .map(|l| (l.head_dim, l.num_q_heads))
+            .unwrap_or((head_dim, num_q_heads));
         let intervention = ops::full_pipeline::PipelineIntervention {
             target_layer,
             target_head,
-            head_dim,
-            num_q_heads,
+            head_dim: target_head_dim,
+            num_q_heads: target_num_q_heads,
             replacement_delta,
             pre_wo_capture: std::cell::RefCell::new(Vec::new()),
             stop_after_capture: false,
@@ -618,13 +632,9 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let mut cache_guard = self.kv_cache.lock().unwrap();
         let kv = self.ensure_kv_cache_for_layers(
             &mut cache_guard,
@@ -653,14 +663,10 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let mut cache_guard = self.kv_cache.lock().unwrap();
         let kv = self.ensure_kv_cache_for_layers(
             &mut cache_guard,
@@ -690,15 +696,11 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         norm_eps: f32,
         get_expert: &dyn Fn(usize, usize) -> Option<(&'w [u8], &'w [u8])>,
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         MetalBackend::decode_token_q4k_moe(
             self,
             layers,
@@ -722,15 +724,11 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
         moe_fire_fn: &mut dyn FnMut(usize, &[f32]),
         moe_collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
         let mut cache_guard = self.kv_cache.lock().unwrap();
         let kv = self.ensure_kv_cache_for_layers(
             &mut cache_guard,
@@ -767,12 +765,6 @@ impl DecodeBackend for MetalBackend {
         x: &[f32],
         hidden: usize,
         inter: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_base: f32,
     ) -> (Option<Vec<f32>>, f64, f64, f64) {
         // Per-stage GPU timing comes from `decode_token_with_moe_split_fn`
         // when `LARQL_PROFILE_SPLIT=1` is set: paired commit/wait boundaries
@@ -783,30 +775,17 @@ impl DecodeBackend for MetalBackend {
         // get the actual split.
         use crate::metal::decode::profile;
         let t0 = std::time::Instant::now();
-        let result = <Self as DecodeBackend>::decode_token(
-            self,
-            layers,
-            x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            rope_base,
-        );
+        let result = <Self as DecodeBackend>::decode_token(self, layers, x, hidden, inter);
         let timings = profile::take_last_split_timings().unwrap_or_else(|| {
-            // Fallback: whole-token wall time in `attn_ms`. Caller likely
-            // forgot to set `LARQL_PROFILE_SPLIT=1`.
-            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            // Fall back: report whole-step wall in attn_ms so the caller sees
+            // a non-zero number when LARQL_PROFILE_SPLIT isn't set.
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
             profile::ProfileTimings {
-                attn_ms: total_ms,
+                attn_ms: wall_ms,
                 gate_up_ms: 0.0,
                 down_ms: 0.0,
             }
         });
-        eprintln!("{}", timings.format_summary(layers.len()));
         (result, timings.attn_ms, timings.gate_up_ms, timings.down_ms)
     }
 }

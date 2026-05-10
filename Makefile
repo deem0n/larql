@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-check-fast larql-compute-check-tests larql-compute-check-all larql-compute-test-metal-decode larql-compute-test-metal-lib larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples larql-kv-ci larql-kv-test larql-kv-fmt-check larql-kv-lint larql-kv-examples larql-kv-bench-test larql-kv-bench larql-kv-coverage larql-kv-coverage-summary larql-kv-coverage-html larql-kv-coverage-policy
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-check-fast larql-compute-check-tests larql-compute-check-all larql-compute-test-metal-decode larql-compute-test-metal-lib larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples larql-kv-ci larql-kv-test larql-kv-fmt-check larql-kv-lint larql-kv-examples larql-kv-bench-test larql-kv-bench larql-kv-coverage larql-kv-coverage-summary larql-kv-coverage-html larql-kv-coverage-policy larql-server-ci larql-server-test larql-server-fmt-check larql-server-lint larql-server-coverage larql-server-coverage-summary larql-server-coverage-html larql-server-coverage-policy
 
 # Build
 build:
@@ -377,6 +377,68 @@ larql-boundary-coverage-html:
 	@echo "Report: coverage/larql-boundary/html/index.html"
 
 larql-boundary-ci: larql-boundary-fmt-check larql-boundary-lint larql-boundary-test larql-boundary-bench-test larql-boundary-examples
+
+# larql-server — HTTP/gRPC inference server (vindex queries, OpenAI-compat,
+# remote MoE expert shards). The 90% per-file coverage floor (see
+# crates/larql-server/coverage-policy.json) is the goal; existing files
+# carry debt baselines that should ratchet upward, never down.
+#
+# 2026-04-26 baseline (from ROADMAP.md `Inherited state`): **74.2% line /
+# 81.2% function** across 580 tests. Re-measure with
+# `make larql-server-coverage-summary` after the workspace stabilises.
+LARQL_SERVER_COVERAGE_MIN ?= 74
+LARQL_SERVER_COVERAGE_POLICY ?= crates/larql-server/coverage-policy.json
+LARQL_SERVER_COVERAGE_REPORT ?= coverage/larql-server/summary.json
+
+larql-server-test:
+	cargo test -p larql-server
+
+larql-server-fmt-check:
+	cargo fmt -p larql-server -- --check
+
+larql-server-lint:
+	cargo clippy -p larql-server --all-targets -- -D warnings
+
+larql-server-coverage-policy:
+	@if [ ! -f "$(LARQL_SERVER_COVERAGE_REPORT)" ]; then \
+		echo "Coverage report not found: $(LARQL_SERVER_COVERAGE_REPORT)"; \
+		echo "Run: make larql-server-coverage-summary"; \
+		exit 1; \
+	fi
+	python3 scripts/check_coverage_policy.py $(LARQL_SERVER_COVERAGE_REPORT) $(LARQL_SERVER_COVERAGE_POLICY)
+
+larql-server-coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-server --fail-under-lines $(LARQL_SERVER_COVERAGE_MIN)
+	@mkdir -p coverage/larql-server
+	cargo llvm-cov report --package larql-server --json --summary-only --output-path $(LARQL_SERVER_COVERAGE_REPORT)
+	$(MAKE) larql-server-coverage-policy
+
+larql-server-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-server --summary-only --fail-under-lines $(LARQL_SERVER_COVERAGE_MIN)
+	@mkdir -p coverage/larql-server
+	cargo llvm-cov report --package larql-server --json --summary-only --output-path $(LARQL_SERVER_COVERAGE_REPORT)
+	$(MAKE) larql-server-coverage-policy
+
+larql-server-coverage-html:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; exit 1; \
+	fi
+	cargo llvm-cov --package larql-server --html --output-dir coverage/larql-server --fail-under-lines $(LARQL_SERVER_COVERAGE_MIN)
+	cargo llvm-cov report --package larql-server --json --summary-only --output-path $(LARQL_SERVER_COVERAGE_REPORT)
+	$(MAKE) larql-server-coverage-policy
+	@echo "Report: coverage/larql-server/html/index.html"
+
+larql-server-ci: larql-server-fmt-check larql-server-lint larql-server-test
 
 # Check (compile without building)
 check:

@@ -74,7 +74,7 @@ pub fn predict_q4k_hidden(
 
         remove_layer_tensors(weights, inserted);
 
-        if let Some(ref dir) = dump_dir {
+        if let Some(dir) = dump_dir {
             let slice = h.as_slice().unwrap_or(&[]);
             let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
             let path = crate::forward::dump_config::cpu_layer_path(dir, layer);
@@ -188,7 +188,10 @@ fn run_moe_layer_cpu(
         if let Some(dir) = l0_stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);
             let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = std::fs::write(crate::forward::dump_config::cpu_stage_path(dir, name), &bytes);
+            let _ = std::fs::write(
+                crate::forward::dump_config::cpu_stage_path(dir, name),
+                &bytes,
+            );
         }
     };
     dump_l0_arr("h1_dense_norm1", &h1);

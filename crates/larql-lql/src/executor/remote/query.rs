@@ -572,7 +572,8 @@ impl Session {
             }
         }
 
-        let result = self.remote_post_json(ENDPOINT_SELECT, &serde_json::Value::Object(body), false)?;
+        let result =
+            self.remote_post_json(ENDPOINT_SELECT, &serde_json::Value::Object(body), false)?;
 
         let mut out = Vec::new();
 

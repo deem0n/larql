@@ -49,9 +49,9 @@ pub struct GridGenerateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{make_test_tokenizer, make_test_vindex, make_test_weights};
     use crate::ffn::moe_remote::{RemoteMoeBackend, RemoteMoeError};
     use crate::layer_graph::generate::eos::EosConfig;
+    use crate::test_utils::{make_test_tokenizer, make_test_vindex, make_test_weights};
     use larql_compute::CpuBackend;
 
     // ── generate_with_remote_moe — error path ────────────────────────────────

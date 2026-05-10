@@ -97,6 +97,27 @@ impl<'a> LayerFfnRouter<'a> {
     }
 }
 
+// ── Activation functions ──
+
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+pub fn silu_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
+    let activated = gate.mapv(|v| v * sigmoid(v));
+    &activated * up
+}
+
+pub fn gelu_tanh_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
+    let activated = gate.mapv(gelu_tanh);
+    &activated * up
+}
+
+pub fn gelu_tanh(x: f32) -> f32 {
+    let c = 0.797_884_6_f32;
+    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
+}
+
 #[cfg(test)]
 mod router_tests {
     use super::*;
@@ -143,27 +164,6 @@ mod router_tests {
         // Layer 99 > num_layers=2 → clamps to last (index 1).
         assert_eq!(router.get(99).name(), "weights");
     }
-}
-
-// ── Activation functions ──
-
-pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-pub fn silu_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
-    let activated = gate.mapv(|v| v * sigmoid(v));
-    &activated * up
-}
-
-pub fn gelu_tanh_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
-    let activated = gate.mapv(gelu_tanh);
-    &activated * up
-}
-
-pub fn gelu_tanh(x: f32) -> f32 {
-    let c = 0.797_884_6_f32;
-    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
 }
 
 // Architecture-correct FFN computation is in weight::dense_ffn_forward

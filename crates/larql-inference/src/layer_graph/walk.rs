@@ -92,8 +92,8 @@ impl<'a> LayerGraph for PipelinedLayerGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
+    use crate::test_utils::make_test_weights;
     use larql_models::ModelWeights;
     use ndarray::Array2;
     use std::sync::OnceLock;

@@ -106,17 +106,14 @@ impl From<MemitCycleDto> for MemitCycle {
 /// state, start fresh" rather than an error. Malformed JSON or IO
 /// errors are surfaced so a corrupt snapshot doesn't silently mask
 /// itself as "no state".
-pub(crate) fn load_memit_store(
-    vindex_dir: &Path,
-) -> Result<Option<MemitStore>, String> {
+pub(crate) fn load_memit_store(vindex_dir: &Path) -> Result<Option<MemitStore>, String> {
     let path = vindex_dir.join(MEMIT_STORE_JSON);
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    let dto: MemitStoreDto = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let dto: MemitStoreDto =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let cycles: Vec<MemitCycle> = dto.cycles.into_iter().map(MemitCycle::from).collect();
     Ok(Some(MemitStore::from_cycles(cycles)))
 }
@@ -126,23 +123,23 @@ pub(crate) fn load_memit_store(
 /// existing snapshot. Empty stores still write a file (one line of
 /// JSON) so callers can tell "we ran COMPACT MAJOR and produced no
 /// facts" apart from "the file was never written".
-pub(crate) fn save_memit_store(
-    vindex_dir: &Path,
-    store: &MemitStore,
-) -> Result<(), String> {
+pub(crate) fn save_memit_store(vindex_dir: &Path, store: &MemitStore) -> Result<(), String> {
     let dto = MemitStoreDto {
         cycles: store.cycles().iter().map(MemitCycleDto::from).collect(),
     };
-    let json = serde_json::to_vec_pretty(&dto)
-        .map_err(|e| format!("serialise memit_store: {e}"))?;
+    let json =
+        serde_json::to_vec_pretty(&dto).map_err(|e| format!("serialise memit_store: {e}"))?;
 
     let final_path = vindex_dir.join(MEMIT_STORE_JSON);
     let tmp_path = vindex_dir.join(format!("{MEMIT_STORE_JSON}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp_path, &json)
-        .map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
+    std::fs::write(&tmp_path, &json).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
-        format!("promote {} → {}: {e}", tmp_path.display(), final_path.display())
+        format!(
+            "promote {} → {}: {e}",
+            tmp_path.display(),
+            final_path.display()
+        )
     })?;
     Ok(())
 }
@@ -238,12 +235,7 @@ mod tests {
         // No leftover .tmp file.
         let leftover_tmp = std::fs::read_dir(&dir)
             .unwrap()
-            .any(|e| {
-                e.unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".tmp.")
-            });
+            .any(|e| e.unwrap().file_name().to_string_lossy().contains(".tmp."));
         assert!(!leftover_tmp, "tmp file should be removed after rename");
 
         let _ = std::fs::remove_dir_all(&dir);
