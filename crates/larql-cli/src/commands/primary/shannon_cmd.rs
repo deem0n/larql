@@ -268,12 +268,7 @@ fn run_layers(args: LayersArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let captures = forward_hidden_all_layers(weights, chunk_ids)?;
         if captures.len() != n_captures {
-            return Err(format!(
-                "expected {} captures, got {}",
-                n_captures,
-                captures.len()
-            )
-            .into());
+            return Err(format!("expected {} captures, got {}", n_captures, captures.len()).into());
         }
 
         let row_start = target_start - prefix_start - 1;
@@ -1028,10 +1023,7 @@ fn prob_for_target(logits: &[f32], target: u32) -> Result<f64, Box<dyn std::erro
 
 /// Apply per-arch logit scaling/softcap and return natural-log probabilities
 /// over the full vocabulary for one position. Length matches the input row.
-fn compute_log_probs_row(
-    weights: &ModelWeights,
-    row: ndarray::ArrayView1<'_, f32>,
-) -> Vec<f32> {
+fn compute_log_probs_row(weights: &ModelWeights, row: ndarray::ArrayView1<'_, f32>) -> Vec<f32> {
     let inv_scale = 1.0 / weights.arch.logits_scaling();
     let final_softcap = weights.arch.final_logit_softcapping();
     let transform = |v: f32| {

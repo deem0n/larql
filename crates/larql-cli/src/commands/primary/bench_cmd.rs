@@ -292,10 +292,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
-                &weights,
-                token_ids.len(),
-            );
+            let kv_ref_bytes =
+                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
 
             for engine_name in engine_list
                 .split(',')
@@ -332,10 +330,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
-                &weights,
-                token_ids.len(),
-            );
+            let kv_ref_bytes =
+                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
 
             for engine_name in engine_list
                 .split(',')
