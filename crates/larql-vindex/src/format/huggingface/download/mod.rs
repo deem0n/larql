@@ -42,6 +42,41 @@ impl RepoKind {
             RepoKind::Model => "models--",
         }
     }
+
+    fn to_hub_type(self) -> hf_hub::RepoType {
+        match self {
+            RepoKind::Dataset => hf_hub::RepoType::Dataset,
+            RepoKind::Model => hf_hub::RepoType::Model,
+        }
+    }
+}
+
+/// Order in which `larql pull` probes HF for an `hf://owner/name` path.
+/// `larql publish` defaults to `repo_type = "model"`, so model is tried
+/// first; dataset stays as the fallback for older vindexes that were
+/// uploaded before the publish default flipped (and for docs examples
+/// that pin `--repo-type dataset`).
+const HF_PULL_REPO_KINDS: [RepoKind; 2] = [RepoKind::Model, RepoKind::Dataset];
+
+/// Build a typed `ApiRepo` handle for a given `(repo_id, revision, kind)`.
+/// Centralised so the three pull entry points share one constructor and
+/// the with/without-revision branching lives in one place.
+fn hf_repo(
+    api: &hf_hub::api::sync::Api,
+    repo_id: &str,
+    revision: Option<&str>,
+    kind: RepoKind,
+) -> hf_hub::api::sync::ApiRepo {
+    let repo_type = kind.to_hub_type();
+    if let Some(rev) = revision {
+        api.repo(hf_hub::Repo::with_revision(
+            repo_id.to_string(),
+            repo_type,
+            rev.to_string(),
+        ))
+    } else {
+        api.repo(hf_hub::Repo::new(repo_id.to_string(), repo_type))
+    }
 }
 
 /// Resolve an `hf://` path to a local directory, downloading if needed.
@@ -68,26 +103,32 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
     let api = hf_hub::api::sync::Api::new()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
-    let repo = if let Some(ref rev) = revision {
-        api.repo(hf_hub::Repo::with_revision(
-            repo_id.clone(),
-            hf_hub::RepoType::Dataset,
-            rev.clone(),
-        ))
-    } else {
-        api.repo(hf_hub::Repo::new(
-            repo_id.clone(),
-            hf_hub::RepoType::Dataset,
-        ))
-    };
-
-    // Download index.json first (small, tells us what we need)
-    let index_path = repo.get(INDEX_JSON).map_err(|e| {
-        VindexError::Parse(format!(
-            "failed to download index.json from hf://{}: {e}",
-            repo_id
-        ))
-    })?;
+    // `larql publish` defaults to model repos, but older vindexes and
+    // some docs examples live as dataset repos. Probe in publish-default
+    // order; the first kind that yields index.json wins, the rest are
+    // skipped.
+    let mut last_err: Option<String> = None;
+    let (repo, index_path) = HF_PULL_REPO_KINDS
+        .into_iter()
+        .find_map(|kind| {
+            let repo = hf_repo(&api, &repo_id, revision.as_deref(), kind);
+            match repo.get(INDEX_JSON) {
+                Ok(path) => Some((repo, path)),
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    None
+                }
+            }
+        })
+        .ok_or_else(|| {
+            let suffix = last_err
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            VindexError::Parse(format!(
+                "failed to download index.json from hf://{repo_id}{suffix}"
+            ))
+        })?;
 
     let vindex_dir = index_path
         .parent()
@@ -121,24 +162,24 @@ pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
     let api = hf_hub::api::sync::Api::new()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
-    let repo = if let Some(ref rev) = revision {
-        api.repo(hf_hub::Repo::with_revision(
-            repo_id.clone(),
-            hf_hub::RepoType::Dataset,
-            rev.clone(),
-        ))
-    } else {
-        api.repo(hf_hub::Repo::new(
-            repo_id.clone(),
-            hf_hub::RepoType::Dataset,
-        ))
-    };
-
-    for filename in VINDEX_WEIGHT_FILES {
-        let _ = repo.get(filename); // optional, skip if not in repo
+    // Same model-first-then-dataset probe order as `resolve_hf_vindex`.
+    // We use index.json as the "does this repo type exist?" probe so we
+    // don't accidentally fetch weight files from a stale dataset repo
+    // when the live vindex lives on the model side.
+    for kind in HF_PULL_REPO_KINDS {
+        let repo = hf_repo(&api, &repo_id, revision.as_deref(), kind);
+        if repo.get(INDEX_JSON).is_err() {
+            continue;
+        }
+        for filename in VINDEX_WEIGHT_FILES {
+            let _ = repo.get(filename); // optional, skip if not in repo
+        }
+        return Ok(());
     }
 
-    Ok(())
+    Err(VindexError::Parse(format!(
+        "failed to fetch index.json from hf://{repo_id}"
+    )))
 }
 
 /// Re-exported from hf-hub 0.5 so callers don't have to depend on
@@ -306,58 +347,57 @@ where
     let api = hf_hub::api::sync::Api::new()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
-    let repo = if let Some(ref rev) = revision {
-        api.repo(hf_hub::Repo::with_revision(
-            repo_id.clone(),
-            hf_hub::RepoType::Dataset,
-            rev.clone(),
-        ))
-    } else {
-        api.repo(hf_hub::Repo::new(
-            repo_id.clone(),
-            hf_hub::RepoType::Dataset,
-        ))
-    };
+    // Probe each repo kind in publish-default order. The first kind that
+    // returns index.json (cache hit or download) is the winner; we then
+    // fetch the rest of `VINDEX_CORE_FILES` from that same handle.
+    for kind in HF_PULL_REPO_KINDS {
+        let repo = hf_repo(&api, &repo_id, revision.as_deref(), kind);
 
-    // Helper: one file, with cache short-circuit. Returns the resolved
-    // on-disk path. The cache check fires the progress reporter so the
-    // bar shows a filled-to-100% track tagged with the filename — users
-    // see that the file was served from cache, not re-downloaded.
-    let mut fetch = |filename: &str, label: &str| -> Option<PathBuf> {
-        if let Some((cached_path, size)) =
-            cached_snapshot_file(RepoKind::Dataset, &repo_id, revision.as_deref(), filename)
-        {
-            // Tag the progress message so the bar visibly distinguishes
-            // "cached" from "just downloaded very fast". Callers rendering
-            // the bar see the prefix at init time and can restyle.
-            let mut p = progress(label);
-            let tagged = format!("{filename} [cached]");
-            p.init(size as usize, &tagged);
-            p.update(size as usize);
-            p.finish();
-            return Some(cached_path);
-        }
-        repo.download_with_progress(filename, progress(label)).ok()
-    };
+        // Helper: one file, with cache short-circuit. Returns the resolved
+        // on-disk path. The cache check fires the progress reporter so the
+        // bar shows a filled-to-100% track tagged with the filename — users
+        // see that the file was served from cache, not re-downloaded.
+        let mut fetch = |filename: &str, label: &str| -> Option<PathBuf> {
+            if let Some((cached_path, size)) =
+                cached_snapshot_file(kind, &repo_id, revision.as_deref(), filename)
+            {
+                // Tag the progress message so the bar visibly distinguishes
+                // "cached" from "just downloaded very fast". Callers rendering
+                // the bar see the prefix at init time and can restyle.
+                let mut p = progress(label);
+                let tagged = format!("{filename} [cached]");
+                p.init(size as usize, &tagged);
+                p.update(size as usize);
+                p.finish();
+                return Some(cached_path);
+            }
+            repo.download_with_progress(filename, progress(label)).ok()
+        };
 
-    // index.json drives everything — we need its snapshot dir to know
-    // where the rest of the files live. Cache-hit or download.
-    let index_path = fetch(INDEX_JSON, INDEX_JSON).ok_or_else(|| {
-        VindexError::Parse(format!("failed to fetch index.json from hf://{repo_id}"))
-    })?;
-    let vindex_dir = index_path
-        .parent()
-        .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
-        .to_path_buf();
-
-    for filename in VINDEX_CORE_FILES {
-        if *filename == INDEX_JSON {
+        // index.json drives everything — we need its snapshot dir to know
+        // where the rest of the files live. If this kind doesn't have it,
+        // try the next kind.
+        let Some(index_path) = fetch(INDEX_JSON, INDEX_JSON) else {
             continue;
+        };
+        let vindex_dir = index_path
+            .parent()
+            .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
+            .to_path_buf();
+
+        for filename in VINDEX_CORE_FILES {
+            if *filename == INDEX_JSON {
+                continue;
+            }
+            // Optional files — ignore failures (missing from repo is fine).
+            let _ = fetch(filename, filename);
         }
-        // Optional files — ignore failures (missing from repo is fine).
-        let _ = fetch(filename, filename);
+        return Ok(vindex_dir);
     }
-    Ok(vindex_dir)
+
+    Err(VindexError::Parse(format!(
+        "failed to fetch index.json from hf://{repo_id}"
+    )))
 }
 
 /// Resolve an `hf://` model repo path to a local snapshot directory,
@@ -571,18 +611,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn resolve_hf_vindex_errors_on_404_index_json() {
-        // mockito returns 404 for /datasets/owner/repo/resolve/main/index.json
-        // → repo.get(INDEX_JSON) errors → resolve_hf_vindex returns
-        // the wrapped "failed to download index.json" error. Exercises:
-        // hf:// strip, no-revision branch, Api::new(), repo.get error path.
+    fn resolve_hf_vindex_errors_when_both_repo_kinds_404() {
+        // mockito returns 404 for every URL → both Model and Dataset
+        // probes fail in turn → resolve_hf_vindex returns the wrapped
+        // "failed to download index.json" error. Exercises: hf:// strip,
+        // no-revision branch, Api::new(), full HF_PULL_REPO_KINDS loop.
         let mut server = mockito::Server::new();
         let _g = HfTestEnv::new(&server.url());
         let _m = server
-            .mock(
-                "GET",
-                mockito::Matcher::Regex(r"/datasets/owner/repo/resolve/.*/index\.json".into()),
-            )
+            .mock("GET", mockito::Matcher::Any)
             .with_status(404)
             .create();
 
@@ -597,14 +634,14 @@ mod tests {
     #[serial]
     fn resolve_hf_vindex_errors_with_revision_pinned() {
         // Same as above but with `@v2.0` revision. The split path takes
-        // a different `repo` constructor (with_revision) — verify both
-        // branches by exercising them with the same 404 mock.
+        // a different `repo` constructor (with_revision) — verify the
+        // revision-bearing branch with the same all-404 mock.
         let mut server = mockito::Server::new();
         let _g = HfTestEnv::new(&server.url());
         let _m = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"/datasets/owner/repo/resolve/v2\.0/index\.json".into()),
+                mockito::Matcher::Regex(r"/resolve/v2\.0/index\.json".into()),
             )
             .with_status(404)
             .create();
@@ -618,10 +655,11 @@ mod tests {
 
     #[test]
     #[serial]
-    fn download_hf_weights_silently_skips_missing_files() {
-        // download_hf_weights iterates VINDEX_WEIGHT_FILES with `let _ =
-        // repo.get(filename)` — every miss is silenced. Pin that contract:
-        // even when every file 404s, the function returns Ok(()).
+    fn download_hf_weights_errors_when_no_repo_kind_has_index_json() {
+        // `download_hf_weights` now uses index.json as the "does this repo
+        // type exist?" probe. When both Model and Dataset 404 on
+        // index.json, the function returns the "failed to fetch
+        // index.json" error rather than silently succeeding.
         let mut server = mockito::Server::new();
         let _g = HfTestEnv::new(&server.url());
         let _m = server
@@ -629,7 +667,11 @@ mod tests {
             .with_status(404)
             .create();
 
-        download_hf_weights("hf://owner/repo").expect("missing files are non-fatal");
+        let err = download_hf_weights("hf://owner/repo").expect_err("no index.json on either side");
+        assert!(
+            err.to_string().contains("failed to fetch index.json"),
+            "got: {err}"
+        );
     }
 
     #[test]
