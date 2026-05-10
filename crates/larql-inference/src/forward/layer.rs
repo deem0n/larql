@@ -344,4 +344,83 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn run_attention_public_matches_inner() {
+        let weights = make_test_weights();
+        let input = h(3, weights.hidden_size);
+        let pub_out = run_attention_public(&weights, &input, 0).unwrap();
+        let inner_out = run_attention(&weights, &input, 0).unwrap();
+        assert_eq!(pub_out.shape(), inner_out.shape());
+        for (a, b) in pub_out.iter().zip(inner_out.iter()) {
+            assert!((a - b).abs() < 1e-6, "public/inner attention differ: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn run_attention_inner_with_capture_attention_returns_weights() {
+        let weights = make_test_weights();
+        let input = h(3, weights.hidden_size);
+        let (out, weights_opt) =
+            run_attention_inner(&weights, &input, 0, /*capture=*/ true, None).unwrap();
+        assert_eq!(out.shape(), &[3, weights.hidden_size]);
+        let aw = weights_opt.expect("attention weights should be captured");
+        // One distribution per Q-head, each with seq_len=3 entries (last position).
+        assert_eq!(aw.heads.len(), weights.num_q_heads);
+        for head in &aw.heads {
+            assert_eq!(head.len(), 3);
+        }
+    }
+
+    #[test]
+    fn run_attention_with_kv_cache_returns_shared_kv() {
+        let weights = make_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_post_attn, (k, v)) =
+            run_attention_with_kv_cache(&weights, &input, 0).expect("attn-with-kv must succeed");
+        assert_eq!(h_post_attn.shape(), &[2, weights.hidden_size]);
+        // K/V have shape (seq, num_kv_heads * head_dim).
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        assert_eq!(k.shape(), &[2, kv_dim]);
+        assert_eq!(v.shape(), &[2, kv_dim]);
+    }
+
+    #[test]
+    fn apply_layer_scalar_is_noop_when_key_absent() {
+        // tinymodel arch returns None for layer_scalar_key — the function
+        // must leave the input untouched.
+        let weights = make_test_weights();
+        let mut input = h(2, weights.hidden_size);
+        let before = input.clone();
+        apply_layer_scalar(&weights, &mut input, 0);
+        assert_eq!(input, before);
+    }
+
+    #[test]
+    fn run_layer_with_capture_returns_attention_weights_on_request() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (h_out, _act, _attn, _kv) = run_layer_with_capture(
+            &weights, &input, 0, &ffn, false, /*capture_attention=*/ true, None, None,
+        )
+        .expect("run_layer_with_capture must succeed");
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+    }
+
+    #[test]
+    fn run_ffn_with_kv_share_skips_kv_output() {
+        // shared_kv = Some ⇒ run_layer_with_ffn takes the inner-attention
+        // path which doesn't return KV — exercise that branch.
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        // Capture KV from layer 0 first, then re-feed at layer 1 as shared.
+        let (_, shared) = run_attention_with_kv_cache(&weights, &input, 0).unwrap();
+        let (h_out, _, kv_out) =
+            run_layer_with_ffn(&weights, &input, 1, &ffn, false, None, Some(&shared))
+                .expect("layer with shared KV must succeed");
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+        assert!(kv_out.is_none(), "shared-KV path must not return new KV");
+    }
 }

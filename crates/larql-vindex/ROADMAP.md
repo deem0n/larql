@@ -191,10 +191,24 @@ the trait surface should leave room for it but we don't implement.
   accessors (`attn_q4_data`, `interleaved_q4*_mmap_ref`) deferred
   to step 5 — they need an API-shape decision once substore mmap
   fields drop.
-- [ ] Step 5 — drop `Arc<Mmap>` fields from substores; compiler
-  flags any remaining `pub` field reach (~155 sites across 19
-  files in vindex per the 2026-05-10 audit). Whole-buffer
-  accessor reshape happens here.
+- [x] Step 5 (partial) — `storage` field is now
+  `Arc<MmapStorage>` (concrete, mutable via `Arc::make_mut`).
+  Loaders rewritten to use `set_*()` setters; `refresh_storage()`
+  removed. 12 setters + 11 `has_*` + 6 `*_view()` helpers added.
+  Read sites migrated for `lm_head/knn.rs`, `interleaved_q4.rs`,
+  `gate_accessors.rs` `is_some()` checks, `is_mmap()`,
+  `attn_q4_data`. `MmapStorage` field visibility tightened to
+  `pub(crate)` for test ergonomics.
+- [ ] Step 6 — finish read migration for gate KNN compute
+  (`gate_accessors.rs` per-layer reads, `compute/gate_knn/*`,
+  `gate_store.rs`, `mutate/mod.rs`, `patch/overlay.rs`); migrate
+  the f32 native FFN paths (`up_features_mmap`,
+  `down_features_mmap`, `interleaved_mmap`) once they have trait
+  coverage; drop substore mmap fields; add
+  `MmapStorage::release_pages()` for madvise. The gate KNN
+  reaches share a structural pattern (bytes + dtype + slice
+  combine for ndarray views) — `gate_layer_view()` is the
+  intended consumption shape.
 
 See `CHANGELOG.md` 2026-05-10 entry for the full step 1-3 writeup
 plus bench numbers.

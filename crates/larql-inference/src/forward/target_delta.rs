@@ -748,6 +748,119 @@ mod tests {
     }
 
     #[test]
+    fn target_delta_opts_default_matches_python_reference() {
+        let d = TargetDeltaOpts::default();
+        assert_eq!(d.steps, 60);
+        assert!((d.lr - 0.5).abs() < 1e-6);
+        assert!((d.kl_weight - 0.0625).abs() < 1e-6);
+        assert!(!d.normalise);
+    }
+
+    #[test]
+    fn optimise_target_delta_happy_path_returns_finite_delta() {
+        // Drive the actual Adam loop with tiny steps so we touch every
+        // line of the optimisation body without burning CPU.
+        let weights = make_test_weights();
+        let opts = TargetDeltaOpts {
+            steps: 2,
+            lr: 0.1,
+            kl_weight: 0.0,
+            normalise: false,
+        };
+        let install_layer = weights.num_layers - 1;
+        let result = optimise_target_delta(&weights, &[0u32], 1, install_layer, opts)
+            .expect("happy path must succeed");
+        assert_eq!(result.layer, install_layer);
+        assert_eq!(result.delta.len(), weights.hidden_size);
+        assert!(result.delta.iter().all(|v| v.is_finite()));
+        assert!(result.final_loss.is_finite());
+        assert!(result.baseline_loss.is_finite());
+    }
+
+    #[test]
+    fn optimise_target_delta_with_kl_weight_runs_kl_branch() {
+        // kl_weight != 0.0 → triggers the `dlogits += kl * (cur - base)`
+        // and `kl_val` accumulation branches.
+        let weights = make_test_weights();
+        let opts = TargetDeltaOpts {
+            steps: 1,
+            lr: 0.1,
+            kl_weight: 0.05,
+            normalise: false,
+        };
+        let install_layer = weights.num_layers - 1;
+        let result = optimise_target_delta(&weights, &[0u32], 1, install_layer, opts)
+            .expect("kl-weighted opt must succeed");
+        assert!(result.final_loss.is_finite());
+    }
+
+    #[test]
+    fn optimise_target_delta_with_normalise_returns_unit_norm_delta() {
+        let weights = make_test_weights();
+        let opts = TargetDeltaOpts {
+            steps: 2,
+            lr: 0.5,
+            kl_weight: 0.0,
+            normalise: true,
+        };
+        let install_layer = weights.num_layers - 1;
+        let result = optimise_target_delta(&weights, &[0u32, 1], 2, install_layer, opts)
+            .expect("normalise must succeed");
+        let norm: f32 = result.delta.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Either zero (degenerate optimization) or unit norm.
+        assert!(
+            norm == 0.0 || (norm - 1.0).abs() < 1e-4,
+            "normalised delta should have unit norm or be zero, got {norm}"
+        );
+    }
+
+    #[test]
+    fn optimise_target_delta_rejects_mid_layer() {
+        let weights = make_test_weights();
+        // num_layers=2 in test fixture, so install_layer=0 is mid-layer.
+        let err = optimise_target_delta(
+            &weights,
+            &[0u32],
+            0,
+            0,
+            TargetDeltaOpts::default(),
+        )
+        .expect_err("mid-layer install must error");
+        assert!(
+            err.contains("only install_layer = n_layers-1"),
+            "expected mid-layer rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn optimise_target_delta_rejects_layer_out_of_range() {
+        let weights = make_test_weights();
+        let err = optimise_target_delta(
+            &weights,
+            &[0u32],
+            0,
+            weights.num_layers + 5,
+            TargetDeltaOpts::default(),
+        )
+        .expect_err("install_layer >= n_layers must error");
+        assert!(err.contains("≥ n_layers"), "got: {err}");
+    }
+
+    #[test]
+    fn softmax_1d_sums_to_one_and_handles_extreme_logits() {
+        // Tiny + huge logits exercise the numerical-stability shift.
+        let logits = arr1(&[100.0f32, 100.5, 99.0, -1000.0]);
+        let probs = softmax_1d(&logits);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "softmax sum: {sum}");
+        // The smallest logit should produce ~0 probability.
+        assert!(probs[3] < 1e-30 || probs[3] == 0.0);
+        // Max-logit index should hold the largest probability.
+        assert!(probs[1] > probs[0]);
+        assert!(probs[1] > probs[2]);
+    }
+
+    #[test]
     fn rmsnorm_backward_finite_difference() {
         // Analytical gradient should match numerical at a random point.
         let x = arr1(&[0.5_f32, 1.0, -0.5, 2.0]);

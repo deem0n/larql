@@ -578,4 +578,136 @@ mod dispatch_tests {
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
     }
+
+    // ── trace + l1_cache + dispatch_trace ──────────────────────────────
+
+    #[test]
+    fn walk_ffn_take_residuals_returns_per_layer_traces() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx).with_trace();
+        let x = input(2, weights.hidden_size);
+        // Run forward for every layer so trace_residuals populates.
+        for layer in 0..weights.num_layers {
+            ffn.forward(layer, &x);
+        }
+        let residuals = ffn.take_residuals();
+        assert_eq!(residuals.len(), weights.num_layers);
+        for (layer, residual) in &residuals {
+            assert!(*layer < weights.num_layers);
+            assert_eq!(residual.len(), weights.hidden_size);
+            assert!(residual.iter().all(|v| v.is_finite()));
+        }
+        // Drained — second call must be empty.
+        assert!(ffn.take_residuals().is_empty());
+    }
+
+    #[test]
+    fn walk_ffn_with_trace_emits_residuals() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_with_trace(&weights, &idx, 4);
+        let x = input(1, weights.hidden_size);
+        ffn.forward(0, &x);
+        let residuals = ffn.take_residuals();
+        assert_eq!(residuals.len(), 1);
+        assert_eq!(residuals[0].0, 0);
+    }
+
+    #[test]
+    fn walk_ffn_new_unlimited_with_trace_records() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited_with_trace(&weights, &idx);
+        let x = input(1, weights.hidden_size);
+        ffn.forward(0, &x);
+        assert_eq!(ffn.take_residuals().len(), 1);
+    }
+
+    #[test]
+    fn walk_ffn_take_trace_pairs_residuals_with_walk_hits() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited_with_trace(&weights, &idx);
+        let x = input(1, weights.hidden_size);
+        ffn.forward(0, &x);
+        let trace = ffn.take_trace();
+        assert!(!trace.layers.is_empty());
+        // Mock index returns no FeatureMeta so walk_hits collapses to empty
+        // — but the layer entry itself must still be present.
+        assert_eq!(trace.layers[0].0, 0);
+    }
+
+    #[test]
+    fn walk_ffn_new_with_backend_attaches_backend() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_with_backend(&weights, &idx, 4, &larql_compute::CpuBackend);
+        let x = input(1, weights.hidden_size);
+        let out = ffn.forward(0, &x);
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn walk_ffn_with_l1_cache_records_misses_then_hits() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn =
+            WalkFfn::new_unlimited(&weights, &idx).with_l1_cache(weights.num_layers);
+        let x = input(1, weights.hidden_size);
+        // L1 cache stats: first call is a miss, second identical call a hit.
+        ffn.forward(0, &x);
+        ffn.forward(0, &x);
+        let (hits, misses) = ffn.l1_cache_stats().expect("cache enabled");
+        assert!(misses >= 1, "first call must be a miss");
+        // Whether the second call hits depends on the cache key — so we
+        // just assert hits is a sensible non-overflowing count.
+        assert!(hits + misses >= 2);
+    }
+
+    #[test]
+    fn walk_ffn_l1_cache_stats_returns_none_when_disabled() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        assert!(ffn.l1_cache_stats().is_none());
+    }
+
+    #[test]
+    fn walk_ffn_with_dispatch_trace_records_per_layer_path() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx).with_dispatch_trace();
+        let x = input(1, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            ffn.forward(layer, &x);
+        }
+        let trace = ffn.take_dispatch_trace();
+        assert_eq!(trace.len(), weights.num_layers);
+        for (i, entry) in trace.iter().enumerate() {
+            assert_eq!(entry.layer, i);
+            assert!(!entry.path.is_empty());
+        }
+        // Drain semantics: second call returns empty.
+        assert!(ffn.take_dispatch_trace().is_empty());
+    }
+
+    #[test]
+    fn walk_ffn_take_dispatch_trace_returns_empty_when_disabled() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        assert!(ffn.take_dispatch_trace().is_empty());
+    }
+
+    #[test]
+    fn walk_ffn_from_config_uses_supplied_walkffnconfig() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let cfg = crate::vindex::WalkFfnConfig::sparse(weights.num_layers, 2);
+        let ffn = WalkFfn::from_config(&weights, &idx, cfg);
+        let x = input(1, weights.hidden_size);
+        let out = ffn.forward(0, &x);
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+    }
 }

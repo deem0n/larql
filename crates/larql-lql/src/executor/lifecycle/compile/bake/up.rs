@@ -241,4 +241,364 @@ mod tests {
         assert_eq!(UP_PROJ_KEY_FRAGMENT, "up_proj");
         assert_eq!(LAYERS_KEY_FRAGMENT, "layers.");
     }
+
+    // ── End-to-end fixture tests ────────────────────────────
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "larql_bake_up_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn mini_config(num_layers: usize, hidden: usize, intermediate: usize) -> larql_vindex::VindexConfig {
+        larql_vindex::VindexConfig {
+            version: 1,
+            model: "test".into(),
+            family: "test".into(),
+            source: None,
+            checksums: None,
+            num_layers,
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            vocab_size: 32,
+            embed_scale: 1.0,
+            extract_level: larql_vindex::ExtractLevel::All,
+            dtype: larql_vindex::config::dtype::StorageDtype::F32,
+            quant: larql_vindex::QuantFormat::None,
+            layer_bands: None,
+            layers: Vec::new(),
+            down_top_k: 10,
+            has_model_weights: true,
+            model_config: None,
+            fp4: None,
+            ffn_layout: None,
+        }
+    }
+
+    /// Lay out a synthetic up_weights.bin with `num_layers` tensors of
+    /// shape `[intermediate, hidden]` packed back-to-back. Returns the
+    /// manifest entries so callers can write `weight_manifest.json`
+    /// matching the layout.
+    fn write_synthetic_up_weights_bin(
+        dir: &std::path::Path,
+        num_layers: usize,
+        hidden: usize,
+        intermediate: usize,
+        bpf: usize,
+    ) -> Vec<(String, u64, u64)> {
+        let row_bytes = hidden * bpf;
+        let layer_bytes = intermediate * row_bytes;
+        let total = num_layers * layer_bytes;
+        let mut bytes: Vec<u8> = Vec::with_capacity(total);
+
+        for layer in 0..num_layers {
+            for feat in 0..intermediate {
+                for d in 0..hidden {
+                    let v = (layer * 100 + feat * 10 + d) as f32 * 0.001;
+                    if bpf == BYTES_PER_F32 {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    } else {
+                        let h = larql_models::quant::half::f32_to_f16(v);
+                        bytes.extend_from_slice(&h.to_le_bytes());
+                    }
+                }
+            }
+        }
+        std::fs::write(dir.join("up_weights.bin"), &bytes).unwrap();
+
+        let mut entries = Vec::new();
+        for layer in 0..num_layers {
+            entries.push((
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                (layer * layer_bytes) as u64,
+                layer_bytes as u64,
+            ));
+        }
+        entries
+    }
+
+    fn write_manifest(dir: &std::path::Path, file: &str, entries: &[(String, u64, u64)]) {
+        let json: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(key, off, len)| {
+                serde_json::json!({
+                    "key": key,
+                    "file": file,
+                    "offset": off,
+                    "length": len,
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.join(WEIGHT_MANIFEST_JSON),
+            serde_json::to_string(&json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_up_row_f32(
+        dir: &std::path::Path,
+        layer: usize,
+        feat: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> Vec<f32> {
+        let bytes = std::fs::read(dir.join("up_weights.bin")).unwrap();
+        let layer_bytes = intermediate * hidden * BYTES_PER_F32;
+        let row_bytes = hidden * BYTES_PER_F32;
+        let row_start = layer * layer_bytes + feat * row_bytes;
+        (0..hidden)
+            .map(|d| {
+                let cell = row_start + d * BYTES_PER_F32;
+                f32::from_le_bytes(bytes[cell..cell + BYTES_PER_F32].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn patch_up_weights_no_overrides_is_noop() {
+        let dir = unique_dir("noop");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty src and dst dirs — no manifest, no up_weights.bin needed
+        // since the function returns early on empty overrides.
+        let cfg = mini_config(2, 4, 4);
+        let result = patch_up_weights(&dir, &dir, &cfg, &HashMap::new());
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_skips_silently_when_manifest_absent() {
+        let dir = unique_dir("no_manifest");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let cfg = mini_config(2, 4, 4);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((0, 0), vec![1.0; 4]);
+
+        // No weight_manifest.json in src — function should silently
+        // succeed (skipping the bake) rather than error.
+        let result = patch_up_weights(&src, &dst, &cfg, &overrides);
+        assert!(result.is_ok(), "expected silent skip, got {result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_f32_writes_correct_row() {
+        let dir = unique_dir("f32");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let num_layers = 3;
+        let hidden = 4;
+        let intermediate = 4;
+        let entries = write_synthetic_up_weights_bin(&src, num_layers, hidden, intermediate, BYTES_PER_F32);
+        write_manifest(&src, "up_weights.bin", &entries);
+
+        let cfg = mini_config(num_layers, hidden, intermediate);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        let layer = 1;
+        let feat = 2;
+        let new_row: Vec<f32> = vec![100.0, 200.0, 300.0, 400.0];
+        overrides.insert((layer, feat), new_row.clone());
+
+        patch_up_weights(&src, &dst, &cfg, &overrides).unwrap();
+
+        let read_back = read_up_row_f32(&dst, layer, feat, hidden, intermediate);
+        assert_eq!(read_back, new_row, "patched row mismatched override");
+
+        // Adjacent feature row (feat-1) untouched.
+        let neighbour = read_up_row_f32(&dst, layer, feat - 1, hidden, intermediate);
+        for (d, val) in neighbour.iter().enumerate() {
+            let expected = (layer * 100 + (feat - 1) * 10 + d) as f32 * 0.001;
+            assert!(
+                (val - expected).abs() < 1e-6,
+                "neighbour row d={d} mismatched"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_f16_round_trips_within_tolerance() {
+        let dir = unique_dir("f16");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let num_layers = 2;
+        let hidden = 4;
+        let intermediate = 4;
+        let entries = write_synthetic_up_weights_bin(&src, num_layers, hidden, intermediate, BYTES_PER_F16);
+        write_manifest(&src, "up_weights.bin", &entries);
+
+        let cfg = mini_config(num_layers, hidden, intermediate);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        let new_row: Vec<f32> = vec![1.0, 2.0, -1.0, 0.5];
+        overrides.insert((0, 1), new_row.clone());
+
+        patch_up_weights(&src, &dst, &cfg, &overrides).unwrap();
+
+        // Read back as f16.
+        let bytes = std::fs::read(dst.join("up_weights.bin")).unwrap();
+        let row_bytes = hidden * BYTES_PER_F16;
+        let row_start = 0 * intermediate * row_bytes + 1 * row_bytes;
+        for (d, want) in new_row.iter().enumerate() {
+            let cell = row_start + d * BYTES_PER_F16;
+            let bits = u16::from_le_bytes(bytes[cell..cell + BYTES_PER_F16].try_into().unwrap());
+            let got = larql_models::quant::half::f16_to_f32(bits);
+            assert!(
+                (got - want).abs() < 0.01,
+                "f16 d={d}: got {got}, want {want}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_rejects_wrong_shape() {
+        let dir = unique_dir("wrong_shape");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let entries = write_synthetic_up_weights_bin(&src, 2, 4, 4, BYTES_PER_F32);
+        write_manifest(&src, "up_weights.bin", &entries);
+
+        let cfg = mini_config(2, 4, 4);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        // Wrong length: 2 instead of 4.
+        overrides.insert((0, 0), vec![1.0, 2.0]);
+
+        let err = patch_up_weights(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("wrong shape"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_rejects_out_of_range_feature() {
+        let dir = unique_dir("oor_feat");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let entries = write_synthetic_up_weights_bin(&src, 2, 4, 4, BYTES_PER_F32);
+        write_manifest(&src, "up_weights.bin", &entries);
+
+        let cfg = mini_config(2, 4, 4);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        // Feature index 99 — intermediate is 4.
+        overrides.insert((0, 99), vec![0.0; 4]);
+
+        let err = patch_up_weights(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_skips_layers_not_in_manifest() {
+        let dir = unique_dir("skip_layer");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        // Manifest only describes layer 0 — layer 1 has no entry.
+        let mut entries = write_synthetic_up_weights_bin(&src, 2, 4, 4, BYTES_PER_F32);
+        entries.truncate(1);
+        write_manifest(&src, "up_weights.bin", &entries);
+
+        let cfg = mini_config(2, 4, 4);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((1, 0), vec![1.0; 4]); // layer 1 — no manifest entry
+
+        // Should silently skip.
+        let result = patch_up_weights(&src, &dst, &cfg, &overrides);
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_up_weights_rejects_unrecognised_dtype() {
+        let dir = unique_dir("dtype");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let cfg = mini_config(1, 4, 4);
+        // Length matches neither f32 (64) nor f16 (32) for one 16-element tensor.
+        let entries = vec![(
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            0u64,
+            50u64,
+        )];
+        std::fs::write(src.join("up_weights.bin"), vec![0u8; 50]).unwrap();
+        write_manifest(&src, "up_weights.bin", &entries);
+
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((0, 0), vec![0.0; 4]);
+        let err = patch_up_weights(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("expected"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_manifest_for_up_filters_to_up_proj_entries() {
+        let dir = unique_dir("parse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![
+            serde_json::json!({"key": "model.layers.0.mlp.up_proj.weight", "file": "up.bin", "offset": 0, "length": 64}),
+            serde_json::json!({"key": "model.layers.0.mlp.gate_proj.weight", "file": "gate.bin", "offset": 0, "length": 64}),
+            serde_json::json!({"key": "model.layers.5.mlp.up_proj.weight", "file": "up.bin", "offset": 64, "length": 128}),
+            serde_json::json!({"key": "model.embed_tokens.weight", "file": "embed.bin", "offset": 0, "length": 32}),
+        ];
+        let path = dir.join(WEIGHT_MANIFEST_JSON);
+        std::fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+
+        let lookup = parse_manifest_for_up(&path).unwrap();
+        assert_eq!(lookup.len(), 2, "only up_proj entries kept");
+        assert!(lookup.contains_key(&0));
+        assert!(lookup.contains_key(&5));
+        assert!(!lookup.contains_key(&999));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_manifest_for_up_skips_malformed_entries() {
+        let dir = unique_dir("malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![
+            // missing "file"
+            serde_json::json!({"key": "model.layers.0.mlp.up_proj.weight", "offset": 0, "length": 64}),
+            // missing "offset"
+            serde_json::json!({"key": "model.layers.1.mlp.up_proj.weight", "file": "up.bin", "length": 64}),
+            // missing "length"
+            serde_json::json!({"key": "model.layers.2.mlp.up_proj.weight", "file": "up.bin", "offset": 0}),
+            // unparsable layer index
+            serde_json::json!({"key": "model.layers.bogus.mlp.up_proj.weight", "file": "up.bin", "offset": 0, "length": 64}),
+            // valid
+            serde_json::json!({"key": "model.layers.7.mlp.up_proj.weight", "file": "up.bin", "offset": 100, "length": 64}),
+        ];
+        let path = dir.join(WEIGHT_MANIFEST_JSON);
+        std::fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+
+        let lookup = parse_manifest_for_up(&path).unwrap();
+        assert_eq!(lookup.len(), 1);
+        assert!(lookup.contains_key(&7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

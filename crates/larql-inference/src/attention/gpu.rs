@@ -301,3 +301,112 @@ pub fn q4_attention_proj(
     }
     Some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::make_test_weights;
+    use ndarray::Array2;
+
+    fn h(rows: usize, cols: usize) -> Array2<f32> {
+        Array2::from_shape_vec(
+            (rows, cols),
+            (0..rows * cols).map(|i| (i as f32 + 1.0) * 0.02).collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_attention_block_gpu_no_backend_falls_back_to_cpu() {
+        let weights = make_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_post, attn_proj, attn_w) =
+            run_attention_block_gpu(&weights, &input, 0, false, None).unwrap();
+        assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
+        assert_eq!(attn_proj.shape()[0], 2);
+        assert!(attn_w.is_none());
+    }
+
+    #[test]
+    fn run_attention_block_gpu_with_cpu_backend_matches_no_backend() {
+        let weights = make_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_no, _, _) = run_attention_block_gpu(&weights, &input, 0, false, None).unwrap();
+        let (h_cpu, _, _) =
+            run_attention_block_gpu(&weights, &input, 0, false, Some(&larql_compute::CpuBackend))
+                .unwrap();
+        for (a, b) in h_no.iter().zip(h_cpu.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "no-backend vs CpuBackend differ: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_attention_block_gpu_capture_attention_returns_weights() {
+        let weights = make_test_weights();
+        let input = h(3, weights.hidden_size);
+        let (_, _, attn_w) = run_attention_block_gpu(&weights, &input, 0, true, None).unwrap();
+        let aw = attn_w.expect("capture=true must yield weights");
+        assert_eq!(aw.heads.len(), weights.num_q_heads);
+    }
+
+    #[test]
+    fn run_attention_block_gpu_all_layers_finite() {
+        let weights = make_test_weights();
+        let input = h(2, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            let (h_out, _, _) =
+                run_attention_block_gpu(&weights, &input, layer, false, None).unwrap();
+            assert!(
+                h_out.iter().all(|v| v.is_finite()),
+                "layer {layer} non-finite"
+            );
+        }
+    }
+
+    #[test]
+    fn run_attention_block_gpu_returns_none_for_missing_layer() {
+        let weights = make_test_weights();
+        let input = h(2, weights.hidden_size);
+        let bogus = weights.num_layers + 5;
+        assert!(run_attention_block_gpu(&weights, &input, bogus, false, None).is_none());
+    }
+
+    #[test]
+    fn run_attention_with_kv_returns_q_rope_and_k_v() {
+        let weights = make_test_weights();
+        let input = h(3, weights.hidden_size);
+        let (h_out, k, v) = run_attention_with_kv(&weights, &input, 0).unwrap();
+        assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        assert_eq!(k.shape(), &[3, kv_dim]);
+        assert_eq!(v.shape(), &[3, kv_dim]);
+        assert!(h_out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn run_attention_with_kv_backend_matches_no_backend() {
+        let weights = make_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_no, k_no, v_no) = run_attention_with_kv_backend(&weights, &input, 0, None).unwrap();
+        let (h_cpu, k_cpu, v_cpu) = run_attention_with_kv_backend(
+            &weights,
+            &input,
+            0,
+            Some(&larql_compute::CpuBackend),
+        )
+        .unwrap();
+        for (a, b) in h_no.iter().zip(h_cpu.iter()) {
+            assert!((a - b).abs() < 1e-4);
+        }
+        for (a, b) in k_no.iter().zip(k_cpu.iter()) {
+            assert!((a - b).abs() < 1e-4);
+        }
+        for (a, b) in v_no.iter().zip(v_cpu.iter()) {
+            assert!((a - b).abs() < 1e-4);
+        }
+    }
+
+}

@@ -28,9 +28,7 @@ use std::sync::Arc;
 
 use ndarray::Array2;
 
-use super::storage::{
-    FfnStore, GateStore, MetadataStore, MmapStorage, ProjectionStore, VindexStorage,
-};
+use super::storage::{FfnStore, GateStore, MetadataStore, MmapStorage, ProjectionStore};
 // Re-export all shared types from types.rs so external callers can
 // keep using `crate::index::core::{VectorIndex, FeatureMeta, …}` paths.
 pub use super::types::*;
@@ -66,13 +64,17 @@ pub struct VectorIndex {
     /// down_meta + per-feature overrides.
     pub metadata: MetadataStore,
 
-    /// Mmap-agnostic byte-handle façade. Held as `Arc<dyn VindexStorage>`
-    /// so future Redis / S3 backends can plug in without rippling
-    /// through every `Arc<VectorIndex>` consumer in the workspace.
-    /// Today the only impl is [`MmapStorage`], rebuilt by
-    /// [`Self::refresh_storage`] after any loader mutates a substore
-    /// mmap field. Step 4 of the migration in `ROADMAP.md` (P0).
-    pub storage: Arc<dyn VindexStorage>,
+    /// Mmap-agnostic byte-handle façade. Loaders mutate via
+    /// `Arc::make_mut(&mut self.storage).set_*(...)` — the `Arc`
+    /// clones-on-write if other `VectorIndex` clones share it, so
+    /// `Clone` stays a single refcount bump.
+    ///
+    /// `MmapStorage` is the production impl; it implements
+    /// [`VindexStorage`] for callers that want the trait abstraction
+    /// (walk kernels, Metal dispatch, future Redis / S3 backends —
+    /// those would land as separate impls of the trait, but this
+    /// concrete type is what `VectorIndex` itself holds).
+    pub storage: Arc<MmapStorage>,
 }
 
 impl Clone for VectorIndex {
@@ -123,14 +125,20 @@ impl VectorIndex {
         let mut v = Self::empty(num_layers, hidden_size);
         v.gate.gate_vectors = gate_vectors;
         v.metadata.down_meta = down_meta;
-        // Heap mode — no mmap fields populated, but be consistent and
-        // refresh anyway.
-        v.refresh_storage();
+        // Heap mode — no mmap fields are populated. `storage` stays
+        // at `MmapStorage::empty(hidden_size)` from `Self::empty()`.
         v
     }
 
     /// Build a zero-copy mmap-mode index — gate vectors come from the
     /// supplied mmap; down_meta is optionally mmap'd too.
+    ///
+    /// **Step 5 transition state**: writes the gate mmap to **both**
+    /// `self.gate` (substore) and `self.storage` (façade). Gate-KNN
+    /// compute (`gate_accessors.rs` + `gate_knn/*`) still reads from
+    /// substore fields; step 6 will migrate those reads to
+    /// `self.storage.gate_layer_view(layer)` and drop the substore
+    /// gate fields.
     pub fn new_mmap(
         gate_mmap: memmap2::Mmap,
         gate_slices: Vec<GateLayerSlice>,
@@ -140,32 +148,18 @@ impl VectorIndex {
         hidden_size: usize,
     ) -> Self {
         let mut v = Self::empty(num_layers, hidden_size);
-        v.gate.gate_mmap_bytes = Some(std::sync::Arc::new(gate_mmap));
+        let gate_mmap_arc = Arc::new(gate_mmap);
+        v.gate.gate_mmap_bytes = Some(Arc::clone(&gate_mmap_arc));
         v.gate.gate_mmap_dtype = dtype;
-        v.gate.gate_mmap_slices = gate_slices;
-        v.metadata.down_meta_mmap = down_meta_mmap.map(std::sync::Arc::new);
-        v.refresh_storage();
+        v.gate.gate_mmap_slices = gate_slices.clone();
+        Arc::make_mut(&mut v.storage).set_gate_vectors(gate_mmap_arc, dtype, gate_slices);
+        v.metadata.down_meta_mmap = down_meta_mmap.map(Arc::new);
         v
-    }
-
-    /// Rebuild [`Self::storage`] from the current substore state.
-    /// Loaders that mutate substore mmap or manifest fields call this
-    /// after the mutation completes, so the storage façade always
-    /// reflects what the substores hold.
-    ///
-    /// Cheap — every substore field clone is an `Arc` refcount bump
-    /// (or a `Vec` clone for manifests, which are small). The whole
-    /// rebuild is one allocation for the new `MmapStorage` plus a few
-    /// `Bytes::from_owner` calls.
-    pub(crate) fn refresh_storage(&mut self) {
-        let snapshot =
-            MmapStorage::from_substores(&self.ffn, &self.gate, &self.projections, self.hidden_size);
-        self.storage = Arc::new(snapshot);
     }
 
     /// Returns true if this index uses mmap'd gate vectors (zero heap copy).
     pub fn is_mmap(&self) -> bool {
-        self.gate.gate_mmap_bytes.is_some()
+        self.storage.has_gate_vectors()
     }
 
     /// Estimated heap bytes used by gate vectors (0 if mmap'd).
@@ -207,6 +201,7 @@ mod refactor_tests {
     //! tests pin the cross-store invariants (caches reset, Arc shared,
     //! atomics carry).
     use super::*;
+    use crate::index::storage::vindex_storage::VindexStorage;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 

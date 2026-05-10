@@ -59,10 +59,10 @@ impl VectorIndex {
             let d = fp4.manifest.projections.down.precision;
             parts.push(format!("FP4 sparse (gate={g}, up={u}, down={d})"));
         }
-        if self.ffn.interleaved_q4k_mmap.is_some() {
+        if self.storage.has_interleaved_q4k() {
             parts.push("Q4K interleaved".into());
         }
-        if self.ffn.interleaved_q4_mmap.is_some() {
+        if self.storage.has_interleaved_q4() {
             parts.push("Q4_0 interleaved".into());
         }
         if self.ffn.interleaved_mmap.is_some() {

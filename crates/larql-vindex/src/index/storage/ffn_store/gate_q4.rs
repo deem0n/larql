@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::error::VindexError;
 use crate::format::filenames::GATE_VECTORS_Q4_BIN;
 use crate::index::core::VectorIndex;
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::mmap_util::mmap_optimized;
 
 impl VectorIndex {
@@ -44,15 +45,19 @@ impl VectorIndex {
             offset += q4_bytes;
         }
 
-        self.gate.gate_q4_mmap = Some(Arc::new(mmap));
-        self.gate.gate_q4_slices = slices;
-        self.refresh_storage();
+        // Step 5 transition: dual-write substore + storage so gate
+        // KNN compute (`gate_accessors.rs` + `dispatch.rs`) keeps
+        // working until step 6 migrates those reads.
+        let mmap_arc = Arc::new(mmap);
+        self.gate.gate_q4_mmap = Some(Arc::clone(&mmap_arc));
+        self.gate.gate_q4_slices = slices.clone();
+        Arc::make_mut(&mut self.storage).set_gate_q4(mmap_arc, slices);
         Ok(())
     }
 
     /// Whether Q4 gate vectors are loaded.
     pub fn has_gate_q4(&self) -> bool {
-        self.gate.gate_q4_mmap.is_some()
+        self.storage.has_gate_q4()
     }
 
     /// Get Q4 data slice for a layer's gate vectors. Returns the raw Q4_0 bytes.

@@ -20,6 +20,7 @@ use crate::format::filenames::{
 };
 use crate::format::weights::Q4kManifestEntry;
 use crate::index::core::VectorIndex;
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::mmap_util::mmap_demand_paged;
 
 use super::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER, FFN_DOWN};
@@ -66,33 +67,34 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: the q4k forward walk reads only the activated features'
         // byte ranges per layer, not the entire 13 GB file.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.interleaved_q4k_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
         let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
-        if manifest_path.exists() {
+        let manifest = if manifest_path.exists() {
             // Typed deserialise — `Q4kManifestEntry` matches the writer's
             // shape, so a renamed field on either side fails loudly here
             // instead of silently producing zero-byte slices.
             let raw = read_q4k_manifest(&manifest_path, INTERLEAVED_Q4K_MANIFEST_JSON)?;
-            let entries: Vec<(usize, usize, String)> = raw
-                .into_iter()
-                .map(|e| {
-                    (
-                        e.offset as usize,
-                        e.length as usize,
-                        e.format_tag().to_string(),
-                    )
-                })
-                .collect();
-            self.ffn.interleaved_q4k_manifest = Some(entries);
-        }
-        self.refresh_storage();
+            Some(
+                raw.into_iter()
+                    .map(|e| {
+                        (
+                            e.offset as usize,
+                            e.length as usize,
+                            e.format_tag().to_string(),
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Arc::make_mut(&mut self.storage).set_interleaved_q4k(mmap, manifest);
         Ok(())
     }
 
     pub fn has_interleaved_q4k(&self) -> bool {
-        self.ffn.interleaved_q4k_mmap.is_some()
+        self.storage.has_interleaved_q4k()
     }
 
     /// Load `down_features_q4k.bin` if present (W2 feature-major down).
@@ -112,8 +114,7 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only the activated features' byte ranges per
         // layer get read in. Same access pattern as `interleaved_q4k.bin`.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.down_features_q4k_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
         let raw = read_q4k_manifest(&manifest_path, DOWN_FEATURES_Q4K_MANIFEST_JSON)?;
         let entries: Vec<DownFeaturesQ4kEntry> = raw
@@ -132,14 +133,13 @@ impl VectorIndex {
                 })
             })
             .collect::<Result<Vec<_>, VindexError>>()?;
-        self.ffn.down_features_q4k_manifest = Some(entries);
-        self.refresh_storage();
+        Arc::make_mut(&mut self.storage).set_down_features_q4k(mmap, entries);
         Ok(())
     }
 
     /// Whether feature-major Q4_K-encoded down vectors are loaded.
     pub fn has_down_features_q4k(&self) -> bool {
-        self.ffn.down_features_q4k_mmap.is_some() && self.ffn.down_features_q4k_manifest.is_some()
+        self.storage.has_down_features_q4k()
     }
 
     /// Per-layer slice of `down_features_q4k.bin` plus the format tag

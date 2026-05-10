@@ -124,11 +124,66 @@ three-field substore reach (`gate_mmap_bytes` +
 - No external API change — public `&[u8]` / `&[f32]` accessor
   signatures unchanged.
 
-### Open
-- Step 5: drop substore `Arc<Mmap>` fields; compiler flags any
-  remaining `pub` field reach (~155 sites across 19 files per the
-  2026-05-10 audit). Whole-buffer accessor API shape resolved at
-  the same time.
+### Step 5 — `MmapStorage` becomes the source of truth (partial)
+
+- `storage` field type changed from `Arc<dyn VindexStorage>` to
+  `Arc<MmapStorage>` (concrete). Loaders mutate via
+  `Arc::make_mut(&mut self.storage).set_*(...)` — clones-on-write if
+  shared, so `Clone for VectorIndex` stays a single refcount bump.
+  External consumers can still take `&dyn VindexStorage` for
+  backend-agnostic code.
+- 12 new setter methods on `MmapStorage`: `set_attn_q4k/q4/q8`,
+  `set_lm_head_f32/f16/q4_mmap/q4_synth`,
+  `set_interleaved_q4k/q4`, `set_down_features_q4k`,
+  `set_gate_vectors`, `set_gate_q4`. 11 new `has_*` capability
+  helpers and 6 new `*_view() -> Option<&Bytes>` borrows for
+  zero-atomic whole-buffer reads.
+- All trait-covered loaders rewritten to use the setter pattern:
+  `load_attn_q8/q4k/q4`, `load_lm_head/q4`,
+  `synthesize_lm_head_q4`, `set_lm_head_f16_mmap`,
+  `load_interleaved_q4k/q4`, `load_down_features_q4k`,
+  `load_gate_vectors_q4`. `refresh_storage()` removed (obsolete).
+- Read sites migrated for non-gate-KNN paths: `lm_head/knn.rs` (3
+  reaches), `interleaved_q4.rs` (2 reaches), `is_some()` checks in
+  `gate_accessors.rs` (2), `is_mmap()` (1). `attn_q4_data` now
+  forwards through `attn_q4_whole_buffer_view()`.
+- `MmapStorage` field visibility loosened to `pub(crate)` so
+  in-crate tests can construct corrupt-manifest fixtures (the
+  attn-bounds tests). External callers must go through the trait
+  or inherent setters/views.
+
+#### Deferred to step 6 — gate KNN read migration
+
+The gate KNN compute paths (`gate_accessors.rs` ~26 reaches,
+`compute/gate_knn/*` ~23 reaches, `gate_store.rs` ~7,
+`mutate/mod.rs` ~9, `patch/overlay.rs` ~3) still read directly
+from substore fields. They combine `gate_mmap_bytes` +
+`gate_mmap_dtype` + `gate_mmap_slices` for ndarray view
+construction on the decode hot path — restructuring around
+`gate_layer_view()` is a focused refactor that needs its own
+review. **Substore gate fields are dual-written** by
+`new_mmap` and `load_gate_vectors_q4` so gate KNN keeps working.
+
+Step 6 will:
+1. Migrate gate KNN reads to `self.storage.gate_layer_view(layer)`.
+2. Migrate the f32 native FFN paths (`up_features_mmap`,
+   `down_features_mmap`, `interleaved_mmap`) — these aren't yet in
+   the trait surface.
+3. Drop the trait-covered substore mmap fields.
+4. Add `MmapStorage::release_pages()` for the madvise path
+   currently broken by the migration.
+
+### Tests + tooling
+- Lib tests **877 → 881** (+4 from new `MmapStorage` setter /
+  has_* / view round-trips and trait-dispatch sweep).
+- `cargo clippy --lib --tests --benches -- -D warnings`: clean.
+- `cargo fmt --check`: clean.
+- Coverage policy passes: total **89.58%** lines, 87/127 files at
+  90% default, 40 debt baselines (2 nudged down by ~0.5–1%
+  reflecting the forwarder migration's file shrinkage).
+- `vindex_storage/mmap_storage.rs`: 45.07% → **99.43%** after
+  setter / has_* / view tests (+10 dedicated tests).
+- `vindex_storage/mod.rs`: **98.00%**.
 
 ## [2026-05-10] — Per-layer FFN Phase 2 closed
 

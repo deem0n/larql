@@ -12,6 +12,7 @@ use crate::format::filenames::*;
 use crate::mmap_util::mmap_optimized;
 
 use crate::index::core::VectorIndex;
+use crate::index::storage::vindex_storage::VindexStorage;
 
 /// Number of attention projection tensors recorded per layer in every
 /// `attn_weights_*.bin` manifest: Q, K, V, O — in that order.
@@ -25,29 +26,31 @@ impl VectorIndex {
             return Err(VindexError::Parse("attn_weights_q8.bin not found".into()));
         }
         let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_optimized(&file)? };
-        self.projections.attn_q8_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_optimized(&file)? });
 
         let manifest_path = dir.join(ATTN_WEIGHTS_Q8_MANIFEST_JSON);
-        if manifest_path.exists() {
+        let manifest = if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)
                     .map_err(|e| VindexError::Parse(e.to_string()))?,
             )
             .map_err(|e| VindexError::Parse(e.to_string()))?;
 
-            let entries: Vec<(usize, usize, usize)> = json
-                .iter()
-                .map(|e| {
-                    let offset = e["q8_offset"].as_u64().unwrap_or(0) as usize;
-                    let vals_len = e["q8_vals_len"].as_u64().unwrap_or(0) as usize;
-                    let scales_len = e["q8_scales_len"].as_u64().unwrap_or(0) as usize;
-                    (offset, vals_len, scales_len)
-                })
-                .collect();
-            self.projections.attn_q8_manifest = Some(entries);
-        }
-        self.refresh_storage();
+            Some(
+                json.iter()
+                    .map(|e| {
+                        let offset = e["q8_offset"].as_u64().unwrap_or(0) as usize;
+                        let vals_len = e["q8_vals_len"].as_u64().unwrap_or(0) as usize;
+                        let scales_len = e["q8_scales_len"].as_u64().unwrap_or(0) as usize;
+                        (offset, vals_len, scales_len)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        Arc::make_mut(&mut self.storage).set_attn_q8(mmap, manifest);
         Ok(())
     }
 
@@ -85,10 +88,10 @@ impl VectorIndex {
             return Err(VindexError::Parse("attn_weights_q4k.bin not found".into()));
         }
         let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_optimized(&file)? };
+        let mmap = Arc::new(unsafe { mmap_optimized(&file)? });
 
         let manifest_path = dir.join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON);
-        if manifest_path.exists() {
+        let manifest = if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)
                     .map_err(|e| VindexError::Parse(e.to_string()))?,
@@ -147,10 +150,11 @@ impl VectorIndex {
                     Ok((offset, length, tag.to_string()))
                 })
                 .collect::<Result<Vec<_>, VindexError>>()?;
-            self.projections.attn_q4k_manifest = Some(entries);
-        }
-        self.projections.attn_q4k_mmap = Some(Arc::new(mmap));
-        self.refresh_storage();
+            Some(entries)
+        } else {
+            None
+        };
+        Arc::make_mut(&mut self.storage).set_attn_q4k(mmap, manifest);
         Ok(())
     }
 
@@ -175,38 +179,40 @@ impl VectorIndex {
             return Err(VindexError::Parse("attn_weights_q4.bin not found".into()));
         }
         let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_optimized(&file)? };
-        self.projections.attn_q4_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_optimized(&file)? });
 
         // Load manifest with per-matrix offsets
         let manifest_path = dir.join(ATTN_WEIGHTS_Q4_MANIFEST_JSON);
-        if manifest_path.exists() {
+        let manifest = if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)
                     .map_err(|e| VindexError::Parse(e.to_string()))?,
             )
             .map_err(|e| VindexError::Parse(e.to_string()))?;
 
-            let entries: Vec<(usize, usize)> = json
-                .iter()
-                .map(|e| {
-                    let offset = e["q4_offset"].as_u64().unwrap_or(0) as usize;
-                    let length = e["q4_length"].as_u64().unwrap_or(0) as usize;
-                    (offset, length)
-                })
-                .collect();
-            self.projections.attn_q4_manifest = Some(entries);
-        }
-        self.refresh_storage();
+            Some(
+                json.iter()
+                    .map(|e| {
+                        let offset = e["q4_offset"].as_u64().unwrap_or(0) as usize;
+                        let length = e["q4_length"].as_u64().unwrap_or(0) as usize;
+                        (offset, length)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Arc::make_mut(&mut self.storage).set_attn_q4(mmap, manifest);
         Ok(())
     }
 
     /// Get raw Q4 attention weight bytes (all layers packed).
+    ///
+    /// Forwarded through [`VectorIndex::storage`]. The borrow lifetime
+    /// is tied to `&self` because `MmapStorage` keeps the
+    /// `bytes::Bytes` whole-buffer handle alive.
     pub fn attn_q4_data(&self) -> Option<&[u8]> {
-        self.projections
-            .attn_q4_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
+        self.storage.attn_q4_whole_buffer_view().map(|b| b.as_ref())
     }
 
     /// Get per-layer Q4 attention weight slices (Q, K, V, O) using the manifest.
@@ -430,17 +436,12 @@ mod tests {
 
         // …then corrupt the manifest so the V entry's slice would walk
         // off the end of the mmap. The bounds check should turn this
-        // into `None` rather than a panic. Call `refresh_storage` so
-        // the trait facade picks up the corrupted manifest — direct
-        // substore mutation is a test-only pattern (production goes
-        // through loaders, which refresh automatically).
-        let m = idx
-            .projections
-            .attn_q4k_manifest
-            .as_mut()
-            .expect("manifest");
+        // into `None` rather than a panic. Direct mutation of the
+        // storage's pub(crate) manifest field is a test-only pattern
+        // (production goes through `set_attn_q4k`).
+        let storage = std::sync::Arc::make_mut(&mut idx.storage);
+        let m = storage.attn_q4k_manifest.as_mut().expect("manifest");
         m[2] = (len, 1, "Q4_K".to_string()); // offset = len → end = len + 1 > mmap.len()
-        idx.refresh_storage();
         assert!(idx.attn_q4k_layer_data(0).is_none());
     }
 

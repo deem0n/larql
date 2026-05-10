@@ -317,4 +317,487 @@ mod tests {
         assert!(DEFAULT_REMOTE_TIMEOUT_SECS >= 5);
         assert!(DEFAULT_REMOTE_TIMEOUT_SECS <= 600);
     }
+
+    // ── End-to-end mockito tests ────────────────────────────
+    //
+    // Each test stands up a `mockito::Server`, mocks one or more
+    // `/v1/*` endpoints with canned JSON, then drives the matching
+    // forwarder via the public verbs. Tests validate that the request
+    // hits the right path, parses the response shape, and surfaces a
+    // user-readable summary.
+
+    use crate::executor::Session;
+
+    fn connect(server_url: &str) -> Session {
+        let mut session = Session::new();
+        session
+            .exec_use_remote(server_url)
+            .expect("exec_use_remote with mocked /v1/stats");
+        session
+    }
+
+    fn stats_body() -> String {
+        serde_json::json!({
+            "model": "test-model",
+            "family": "llama",
+            "layers": 32,
+            "features": 4096,
+            "hidden_size": 1024,
+            "dtype": "f32",
+            "extract_level": "all",
+            "loaded": {"browse": true, "inference": false},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn use_remote_succeeds_when_server_reachable() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(stats_body())
+            .create();
+
+        let session = connect(&server.url());
+        assert!(session.is_remote());
+    }
+
+    #[test]
+    fn use_remote_errors_on_5xx() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(503)
+            .with_body("upstream down")
+            .create();
+
+        let mut session = Session::new();
+        let err = session.exec_use_remote(&server.url()).unwrap_err();
+        assert!(err.to_string().contains("503"));
+    }
+
+    #[test]
+    fn use_remote_errors_on_invalid_json() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body("not actually json")
+            .create();
+
+        let mut session = Session::new();
+        let err = session.exec_use_remote(&server.url()).unwrap_err();
+        assert!(err.to_string().contains("invalid response"));
+    }
+
+    #[test]
+    fn use_remote_errors_when_server_unreachable() {
+        let mut session = Session::new();
+        // Port 1 is reserved + nothing's listening there.
+        let err = session
+            .exec_use_remote("http://127.0.0.1:1")
+            .unwrap_err();
+        assert!(err.to_string().contains("failed to connect"));
+    }
+
+    #[test]
+    fn remote_stats_renders_summary() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(stats_body())
+            .expect_at_least(1)
+            .create();
+
+        let session = connect(&server.url());
+        let out = session.remote_stats().unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("test-model"));
+        assert!(joined.contains("Layers: 32"));
+        assert!(joined.contains("Features: 4096"));
+    }
+
+    #[test]
+    fn remote_walk_renders_hits() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _walk = server
+            .mock("GET", mockito::Matcher::Regex(r"/v1/walk".into()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "hits": [
+                        {"layer": 5, "feature": 3, "gate_score": 12.5, "target": "Paris"},
+                        {"layer": 7, "feature": 1, "gate_score": 9.0, "target": "France"}
+                    ],
+                    "latency_ms": 42.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session.remote_walk("test prompt", Some(3), None).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Paris"));
+        assert!(joined.contains("France"));
+        assert!(joined.contains("42"));
+    }
+
+    #[test]
+    fn remote_describe_renders_edges() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _describe = server
+            .mock("GET", mockito::Matcher::Regex(r"/v1/describe".into()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "edges": [
+                        {
+                            "target": "Paris",
+                            "gate_score": 14.2,
+                            "layer": 26,
+                            "relation": "capital",
+                            "source": "probe",
+                            "also": ["French", "Europe"],
+                        }
+                    ],
+                    "latency_ms": 15.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_describe("France", None, crate::ast::DescribeMode::Verbose)
+            .unwrap();
+        let joined = out.join("\n");
+        assert!(joined.starts_with("France"));
+        assert!(joined.contains("Paris"));
+        assert!(joined.contains("capital"));
+    }
+
+    #[test]
+    fn remote_describe_no_edges_emits_friendly_line() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _describe = server
+            .mock("GET", mockito::Matcher::Regex(r"/v1/describe".into()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"edges": [], "latency_ms": 5.0}).to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_describe("X", None, crate::ast::DescribeMode::Brief)
+            .unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("(no edges found)"));
+    }
+
+    #[test]
+    fn remote_infer_renders_predictions() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _infer = server
+            .mock("POST", ENDPOINT_INFER)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "predictions": [
+                        {"token": "Paris", "probability": 0.7},
+                        {"token": "Lyon", "probability": 0.1}
+                    ],
+                    "latency_ms": 12.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_infer("The capital of France is", Some(2), false)
+            .unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Paris"));
+        assert!(joined.contains("70.00%"));
+    }
+
+    #[test]
+    fn remote_infer_compare_mode_renders_walk_and_dense() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _infer = server
+            .mock("POST", ENDPOINT_INFER)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "walk": [{"token": "Paris", "probability": 0.7}],
+                    "walk_ms": 10.0,
+                    "dense": [{"token": "Paris", "probability": 0.65}],
+                    "dense_ms": 80.0,
+                    "latency_ms": 92.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_infer("test", Some(1), true)
+            .unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Predictions (walk)"));
+        assert!(joined.contains("Predictions (dense)"));
+    }
+
+    #[test]
+    fn remote_select_renders_edge_table() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _select = server
+            .mock("POST", ENDPOINT_SELECT)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "edges": [
+                        {"layer": 5, "feature": 1, "target": "Paris", "c_score": 0.95, "relation": "capital"}
+                    ],
+                    "total": 1,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session.remote_select(&[], Some(10)).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Paris"));
+        assert!(joined.contains("capital"));
+        assert!(joined.contains("1 total"));
+    }
+
+    #[test]
+    fn remote_select_empty_emits_no_match_line() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _select = server
+            .mock("POST", ENDPOINT_SELECT)
+            .with_status(200)
+            .with_body(serde_json::json!({"edges": [], "total": 0}).to_string())
+            .create();
+
+        let session = connect(&server.url());
+        let out = session.remote_select(&[], None).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("(no matching edges)"));
+    }
+
+    #[test]
+    fn remote_show_relations_renders_probe_section() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _rel = server
+            .mock("GET", ENDPOINT_RELATIONS)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "probe_relations": [
+                        {"name": "capital", "count": 12},
+                        {"name": "language", "count": 8}
+                    ],
+                    "probe_count": 2,
+                    "relations": [],
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_show_relations(crate::ast::DescribeMode::Verbose, false)
+            .unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Probe-confirmed"));
+        assert!(joined.contains("capital"));
+    }
+
+    #[test]
+    fn remote_insert_returns_summary() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _insert = server
+            .mock("POST", ENDPOINT_INSERT)
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "inserted": 3,
+                    "mode": "compose",
+                    "latency_ms": 250.0,
+                })
+                .to_string(),
+            )
+            .create();
+
+        let session = connect(&server.url());
+        let out = session
+            .remote_insert("Atlantis", "capital", "Poseidon", Some(26), Some(0.95))
+            .unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("Atlantis"));
+        assert!(joined.contains("Poseidon"));
+        assert!(joined.contains("compose"));
+    }
+
+    #[test]
+    fn remote_delete_uses_explicit_layer_feature() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+        let _apply = server
+            .mock("POST", ENDPOINT_PATCHES_APPLY)
+            .with_status(200)
+            .with_body(serde_json::json!({"ok": true}).to_string())
+            .create();
+
+        let session = connect(&server.url());
+        let conds = vec![
+            Condition {
+                field: "layer".into(),
+                op: crate::ast::CompareOp::Eq,
+                value: Value::Integer(5),
+            },
+            Condition {
+                field: "feature".into(),
+                op: crate::ast::CompareOp::Eq,
+                value: Value::Integer(7),
+            },
+        ];
+        let out = session.remote_delete(&conds).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("L5 F7"));
+    }
+
+    #[test]
+    fn remote_delete_errors_when_layer_missing() {
+        // No mockito setup needed — request never goes out because
+        // the precondition check rejects the call locally.
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+
+        let session = connect(&server.url());
+        let conds = vec![Condition {
+            field: "feature".into(),
+            op: crate::ast::CompareOp::Eq,
+            value: Value::Integer(0),
+        }];
+        let err = session.remote_delete(&conds).unwrap_err();
+        assert!(err.to_string().contains("layer"));
+    }
+
+    #[test]
+    fn remote_show_patches_empty_when_none_applied() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+
+        let session = connect(&server.url());
+        let out = session.remote_show_patches().unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("(no local patches)"));
+    }
+
+    #[test]
+    fn remote_remove_local_patch_errors_on_unknown_name() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+
+        let mut session = connect(&server.url());
+        let err = session.remote_remove_local_patch("nope").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn remote_apply_local_patch_errors_when_file_missing() {
+        let mut server = mockito::Server::new();
+        let _stats = server
+            .mock("GET", ENDPOINT_STATS)
+            .with_status(200)
+            .with_body(stats_body())
+            .create();
+
+        let mut session = connect(&server.url());
+        let err = session
+            .remote_apply_local_patch("/tmp/definitely_not_a_real_patch_file.vlp")
+            .unwrap_err();
+        assert!(err.to_string().contains("patch not found"));
+    }
+
+    #[test]
+    fn http_helpers_error_when_not_remote() {
+        // A session with no `USE` should fail every remote forwarder
+        // before any HTTP request is sent.
+        let session = Session::new();
+        assert!(session.remote_stats().is_err());
+        let conds: Vec<Condition> = vec![];
+        assert!(session.remote_select(&conds, None).is_err());
+    }
 }

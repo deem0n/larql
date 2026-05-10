@@ -352,6 +352,75 @@ mod tests {
     }
 
     #[test]
+    fn guided_walk_with_per_layer_features_drives_walk_ffn_loop() {
+        // Hand-construct a universe with a few features per layer so the
+        // `guided_walk_ffn` per-feature loop actually iterates.
+        let w = weights();
+        let idx = make_test_vindex(w);
+        let mut features = std::collections::HashMap::new();
+        // intermediate_size is 32 in the synthetic fixture.
+        for layer in 0..w.num_layers {
+            features.insert(layer, vec![0usize, 5, 10, 17, 31]);
+        }
+        let universe = TemplateUniverse {
+            name: "non-empty".into(),
+            features,
+        };
+        let g = GuidedWalkLayerGraph {
+            weights: w,
+            universe: &universe,
+            index: &idx,
+        };
+        let h = input(2, w.hidden_size);
+        for layer in 0..w.num_layers {
+            let out = g.forward_layer(w, &h, layer).expect("layer should run");
+            assert_eq!(out.residual.shape(), &[2, w.hidden_size]);
+            assert!(
+                out.residual.iter().all(|v| v.is_finite()),
+                "layer {layer} should produce finite output"
+            );
+        }
+    }
+
+    #[test]
+    fn universe_summary_runs_without_panicking() {
+        // summary() prints to stdout — we just verify it doesn't panic on
+        // populated and empty universes. Captures both branches (n > 0 and
+        // n == 0).
+        let mut features = std::collections::HashMap::new();
+        features.insert(0, vec![1, 2, 3]);
+        features.insert(1, vec![]);
+        let universe = TemplateUniverse {
+            name: "test".into(),
+            features,
+        };
+        universe.summary();
+
+        let empty = TemplateUniverse {
+            name: "empty".into(),
+            features: std::collections::HashMap::new(),
+        };
+        empty.summary();
+    }
+
+    #[test]
+    fn detect_template_picks_first_among_equal_length_prefixes() {
+        // Two templates of equal length both match → first index wins
+        // (the longest-prefix-wins tiebreak only fires when lengths differ).
+        let a = TemplatePattern {
+            name: "a".into(),
+            prefix_tokens: vec![1, 2],
+            cached_layers: 0..=5,
+        };
+        let b = TemplatePattern {
+            name: "b".into(),
+            prefix_tokens: vec![1, 2],
+            cached_layers: 0..=5,
+        };
+        assert_eq!(detect_template(&[1, 2, 99], &[a, b]), Some(0));
+    }
+
+    #[test]
     fn guided_walk_all_layers_finite() {
         let w = weights();
         let idx = make_test_vindex(w);

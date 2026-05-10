@@ -53,17 +53,7 @@ impl VectorIndex {
         // 2026-04-27). Routing through `q4k_matvec` (which takes raw f32 x,
         // no Q8 step) restores the format match.
         if backend.has_q4() {
-            let q4_bytes: Option<&[u8]> = self
-                .projections
-                .lm_head_q4_mmap
-                .as_ref()
-                .map(|m| m.as_ref() as &[u8])
-                .or_else(|| {
-                    self.projections
-                        .lm_head_q4_synth
-                        .as_ref()
-                        .map(|v| v.as_slice())
-                });
+            let q4_bytes: Option<&[u8]> = self.storage.lm_head_q4_view().map(|b| b.as_ref());
             if let Some(q4_data) = q4_bytes {
                 let vocab = self.vocab_size;
                 let hidden = self.hidden_size;
@@ -147,7 +137,8 @@ impl VectorIndex {
         top_k: usize,
         backend: &dyn larql_compute::ComputeBackend,
     ) -> Option<Vec<(u32, f32)>> {
-        if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
+        if let Some(f16_view) = self.storage.lm_head_f16_view() {
+            let f16_mmap: &[u8] = f16_view.as_ref();
             let vocab = self.vocab_size;
             let hidden = self.hidden_size;
             if vocab > 0 {
@@ -299,10 +290,11 @@ impl VectorIndex {
     /// Single BLAS gemv: query[1, hidden] @ lm_head[vocab, hidden]^T → [1, vocab].
     /// Then top-K selection. Returns (token_id, score) sorted by score descending.
     pub fn lm_head_knn(&self, query: &ndarray::Array1<f32>, top_k: usize) -> Vec<(u32, f32)> {
-        let mmap = match self.projections.lm_head_mmap.as_ref() {
-            Some(m) => m,
+        let mmap_view = match self.storage.lm_head_f32_view() {
+            Some(v) => v,
             None => return vec![],
         };
+        let mmap: &[u8] = mmap_view.as_ref();
         let vocab = self.vocab_size;
         let hidden = self.hidden_size;
         if vocab == 0 {

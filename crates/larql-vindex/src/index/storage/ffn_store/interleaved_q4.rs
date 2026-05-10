@@ -19,20 +19,20 @@ impl VectorIndex {
             return Err(VindexError::Parse("interleaved_q4.bin not found".into()));
         }
         let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.interleaved_q4_mmap = Some(Arc::new(mmap));
-        self.refresh_storage();
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
+        Arc::make_mut(&mut self.storage).set_interleaved_q4(mmap);
         Ok(())
     }
 
     pub fn has_interleaved_q4(&self) -> bool {
-        self.ffn.interleaved_q4_mmap.is_some()
+        self.storage.has_interleaved_q4()
     }
 
     /// Dequantize one matrix from Q4 interleaved file → f32 Array2.
     /// component: 0=gate, 1=up, 2=down
     fn dequant_q4_matrix(&self, layer: usize, component: usize) -> Option<ndarray::Array2<f32>> {
-        let mmap = self.ffn.interleaved_q4_mmap.as_ref()?;
+        let mmap_view = self.storage.interleaved_q4_whole_buffer_view()?;
+        let mmap: &[u8] = mmap_view.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 {
             return None;
@@ -72,7 +72,8 @@ impl VectorIndex {
     /// Prefetch next layer's Q4 data.
     pub fn prefetch_interleaved_q4_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.ffn.interleaved_q4_mmap {
+        if let Some(mmap_view) = self.storage.interleaved_q4_whole_buffer_view() {
+            let mmap: &[u8] = mmap_view.as_ref();
             let intermediate = self.num_features(layer);
             if intermediate == 0 {
                 return;
