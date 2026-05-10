@@ -22,10 +22,14 @@ detail.
 3. **Finish hardening H12** — H8/H9/H11 shipped 2026-05-10 (typed
    `DumpConfig` + `RemoteMoeRuntime` for env toggles, root surface trimmed
    by 24 names with `research` re-sourced from subpaths, no hardcoded
-   family branches remain in generic generation paths). H12 still partial:
-   three orchestration files > 800 LOC remain (`layer_graph/generate/gpu.rs`,
-   `ffn/moe_remote/shard.rs`, `layer_graph/predict.rs`) — each is a focused
-   1-day split along clear in-file section seams. See "Open: inference crate hardening".
+   family branches remain in generic generation paths). H12 partial:
+   `layer_graph/predict.rs` (881) split into `predict/` directory
+   2026-05-10. Two orchestration files still > 800 LOC remain — each is a
+   focused split:
+   - `layer_graph/generate/gpu.rs` (902) — `generate_streaming` is a single
+     497-LOC fn; cleavable into prefill / decode-loop / sampling-step.
+   - `ffn/moe_remote/shard.rs` (924) — Http/Uds/Grpc transport branches
+     can each move to a per-transport submodule. See "Open: inference crate hardening".
 
 4. **R4 — research trace export contract** — only remaining R-item from the
    mech-interp engine surface; unblocks MI4 onwards. See "Open: Mechanistic
@@ -1800,5 +1804,6 @@ for an incremental pass.
 | H8: `ffn::moe_remote::runtime::RemoteMoeRuntime` | 2026-05-10 | New `OnceLock`-backed runtime config consolidates 6 inline reads (`LARQL_HTTP_TIMING`, `LARQL_MOE_WIRE_F16`, `LARQL_DISABLE_Q8K_WIRE`, `LARQL_VERBOSE`) across `moe_remote/shard.rs` (HTTP + UDS transports) and `moe_remote/backend.rs`. Replaces two `thread_local!` block caches that fragmented the toggle state per worker thread. 3 new tests |
 | H9: trim crate-root re-exports | 2026-05-10 | Dropped 17 `forward::*` (e.g. `RawForward`, `LayerMode`, `forward_raw_logits`, `infer_patched_q4k`, `KNN_COSINE_THRESHOLD`) + 7 `layer_graph::*` (`GridGenerateResult`, `ChatMLRenderer`, `GemmaRenderer`, `LayerOutput`, `Llama3Renderer`, `PerLayerGraph`, `TurnRenderer`) re-exports with zero external consumers AND zero in-crate example/test usage. `research` module rewritten to source from full subpaths (`crate::forward::*`, `crate::layer_graph::*`, `crate::trace::*`) so it survives further root trims. Crate-root surface narrowed from ~120 to ~96 names |
 | H11: verified — no hardcoded family branches | 2026-05-10 | Audit found one remaining `match router_type { "gemma4_top_k_softmax" => ... }` at `pipeline_layer.rs:546`. That's the architecture trait's `router_type` metadata signal — the policy-object pattern this item asks for, not a hardcoded family check. H11 done |
-| H12: deferred with rationale | 2026-05-10 | Three orchestration files still > 800 LOC: `layer_graph/generate/gpu.rs` (902), `ffn/moe_remote/shard.rs` (924), `layer_graph/predict.rs` (881). Each splits into 3-5 sub-modules along in-file `// ───` section seams; needs a focused dedicated session per file (cross-module visibility changes, public API stability work) |
-| Lib tests: 631 → 639 | 2026-05-10 | 8 new tests for the two new typed configs; all 639 lib tests pass clean |
+| H12: split `layer_graph/predict.rs` | 2026-05-10 | 881-LOC single file → `predict/` directory: `mod.rs` 376 (entry + small variants `predict_with_graph`, `predict_with_graph_vindex_logits`, `predict_pipeline`, `trace_with_graph` + tests), `split.rs` 285 (`predict_split_pass` 3-pass approximate-attention pipeline + `predict_split_cached` logits-only fast path), `honest.rs` 261 (`predict_honest` production GPU+CPU hybrid). All 9 predict tests pass; no public API change |
+| H12: remaining files documented | 2026-05-10 | Two orchestration files still > 800 LOC: `layer_graph/generate/gpu.rs` (902 — `generate_streaming` is a single 497-LOC fn, splittable into prefill/decode-loop/sampling-step), `ffn/moe_remote/shard.rs` (924 — Http/Uds/Grpc transport branches splittable per transport). Each is one focused follow-up session |
+| Lib tests: 631 → 639 | 2026-05-10 | 8 new tests for the two new typed configs (5 DumpConfig + 3 RemoteMoeRuntime); split of predict.rs preserved all existing tests; all 639 lib tests pass clean |
