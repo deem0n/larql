@@ -384,10 +384,8 @@ impl GgufFile {
             let key_length = get_arch_u32(GGUF_ATTENTION_KEY_LENGTH);
             if key_length > 0 {
                 key_length
-            } else if num_heads > 0 {
-                hidden_size / num_heads
             } else {
-                0
+                hidden_size.checked_div(num_heads).unwrap_or(0)
             }
         };
         let num_kv_heads = if num_kv_heads > 0 {
