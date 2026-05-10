@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-check-fast larql-compute-check-tests larql-compute-check-all larql-compute-test-metal-decode larql-compute-test-metal-lib larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples larql-kv-ci larql-kv-test larql-kv-fmt-check larql-kv-lint larql-kv-examples larql-kv-bench-test larql-kv-bench larql-kv-coverage larql-kv-coverage-summary larql-kv-coverage-html larql-kv-coverage-policy larql-server-ci larql-server-test larql-server-fmt-check larql-server-lint larql-server-coverage larql-server-coverage-summary larql-server-coverage-html larql-server-coverage-policy
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-check-fast larql-compute-check-tests larql-compute-check-all larql-compute-test-metal-decode larql-compute-test-metal-lib larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples larql-kv-ci larql-kv-test larql-kv-fmt-check larql-kv-lint larql-kv-examples larql-kv-bench-test larql-kv-bench larql-kv-coverage larql-kv-coverage-summary larql-kv-coverage-html larql-kv-coverage-policy larql-server-ci larql-server-test larql-server-fmt-check larql-server-lint larql-server-coverage larql-server-coverage-summary larql-server-coverage-html larql-server-coverage-policy larql-lql-ci larql-lql-test larql-lql-fmt-check larql-lql-lint larql-lql-examples larql-lql-bench-test larql-lql-coverage-summary larql-cli-ci larql-cli-test larql-cli-fmt-check larql-cli-lint larql-cli-coverage-summary larql-inference-ci larql-inference-test larql-inference-fmt-check larql-inference-lint larql-inference-bench-test larql-inference-coverage-summary
 
 # Build
 build:
@@ -442,6 +442,88 @@ larql-server-coverage-html:
 	@echo "Report: coverage/larql-server/html/index.html"
 
 larql-server-ci: larql-server-fmt-check larql-server-lint larql-server-test
+
+# larql-lql — LQL parser, executor, REPL. Crate has no metal default;
+# Remote-backend tests use `mockito`, no real model weights required.
+larql-lql-test:
+	cargo test -p larql-lql
+
+larql-lql-fmt-check:
+	cargo fmt -p larql-lql -- --check
+
+larql-lql-lint:
+	cargo clippy -p larql-lql --all-targets --no-deps -- -D warnings
+
+larql-lql-examples:
+	cargo check -p larql-lql --examples
+
+larql-lql-bench-test:
+	cargo test -p larql-lql --benches
+
+larql-lql-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-lql --summary-only
+
+larql-lql-ci: larql-lql-fmt-check larql-lql-lint larql-lql-test larql-lql-examples larql-lql-bench-test
+
+# larql-cli — top-level `larql` binary. Default features pull in Metal
+# on every member crate; CPU-only matrix uses `--no-default-features`.
+LARQL_CLI_DEFAULT_FEATURES ?= --no-default-features
+
+larql-cli-test:
+	cargo test -p larql-cli $(LARQL_CLI_DEFAULT_FEATURES)
+
+larql-cli-fmt-check:
+	cargo fmt -p larql-cli -- --check
+
+# Lint disabled: 2026-05-10 `larql-cli` carries ~82 pre-existing clippy
+# errors under default features and ~112 under `--no-default-features`
+# (mostly `large_enum_variant` and `dead_code` on metal-only paths).
+# Re-enable `-- -D warnings` after that backlog is cleared.
+larql-cli-lint:
+	cargo clippy -p larql-cli --bins --tests $(LARQL_CLI_DEFAULT_FEATURES) --no-deps
+
+larql-cli-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-cli $(LARQL_CLI_DEFAULT_FEATURES) --summary-only
+
+larql-cli-ci: larql-cli-fmt-check larql-cli-test
+
+# larql-inference — transformer inference engine. Tests requiring real
+# model weights are gated `#[ignore]` (test_arch_golden, test_logits_goldens,
+# test_gemma3_smoke, test_generate_q4k_cpu, test_layer_graph_integration);
+# CI runs the default set only. Several diagnostic examples lag the
+# refactored `larql-compute` decode API and are excluded from `--all-targets`
+# until repaired.
+larql-inference-test:
+	cargo test -p larql-inference
+
+larql-inference-fmt-check:
+	cargo fmt -p larql-inference -- --check
+
+larql-inference-lint:
+	cargo clippy -p larql-inference --lib --tests --benches --no-deps -- -D warnings
+
+larql-inference-bench-test:
+	cargo test -p larql-inference --benches
+
+larql-inference-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-inference --summary-only
+
+larql-inference-ci: larql-inference-fmt-check larql-inference-lint larql-inference-test larql-inference-bench-test
 
 # Check (compile without building)
 check:
