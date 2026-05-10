@@ -74,6 +74,10 @@ enum Commands {
     /// Benchmark decode throughput on a real vindex (Metal / CPU / Ollama).
     Bench(bench_cmd::BenchArgs),
 
+    /// Shannon-style next-token bit measurements and demo compression.
+    #[command(subcommand)]
+    Shannon(shannon_cmd::ShannonCommand),
+
     // ── Server ──────────────────────────────────────────────────────
     #[command(next_help_heading = "Server")]
     /// Serve a vindex over HTTP + gRPC.
@@ -491,6 +495,7 @@ fn main() {
         Commands::Run(args) => run_cmd::run(args),
         Commands::Chat(args) => run_cmd::run(args.into()),
         Commands::Bench(args) => bench_cmd::run(args),
+        Commands::Shannon(cmd) => shannon_cmd::run(cmd),
         Commands::Pull(args) => pull_cmd::run(args),
         Commands::Model(args) => model_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
