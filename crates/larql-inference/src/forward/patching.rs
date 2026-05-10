@@ -256,23 +256,25 @@ mod tests {
     #[test]
     fn patch_changes_recipient_residual_downstream() {
         // Patch donor's post-layer residual at layer 0, position 1 into
-        // recipient. The capture at layer 2 (downstream) must differ from
-        // the un-patched baseline.
+        // recipient. The capture at the next layer (downstream) must
+        // differ from the un-patched baseline. 2-layer fixture: patch at
+        // layer 0, observe at layer 1.
         let weights = shared_weights();
-        if weights.num_layers < 3 {
-            return; // synthetic test weights don't have enough layers
+        if weights.num_layers < 2 {
+            return; // need at least 2 layers for upstream→downstream
         }
+        let downstream = weights.num_layers - 1;
         let donor_tokens = vec![10u32, 20, 30];
         let recipient_tokens = vec![1u32, 2, 3];
 
         let donor = capture_donor_state(weights, &donor_tokens, &[(0, 1)]);
         assert_eq!(donor.len(), 1);
 
-        let baseline = baseline_residual(weights, &recipient_tokens, 2);
-        let patched = patch_and_trace(weights, &recipient_tokens, &donor, &[2])
+        let baseline = baseline_residual(weights, &recipient_tokens, downstream);
+        let patched = patch_and_trace(weights, &recipient_tokens, &donor, &[downstream])
             .residuals
             .into_iter()
-            .find(|(l, _)| *l == 2)
+            .find(|(l, _)| *l == downstream)
             .unwrap()
             .1;
 

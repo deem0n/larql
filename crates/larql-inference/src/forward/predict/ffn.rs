@@ -187,8 +187,7 @@ mod tests {
     fn predict_with_router_routes_per_layer() {
         let fx = TestFixtures::build();
         let ffn = WeightFfn { weights: &fx.weights };
-        let backends: Vec<&dyn FfnBackend> = (0..fx.weights.num_layers).map(|_| &ffn as &dyn FfnBackend).collect();
-        let router = LayerFfnRouter::new(backends);
+        let router = LayerFfnRouter::uniform(&ffn, fx.weights.num_layers);
         let result = predict_with_router(&fx.weights, &fx.tokenizer, &[0u32, 1], 3, &router);
         assert!(result.predictions.len() <= 3);
     }

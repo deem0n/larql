@@ -32,11 +32,20 @@
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
   - `config/{index,quantization,model,compliance,dtype}.rs` — was the
     624-line `types.rs` monolith
-  - Large-file debt **closed 2026-05-10**: every non-test file in the
-    crate is under the soft 600-LOC threshold. The four largest
-    are now `format/weights/write_q4k/mod.rs` (318 L after split),
-    `index/storage/lm_head/knn.rs` (~525), `index/storage/attn.rs`,
-    and `quant/convert_q4k.rs` — all comfortably below the threshold.
+  - Large-file debt **partially closed 2026-05-10**: every file
+    touched by rounds 4–5 is under the soft 600-LOC threshold, but
+    the 2026-05-10 health pass found 8 files ≥800 LOC that were not
+    in the round work-set (notably the new
+    `index/storage/vindex_storage/mmap_storage.rs` 1182 L from the
+    `VindexStorage` migration, and pre-existing
+    `walker/vector_extractor.rs` 1213 L,
+    `format/huggingface/download.rs` 941 L,
+    `format/huggingface/publish/lfs.rs` 905 L,
+    `index/types/ffn_row.rs` 875 L,
+    `extract/build_helpers.rs` 848 L,
+    `index/storage/gate_accessors.rs` 845 L,
+    `format/huggingface/discovery.rs` 800 L). Tracked under P1
+    "Residual large-file debt" below.
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
   one table entry plus codec functions; ~3-file edit. Block sizes flow
   through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS` (round-4 M4).
@@ -70,13 +79,12 @@
   larql-vindex-coverage-html` (cargo-llvm-cov) enforce both the
   aggregate line floor and `coverage-policy.json`.
 - **Coverage ratchet**: aggregate floor is 71% lines from the
-  2026-05-08 baseline of 71.56%; current measured **88.90% lines**
-  as of 2026-05-10 round-6. Per-source-file default is 90%; files
-  below that are explicit debt baselines (40 entries) and should
-  only move upward. **85 of 125 files at the 90% default**, up from
-  41 on 2026-05-08. Today's round-6 push lifted 13 files past the
-  default — see `CHANGELOG.md` for the per-file deltas. Aggregate
-  gap to 90%: **1.1 points**.
+  2026-05-08 baseline of 71.56%; current measured **90.04% lines**
+  as of 2026-05-10 (cleared the workspace 90% line for the first
+  time after the post-`VindexStorage` push). Per-source-file
+  default is 90%; files below that are explicit debt baselines
+  (40 entries) and should only move upward. **86 of 126 files at
+  the 90% default**, up from 41 on 2026-05-08.
 - **Cross-platform CI**: `.github/workflows/larql-vindex.yml` runs
   format, check, examples, clippy, tests, and bench compile/tests on
   Linux, Windows, and macOS. Coverage policy runs on Ubuntu.
@@ -134,9 +142,12 @@ debt without a split plan.
 ### `VindexStorage` trait abstraction
 **Impact**: Lets Redis / S3 / GPU-residency backends plug in
 **Effort**: Medium
-**Status**: Active — promoted from P2 on 2026-05-10 after Phase 2
-closed (per-layer FFN cool-machine rerun reproduced both 88.1 / 19.4
-baselines).
+**Status**: ✅ Closed 2026-05-10 — all 7 migration steps shipped;
+walk kernels, Metal dispatch, KNN, and overlay all consume the
+trait. Future Redis / S3 backends land as parallel `VindexStorage`
+impls without touching this code. Detail kept here as the migration
+record; the section will move to `CHANGELOG.md` next time a P0 item
+displaces it.
 
 The substore extraction (`GateStore`, `FfnStore`, `ProjectionStore`,
 `MetadataStore`) got most of the way there. Formalise a sealed
@@ -271,6 +282,90 @@ Acceptance bar (met 2026-05-09): vector-only and model-backed extracts
 agree on family, embedding scale, layer bands, and required tensor
 coverage; unsupported attention layouts fail before any file is written;
 no string-prefix inheritance of curated band tables.
+
+### Residual large-file debt (review finding 2026-05-10)
+**Impact**: Code navigability + future split cost
+**Effort**: Small–Medium per file
+**Status**: Active — opened by 2026-05-10 health pass after the
+"large-file debt closed" claim was found to apply only to files in
+rounds 4–5 work-sets.
+
+Files ≥800 LOC, ranked by tractability:
+
+- [ ] `walker/vector_extractor.rs` (1213 L) — multi-stage build
+  pipeline; split per stage (likely highest-leverage win).
+- [ ] `extract/build_helpers.rs` (848 L) — weight extraction
+  utilities; group by family/quantisation.
+- [ ] `format/huggingface/download.rs` (941 L) — separate retry +
+  manifest parsing from the download driver.
+- [ ] `format/huggingface/publish/lfs.rs` (905 L) — split LFS batch
+  protocol from upload driver (mirror of round-5 publish split).
+- [ ] `format/huggingface/discovery.rs` (800 L) — split detection
+  heuristics from resolution.
+- [ ] `index/types/ffn_row.rs` (875 L) — accessor trait impls;
+  split per row type if natural seams exist.
+- [ ] `index/storage/gate_accessors.rs` (845 L) — gate KNN
+  dispatch; revisit after the Step 6/7 migration settles.
+- [x] `index/storage/vindex_storage/mmap_storage.rs` (1182 L) —
+  **kept as a single file by design**: 12-method trait impl, dense
+  per-substore mmap storage. Splitting by trait method fragments
+  without modularity gain. Marked "won't split" once accepted.
+
+**Acceptance bar**: 7 listed files (excluding `mmap_storage.rs`)
+under the 600-LOC soft threshold, or each carries a documented
+"won't split" rationale matching `mmap_storage`'s.
+
+### Production-path `unwrap`/`expect` triage (review finding 2026-05-10)
+**Impact**: Crash-safety on I/O failures
+**Effort**: Small
+**Status**: Active
+
+The 2026-05-10 health pass counted ~120 `.unwrap()`/`.expect()`/
+`panic!` sites in production code (after filtering `#[cfg(test)]`
+modules). Most are defensible — `Mutex::lock().unwrap()` (only
+fails on poison) and `ndarray` shape ops with statically-correct
+shapes — but a subset hides genuinely fallible I/O.
+
+Hotspots:
+
+| File | Count |
+|---|---|
+| `index/storage/gate_store.rs` | 12 |
+| `index/compute/gate_knn/hnsw_lifecycle.rs` | 12 |
+| `index/compute/gate_knn/scores_batch.rs` | 9 |
+| `extract/build_from_vectors.rs` | 9 |
+| `patch/knn_store.rs` | 8 |
+| `index/storage/ffn_store/q4k_cache.rs` | 6 |
+
+**Concrete first target**: `gate_store.rs:391`
+(`MmapMut::map_anon(total_bytes).unwrap()`) — real fallible
+allocation panicking the index. Convert to `?` propagating
+`VindexError::Io`.
+
+**Acceptance bar**: every `.unwrap()` in the six hotspot files is
+either (a) a mutex lock or statically-provable shape op (leave
+alone, no comment needed), or (b) converted to `?` with a typed
+error. New `.unwrap()` sites in production paths require a
+one-line justification comment.
+
+### Coverage round-7 (review finding 2026-05-10)
+**Impact**: Per-file ratchet — 40 files still below the 90% default
+**Effort**: Small per file
+**Status**: Active
+
+Aggregate is at 90.04% (workspace floor met for the first time),
+but the per-file ratchet has 40 debt entries. Highest-leverage
+targets by current coverage:
+
+- [ ] `format/weights/write_q4k/moe_layers.rs` — **34.0%** (the
+  single biggest tractable win)
+- [ ] `config/compliance.rs` — 57.9%
+- [ ] `format/load.rs` — 62.9%
+- [ ] `engine/core.rs` — 82.0%
+
+**Acceptance bar**: each listed file moves to ≥90% line coverage
+or carries a documented rationale (e.g. error-path branches that
+require a real S3 outage to exercise).
 
 ### Cached layer decode for template-fixed layers (L0–12) — parked
 **Impact**: 155+ tok/s decode (skip 13 of 21 layers)

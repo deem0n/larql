@@ -89,6 +89,7 @@ impl MetalBackend {
                 ple_input_gate: None,
                 ple_projection: None,
                 ple_post_norm: None,
+                kv_shared_source: None,
             })
             .collect();
         ops::full_pipeline::dispatch_full_pipeline(

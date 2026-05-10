@@ -529,6 +529,14 @@ pub struct FullPipelineLayer<'a> {
     pub ple_projection: Option<&'a [f32]>,
     /// Post-PLE RMSNorm weight `[hidden]`, f32. `None` for non-PLE archs.
     pub ple_post_norm: Option<&'a [f32]>,
+
+    /// KV-cache sharing source: when `Some(src)`, this layer reuses K/V from
+    /// layer `src`'s cache instead of computing its own. Gemma 4 E2B's last
+    /// 20 of 35 layers point to the last non-shared sliding (or global) layer
+    /// of the same attention type. `None` for non-shared layers — the
+    /// production case for every model except E2B and similar future
+    /// KV-shared archs.
+    pub kv_shared_source: Option<usize>,
 }
 
 impl<'a> FullPipelineLayer<'a> {
@@ -707,6 +715,7 @@ impl Default for FullPipelineLayer<'_> {
             ple_input_gate: None,
             ple_projection: None,
             ple_post_norm: None,
+            kv_shared_source: None,
         }
     }
 }

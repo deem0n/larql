@@ -97,6 +97,54 @@ impl<'a> LayerFfnRouter<'a> {
     }
 }
 
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::test_utils::make_test_weights;
+    use weight::WeightFfn;
+
+    #[test]
+    fn ffn_backend_default_forward_moe_full_layer_returns_none() {
+        // The trait's default `forward_moe_full_layer` impl always
+        // returns None — non-MoE backends rely on this fallback.
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let h = larql_vindex::ndarray::Array2::<f32>::zeros((1, weights.hidden_size));
+        assert!(ffn.forward_moe_full_layer(0, &h).is_none());
+    }
+
+    #[test]
+    fn layer_ffn_router_uniform_returns_same_backend_for_every_layer() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let router = LayerFfnRouter::uniform(&ffn, 4);
+        // All four layers return the same backend's name.
+        for layer in 0..4 {
+            assert_eq!(router.get(layer).name(), "weights");
+        }
+    }
+
+    #[test]
+    fn layer_ffn_router_per_layer_dispatches_per_index() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let backends: Vec<&dyn FfnBackend> = (0..3).map(|_| &ffn as &dyn FfnBackend).collect();
+        let router = LayerFfnRouter::per_layer(backends);
+        for layer in 0..3 {
+            assert_eq!(router.get(layer).name(), "weights");
+        }
+    }
+
+    #[test]
+    fn layer_ffn_router_get_out_of_range_clamps_to_last() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let router = LayerFfnRouter::uniform(&ffn, 2);
+        // Layer 99 > num_layers=2 → clamps to last (index 1).
+        assert_eq!(router.get(99).name(), "weights");
+    }
+}
+
 // ── Activation functions ──
 
 pub fn sigmoid(x: f32) -> f32 {
