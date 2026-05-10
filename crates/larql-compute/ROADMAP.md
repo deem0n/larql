@@ -398,7 +398,7 @@ without `simdgroup_matrix`.
 | **D-RMS-FUSE** | RMS-norm pre-fusion with surrounding scalar mul/add (mirrors llama.cpp's `kernel_rms_norm_mul_f32` / `kernel_rms_norm_mul_add_f32`) | Predicted ~0.1-0.2 ms decode on non-Gemma. **Measured null end-to-end** (within drift). | **IMPLEMENTED + FALSIFIED 2026-05-09 (Phase 1).** Most of `_mul_f32` / `_mul_add_f32` was already shipped: our `rms_norm` shader already does norm + scalar mul, and `residual_norm_store` / `post_attn_residual_norm_store` / `post_ffn_norm_residual_add` already fuse norm + residual add at all the load-bearing boundaries except the post-FFN→next-layer-input step on non-Gemma archs. Phase 1 implemented that last gap via `LARQL_FUSED_PRELAYER_NORM=1` opt-in (Llama 2 7B / Mistral 7B). Parity preserved (bit-identical output across 3 archs). End-to-end A/B: Llama 2 7B `+0.0 tok/s within drift`, Mistral 7B `−0.3 tok/s within drift`. The dispatch-overhead saving from skipping rms_norm in layer N+1 is offset by the heavier `residual_norm_store` (does the RMS reduction inline) replacing the lighter `residual_add` in layer N. Per ADR-015 magnitude-compression at the extreme. | `metal/decode/encode_post_ffn.rs` (`PreLayerNormFusion` struct + branch), `metal/decode/encode_qkv.rs` (`input_already_normed` skip flag), `metal/decode/mod.rs` (call sites + `prelayer_norm_active` plumbing). Kept opt-in per ADR-017 retention rules; revival scenario: different K dimensions or future hardware where the rms_norm dispatch overhead vs `residual_norm_store` extra reduction balance shifts. |
 | **D-GEMMA4-E2B** | Investigate Gemma 4 E2B decode 30× pathology surfaced by 2026-05-09 cross-arch bench | (diagnosed) | **DIAGNOSED 2026-05-09.** Cross-arch bench captured `gemma4-e2b-q4k` at 4205 ms/tok GPU fwd vs Gemma 3 4B at 140 ms/tok. **Root cause**: E2B has Per-Layer Embeddings (PLE, `hidden_size_per_layer_input: 256`) which **the Metal pipeline does not implement**. `larql-inference/src/layer_graph/generate/gpu.rs:372-374` explicitly checks `weights.arch.has_per_layer_embeddings()` and routes to `generate_via_cpu_q4k` when true — the entire decode path falls back to CPU. The `LARQL_GPU_TIMING=1` line never fires for E2B because Metal's `decode_token_with_moe_split_fn` is never called. Documented in `gpu.rs` comment: "Without this routing the model produces multilingual gibberish." Diagnosis confirmed by reading the dispatch code and checking E2B's vindex `index.json` (`per_layer_embed_dim: 256`). Llama 2 / Mistral / Gemma 4 31B don't have PLE so route through Metal normally. | Closes the bug as "expected behaviour given PLE-not-in-Metal limitation". The actual perf fix is **D-METAL-PLE** (next row) which implements PLE on Metal. |
 | **D-METAL-PLE** | Implement Per-Layer Embeddings in the Metal decode path | Brings Gemma 4 E2B / future-PLE-models from CPU fallback (~1670 ms/tok) onto Metal (target: ~10-20 ms/tok at E2B's compute scale = **80-150× speedup for E2B**). | **IMPLEMENTED 2026-05-10, but E2B end-to-end blocked on a SECOND missing feature (D-METAL-KV-SHARED below).** Wired per-layer PLE block as 4 dispatches: f32_gemv (gate proj) → new `ple_gate_apply` shader (fused gelu_tanh + multiply against precomputed per-layer-input) → f32_gemv (output proj) → reuses `post_ffn_norm_residual_add` (in-place via `h_post_attn`/`new_h` aliasing) for the closing rms_norm + residual add. Precompute stays on CPU (`precompute_per_layer_inputs`); inference uploads the `[num_layers × ple_dim]` table once per generation step via new `MetalBackend::prepare_ple_inputs`. PLE block fires inside `decode_token_with_moe_split_fn` after `encode_post_ffn_residual` and reuses `gate_out_scratch` / `down_out` (dead by post-FFN) for scratch, so no new persistent buffers. Routing: when `LARQL_METAL_PLE=1`, gpu.rs runs prefill via per-token `decode_token` calls and per-step decode with PLE upload before each call (batched-prefill via `dispatch_full_pipeline` is a follow-up after parity passes). Kernel-level parity for `ple_gate_apply` passes 5/5 against CPU reference (`tests/test_kernel_per_layer_embed.rs`, max abs diff < 1e-5). **End-to-end E2B output is still gibberish with `LARQL_METAL_PLE=1`** because Metal also lacks KV-cache sharing — see D-METAL-KV-SHARED below. PLE wiring is complete and correct in isolation; will deliver the predicted speedup once KV sharing lands. | Files: `metal/shaders/per_layer_embed.rs`, `metal/decode/encode_ple.rs`, `metal/decode/mod.rs` (call site), `metal/mod.rs` (`PleInputBuffer` + `prepare_ple_inputs` / `clear_ple_inputs` / `ple_inputs_snapshot`), `metal/ffn_kernels.rs` (`ple_gate_apply_pipeline`), `pipeline.rs` (`PleSpec` + 3 PLE fields on `FullPipelineLayer`), `larql-inference/src/layer_graph/pipeline_layer.rs` (populate from arch keys), `larql-inference/src/layer_graph/generate/gpu/mod.rs` (per-token PLE upload + routing). E2B fixture added to `scripts/bench-cross-arch.sh`. Gated on `LARQL_METAL_PLE=1`; flip the default once D-METAL-KV-SHARED also lands and end-to-end parity passes. |
-| **D-METAL-KV-SHARED** | Implement cross-layer KV cache sharing in the Metal decode path | E2B's last 20 of 35 layers reuse K/V from earlier "source" layers (last non-shared sliding / global layer of the same type). Without this, layers 15-34 compute their own (wrong) K/V → attention is broken from L15 → garbage output. Same mechanism likely needed for any future KV-shared model. | **PARTIALLY IMPLEMENTED 2026-05-10 — routing correct, math still wrong.** Plumbed: `kv_shared_source: Option<usize>` field on `FullPipelineLayer`, populated in `pipeline_layer.rs::build_arch_params` from `arch.kv_shared_source_layer(layer)`. Dispatch: in `metal/decode/encode_attn.rs`, shared layers (a) skip the fused-attn / fused-kv-aa paths (gated on `kv_shared_source.is_none()`), (b) fall through to a new `else if let Some(src)` branch that dispatches `kv_attention` reading `kv_cache.layers[src].k_cache/v_cache` with `t_val = source.current_len` (source has already incremented past this token), (c) skip the `current_len += 1` (own cache stays at 0). Q is computed/normed/RoPE'd at the shared layer; K/V projections still run but the results are discarded. Verified via `LARQL_KV_SHARED_DEBUG=1`: source-layer mapping is correct (sliding→13, global→14 for E2B), `src.current_len` progresses 1, 2, 3, … per decode_token call, `t_val` matches. **Output is still gibberish** ("တ initialState eTo aud ανhiokin initial است류 …"): per-layer residual dump (`LARQL_DECODE_DUMP_LAYERS` vs `LARQL_CPU_DUMP_LAYERS`) shows L0-L14 magnitudes within ~10-20% of CPU (acceptable given position-mismatch in dump alignment), but L15-L34 magnitudes are roughly **half** of CPU's. Remaining diagnostic work: bisect whether the gap is in (a) attention output magnitude (Q·K alignment off?), (b) source's K/V cache contents (RoPE position mismatch?), or (c) something arch-specific to E2B's first shared layer (e.g., dropped V-norm, different qk_norm offset path). | Files: `pipeline.rs` (+1 field, +1 default), `pipeline_layer.rs` (+1 populate), `metal/pipeline.rs` / `metal/ops/full_pipeline/{buffers,kv_copy}.rs` (+3 None defaults in literal constructors), `metal/decode/encode_attn.rs` (~50 lines: pos/t_val branching + new `else if` shared-attend path + gated `current_len` increment). Diagnostic env var `LARQL_KV_SHARED_DEBUG=1` (currently removed; trivial to reintroduce). Next steps: dump source's K cache directly (read Metal buffer back to CPU at the shared layer's read), compare against CPU's `k_rope` from `attention/block.rs:438` for the same position — should be bit-identical. Suspected loci: (1) my `pos = source.current_len.saturating_sub(1)` for shared-layer Q-RoPE may be subtly wrong for the first decode_token call when source just started; (2) the unfused QK-norm + RoPE path may interact with shared layers in a way the fused path doesn't; (3) `attn_spec.rotary_dim` for shared layers vs source layers — both should match (same arch type) but worth verifying empirically. |
+| **D-METAL-KV-SHARED** | Implement cross-layer KV cache sharing in the Metal decode path | E2B's last 20 of 35 layers reuse K/V from earlier "source" layers (last non-shared sliding / global layer of the same type). Without this, layers 15-34 compute their own (wrong) K/V → attention is broken from L15 → garbage output. Same mechanism likely needed for any future KV-shared model. | **PARTIALLY IMPLEMENTED 2026-05-10 — routing correct, source-cache contents byte-identical to CPU, but L15+ shared-layer dispatch chain still produces wrong residuals.** See "D-METAL-KV-SHARED bisection 2026-05-10" section below for the bisection record and remaining diagnostic plan. | (see section below) |
 | **D-CROSS-PARITY** | Cross-architecture decode bench (Gemma 3 4B, Gemma 4 31B dense, Gemma 4 26B A4B MoE, Llama 2 7B, Mistral 7B) | Operationalises ADR-017 model-agnosticity check; surfaces thermal artifacts (every-arch-regresses-simultaneously signature). | **SHIPPED 2026-05-09 (Phase 1).** `scripts/bench-cross-arch.sh` + `bench/baselines/cross-arch/` + `make bench-cross-arch[ ARGS=--save-baseline\|--compare]`. Captured first under-load run; cool-machine baseline pending. **Phase 2 (per-shader)** still open — current sweep is end-to-end-only; per-shader parity tests (e.g. dispatching `q4k_ffn_gate_up_8sg` against synthetic input on multiple K dimensions to surface kernel-specific arch sensitivities) would catch deeper regressions earlier. | `scripts/bench-cross-arch.sh`, `bench/baselines/cross-arch/README.md`. Phase 2: parametrised tests in `crates/larql-compute/tests/`. |
 | **D-ROPE-VARIANTS** | Add `rope_neox` and `rope_multi` shader variants | Coverage for non-split-half RoPE models (GPT-NeoX, Pythia, some Falcon, multi-frequency long-context) | Open. We have one `rope` shader (split-half). llama.cpp ships `kernel_rope_norm_*`, `kernel_rope_neox_*`, `kernel_rope_multi_*`, `kernel_rope_vision_*`. Currently no architectures in `larql-models/architectures/` need NeoX (all use split-half), so this is **deferred until a NeoX-using model is brought into scope**. TODO documented in `metal/shaders/rope.rs`. | `metal/shaders/rope.rs` extension. See [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §3 |
 
@@ -438,6 +438,191 @@ D-ATTN-MTG as the bigger swing.
 - [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) — kernel-architecture comparison vs llama.cpp; documents the three load-bearing gaps.
 - [docs/adr/017-shader-retention-model-agnosticity.md](docs/adr/017-shader-retention-model-agnosticity.md) — when to add/keep/delete shaders.
 - [docs/adr/018-architecture-shader-routing.md](docs/adr/018-architecture-shader-routing.md) — when to add a new architecture.
+
+### D-METAL-KV-SHARED bisection 2026-05-10
+
+End-to-end E2B output was still gibberish ("တ initialState eTo aud ανhiokin
+initial است류 …") after the routing-and-plumbing landed. This section is the
+diagnostic record.
+
+**What was implemented**
+
+Field plumbing — `kv_shared_source: Option<usize>` added to
+`FullPipelineLayer`, populated in `pipeline_layer.rs::build_arch_params`
+from `arch.kv_shared_source_layer(layer)`. Three literal-constructor
+sites updated.
+
+Dispatch — in `metal/decode/encode_attn.rs`:
+
+- `did_fused_attn` and `use_fused_kv_aa` are gated on
+  `kv_shared_source.is_none()`. Shared layers can't use the fused
+  attn / fused kv_append_attend kernels because both write the
+  layer's own K/V cache and would corrupt the source's cache.
+- Shared layers fall through to a new `else if let Some(src) =
+  kv_shared_source` branch that picks `kv_attention` or
+  `kv_attention_long` based on `attention_span(t_val, window_size)`,
+  binds `kv_cache.layers[src].k_cache` / `v_cache`, and passes
+  `t_val = source.current_len`. Source's `current_len` has already
+  incremented past the new token by the time the shared layer runs
+  (layers process in order, `current_len += 1` fires at the end of
+  source's Step 4).
+- `current_len += 1` for the shared layer is gated on
+  `kv_shared_source.is_none()`. Shared layers leave their own
+  cache pointer at 0 forever; the source's pointer is the
+  source-of-truth.
+- Q is computed at the shared layer (own `W_q`, own
+  `q_norm_weight`, RoPE'd at `pos = source.current_len.saturating_sub(1)`).
+  K/V projections still run at the shared layer but the results
+  are discarded — wasted work that's harmless and was preserved
+  for first-pass simplicity.
+
+The routing path was sanity-checked with a `LARQL_KV_SHARED_DEBUG=1`
+print (since removed) — source mapping is correct (sliding L15-L18
+→ L13, global L19 → L14, etc.), `src.current_len` advances 1, 2, 3, …
+per decode_token call, `t_val` matches.
+
+**Bisection**
+
+Two diagnostic env vars added to `metal/decode/mod.rs` for the
+bisection (kept; trivial to use again):
+
+- `LARQL_KV_CACHE_DUMP_DIR=<dir>` — at end of each `decode_token` call,
+  dumps `metal_L{NN}_K_cache.f32` / `_V_cache.f32` for every layer
+  with `current_len > 0`. Last call wins (file overwritten).
+- `LARQL_PERCALL_LAYER_DUMP_DIR=<dir>` — at end of each call, dumps
+  `metal_call{NNN}_h_final.f32` (residual after L34 +
+  layer_scalar), `metal_call{NNN}_x_input.f32` (the per-token
+  embed input), and per-layer K caches with the call counter in
+  the filename. Counter is process-global (`CALL_COUNT`
+  `AtomicUsize`).
+
+**Bisection results** (E2B prompt "Hi" with chat-template wrap →
+seq_len=29 prompt tokens, `-n 2`):
+
+| stage | result |
+|---|---|
+| Token IDs identical CPU vs Metal | ✓ (`token_ids.len() == 29` in both via `LARQL_TOKEN_DEBUG=1`) |
+| Per-call input embed `metal_call{n}_x_input` | ✓ cosine 1.0000 vs CPU's `cpu_h_embed.f32` row n for all prefill positions 0-28 |
+| Source K cache contents at L0, L13, L14 | ✓ cosine 1.0000 for all 29 prompt positions vs CPU's `cpu_L0_k_out_after_rope.f32` |
+| Source V cache contents at L13 | ✓ cosine 1.0000 for all 29 prompt positions vs CPU's `cpu_L0_v_out.f32` |
+| Per-call `h_final` (after L34, before final_norm) | ✗ cosine **0.18-0.48** vs CPU's `cpu_layer_34.f32[pos]` at every prompt position |
+
+So everything that's a function of source layers' weights, RoPE,
+qk_norm, and V-norm produces byte-perfect cache contents. The bug
+is downstream of the source-layer write.
+
+A telling artifact: Metal's `h_final` magnitude across all 29
+prompt positions is roughly **constant** at ~17, while CPU's
+varies 9-39. The Metal residual stream is being **compressed** —
+losing per-position information — which is the signature of
+attention not differentiating positions (uniform softmax over
+identical-magnitude logits). This is consistent with shared
+layers' attention dispatch returning a near-constant output
+regardless of Q.
+
+**What's been ruled out**
+
+- Source layer correctness: K/V cache is byte-identical CPU vs
+  Metal. Source projections (W_q, W_k, W_v), qk_norm, RoPE,
+  V-norm all produce identical bytes through L14.
+- Routing: `kv_shared_source` populates correctly,
+  `t_val`/`pos` math is correct, layer→source mapping is
+  correct, `current_len` advances correctly.
+- Tokenization: `encode_prompt` produces identical
+  `token_ids` in both code paths (verified via
+  `LARQL_TOKEN_DEBUG=1`).
+- Embed: `embed_tokens_pub` produces identical embeds at every
+  position (cosine 1.000).
+- Q at shared layer: computed with the layer's own W_q against
+  correct h_input. RoPE'd at `pos = N` (matches source's K
+  rotation at position N).
+- PLE math: kernel-level parity passes (5/5 tests at <1e-5 abs
+  diff vs CPU), and turning PLE off does not change the gibberish
+  symptom in any way that reveals PLE as the culprit.
+- Fused-kernel interaction: same gibberish under
+  `LARQL_FUSED_KV_APPEND_ATTEND=0`,
+  `LARQL_FUSED_QK_NORM_ROPE=0`, `LARQL_FUSED_POST_ATTN_NORM=0`,
+  `LARQL_FUSED_POST_FFN_NORM=0`, `LARQL_FUSED_PRELAYER_NORM=0`
+  — all simultaneously and individually. Bug isn't in any
+  fused kernel.
+
+**What's left to check** (next session's plan)
+
+1. **Stage-level dump inside the per-call loop.** Extend
+   `LARQL_PERCALL_LAYER_DUMP_DIR` to also capture L15..L34 stage
+   outputs (`q_out_after_rope`, `attn_out_buf`, `o_out_buf`,
+   `h_post_attn`, post-PLE `h`, post-`layer_scalar` `h`) at the
+   end of each call, gated on a layer-allowlist env var.
+   Compare to CPU's `cpu_L{N}_*.f32` for the same prompt position.
+   The first stage that diverges is the bug.
+2. **Memory hazard tracking on the source cache.** Try inserting
+   `enc.memory_barrier_with_resources(&[source_k_cache,
+   source_v_cache], MTLBarrierScope::Buffers)` at the start of
+   the shared-layer attend dispatch. Apple's compute encoder
+   auto-tracks RAW hazards across dispatches in the same encoder,
+   but the source's `kv_append_attend_fused` writes via
+   `threadgroup_barrier(mem_device)` rather than ending its
+   dispatch — possible the auto-barrier doesn't see the writes.
+3. **Force unfused source path.** Make source layers (those that
+   are themselves a `kv_shared_source` for some later layer) use
+   the unfused `kv_cache_append` + `kv_attention` chain instead
+   of `kv_append_attend_fused`. This forces a hard dispatch
+   boundary so the writes are flushed before any read by a
+   shared layer. Slower but eliminates the hazard hypothesis.
+4. **Single-position end-to-end check.** With a 1-token raw
+   prompt (set `LARQL_RAW_PROMPT=1`), the shared-layer attention
+   collapses to attend(Q, K[0..1], V[0..1]) — softmax over a
+   single position is identity, attn_out = V[0]. Compare
+   Metal's L15 attn_out to CPU's L15 attn_out at this position.
+   Diverging there isolates the bug to Q computation or
+   attention output write; matching there pushes it downstream
+   (FFN, PLE, layer_scalar, or the next shared layer's input).
+
+**Tests landed for regression protection**
+
+- `crates/larql-inference/src/layer_graph/pipeline_layer.rs::tests`
+  (3 new tests, all green):
+  - `build_arch_params_populates_kv_shared_source_for_e2b_like_arch`
+    pins the `kv_shared_source` field's contract end-to-end:
+    builds a synthetic Gemma-4-E2B-shaped arch via
+    `detect_from_json` (4 layers, 2 sliding non-shared + 2
+    shared) and asserts that L0/L1 → None, L2 → Some(0),
+    L3 → Some(1).  Catches any future regression where someone
+    removes the
+    `kv_shared_source: arch.kv_shared_source_layer(layer)`
+    line in `build_arch_params`.
+  - `build_arch_params_populates_ple_fields_for_e2b_like_arch`
+    pins the `ple_input_gate` / `ple_projection` /
+    `ple_post_norm` field contract.  Builds the synthetic
+    arch with PLE keys and tensors, runs `build_arch_params`
+    for each layer, asserts all three slices populate and
+    `ple_spec()` returns Some.
+  - `build_arch_params_leaves_ple_and_kv_shared_fields_none_for_tinymodel`
+    pins the negative case: non-PLE / non-shared archs leave
+    every new field as None.  Prevents spurious population.
+- `crates/larql-compute/tests/test_kernel_per_layer_embed.rs`
+  (5 tests, all green): `ple_gate_apply` shader vs CPU
+  reference at <1e-5 abs diff — smooth inputs, zero inputs,
+  large negatives, E2B production shape.
+
+These tests don't catch the current bug (which is a
+dispatch-level issue beyond field plumbing), but they do
+prevent the entire field-plumbing regression class — the
+"someone refactored the trait and silently dropped a populate
+line" failure mode that's hit larql-models / larql-inference
+multiple times during this work.
+
+**Out of scope for this section but flagged**
+
+- Per-layer Metal-vs-CPU stage parity tests (D-METAL-KV-SHARED
+  Phase B test infrastructure): take a tiny synthetic
+  Gemma-4-E2B-shaped vindex with 4-layer / hidden=8 weights,
+  run a 3-token prompt through both paths, assert
+  byte-equivalence for every per-stage scratch buffer at every
+  layer.  Would have caught the current bug in CI.  Blocked on
+  not yet having a small-vindex builder; cross-arch bench
+  fixture is the closest existing analogue but uses real
+  E2B-scale models.
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)
 

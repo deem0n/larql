@@ -20,9 +20,10 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::net::TcpListener;
 
+use larql_compute::cpu::ops::moe::cpu_moe_forward;
+use larql_compute::MoeLayerWeights;
 use larql_inference::{
-    cpu_moe_forward, ndarray::ArcArray2, MoeLayerWeights, MoeRouterWeights, RemoteMoeBackend,
-    RemoteMoeError, ShardConfig,
+    ndarray::ArcArray2, MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig,
 };
 use larql_models::weights::ModelWeights;
 use larql_models::{ModelArchitecture, ModelConfig};

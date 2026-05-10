@@ -50,6 +50,17 @@ opt-in. See `Completed` section below for the full per-change list.
 - Test coverage: **74.2% line / 81.2% function** at the 2026-04-26
   baseline (478 tests). 2026-05-01 (post Q1 cleanup): **131 lib tests +
   37 integration files (~580 tests total), all green**.
+- 2026-05-10 re-measurement (post REV1–REV5 fixes, full `--tests`
+  run): **65.68% line / 72.18% function** across ~660 tests.
+  Coverage drifted ~8 pts down vs the 2026-04-26 claim — partly
+  because the upstream `larql-inference` / `larql-compute` API
+  refactor temporarily broke `tests/test_expert_endpoint.rs` (now
+  fixed) and the four `routes/expert/*` modules sit at 0% line
+  coverage because they need a live grid harness to exercise. Per-
+  file 90% floor + debt baselines now codified in
+  `crates/larql-server/coverage-policy.json`; run
+  `make larql-server-coverage-summary` to re-measure (added in this
+  session — see CHANGELOG.md).
 - Q1 code-quality cleanup (2026-05-01) shipped 9 of 10 items: 1044-LOC
   `routes/expert.rs` split into 7 focused files; 656-LOC `main.rs` reduced
   to 26 LOC with `bootstrap::serve(cli)` as the orchestration point; new
@@ -951,18 +962,46 @@ out-of-tree consumers; right now a reader can't tell intent.
 
 ---
 
-### REV-COVERAGE. Test coverage gaps vs 90%/file project floor *(P1)*
+### REV-COVERAGE. Test coverage gaps vs 90%/file project floor *(P1, partly addressed)*
 
-**Files**: no dedicated unit test files for `src/cache.rs`,
-`src/ratelimit.rs`, `src/session.rs`, `src/routes/topology.rs`. Missing
-test cases: malformed-JSON rejection (axum `JsonRejection` → 400),
-body-size-limit 413s, ETag 304 paths beyond the one
-`test_http_describe.rs` happy path, gRPC stream backpressure, gRPC
-client cancel mid-stream, OpenAI SSE `[DONE]` framing, OpenAI streaming
-error chunk shape.
+**Status**: 🟡 **Tooling + policy shipped 2026-05-10; per-file gap-fill ongoing.**
 
-**Acceptance**: each file ≥ 90% line coverage (project floor), and the
-above behaviours each have at least one direct test.
+Done in this session:
+- `make larql-server-{test,fmt-check,lint,coverage,coverage-summary,coverage-html,coverage-policy,ci}`
+  added to the workspace Makefile (mirror the `larql-compute` /
+  `larql-vindex` patterns).
+- `crates/larql-server/coverage-policy.json` created. Default per-
+  file floor is **90.0%**; 28 debt baselines snapshotted from the
+  2026-05-10 measurement; `total_line_min_percent: 65.6` matches the
+  current floor. New / split files automatically inherit the 90%
+  default.
+- Real coverage measured: 65.68% line / 72.18% function (was
+  claiming 74.2% / 81.2% at 2026-04-26 — drift since then).
+- Mainline files added in this session land at 100% (`routes/openai/error.rs`)
+  or close to it (`auth.rs` 98.0%, `session.rs` 96.1%).
+
+Still open (per-file gap-fill, listed roughly by impact):
+- `routes/openai/completions.rs` 40.3% → 90% (REV8 split helps)
+- `routes/walk_ffn.rs` 49.0% → 90% (REV7 split helps)
+- `routes/openai/chat.rs` 53.4% → 90% (REV8 split helps)
+- `routes/stream.rs` 53.3% → 90% (Q1.10 split helps)
+- `routes/explain.rs` 44.8% → 90%
+- `routes/infer.rs` 50.2% → 90%
+- `routes/expert/{batch_legacy,multi_layer_batch,single,warmup}.rs`
+  all 0% — these need a live-grid harness and are best treated as
+  one ticket once the grid test fixture exists.
+- `routes/openai/schema/mask.rs` 0% — orthogonal to the splits;
+  needs unit tests on the FSM-mask behaviour.
+- Behavioural-test gaps still open from the original review:
+  malformed-JSON rejection (axum `JsonRejection` → 400),
+  body-size-limit 413s, ETag 304 paths beyond the one
+  `test_http_describe.rs` happy path, gRPC stream backpressure,
+  gRPC client cancel mid-stream, OpenAI SSE `[DONE]` framing,
+  OpenAI streaming error chunk shape.
+
+**Acceptance**: each file ≥ 90% line coverage (project floor) — track
+via `coverage-policy.json` ratchet; each behavioural gap above has at
+least one direct test.
 
 ### REV-SPEC. Spec / OpenAPI drift *(P1)*
 
