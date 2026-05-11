@@ -69,3 +69,14 @@ harness = false
 [[bench]]
 name = "quant_matvec"
 harness = false
+
+# `objc 0.2.x` (an abandoned-but-still-required transitive dep through
+# `metal`) uses `cfg(cargo-clippy)` inside its `msg_send!` / `sel_impl!`
+# macros. From rustc 1.95 onwards, `cargo-clippy` isn't a recognised
+# cfg name, so every macro expansion in our crate emits an
+# `unexpected_cfgs` warning that promotes to error under
+# `clippy -- -D warnings`. Function- and module-level `#[allow]` don't
+# reach into the macro expansion. Suppress crate-wide via the Cargo
+# `[lints]` table — the only place that reliably wires through.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [] }
