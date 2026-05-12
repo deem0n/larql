@@ -142,6 +142,9 @@ async fn spawn_server(model: LoadedModel) -> String {
 /// domain socket, returning `(http_url, unix_url)`.  The two listeners
 /// share the same `AppState`, so the bench can A/B the same shard via
 /// different transports.
+///
+/// Unix-only — `tokio::net::UnixListener` is gated on `cfg(unix)`.
+#[cfg(unix)]
 async fn spawn_server_with_uds(model: LoadedModel, uds_path: &std::path::Path) -> (String, String) {
     let state = make_app_state(model);
     let router_tcp = single_model_router(state.clone());
@@ -498,11 +501,24 @@ fn main() {
     // doesn't change the picture.
     let uds_path_a = std::path::PathBuf::from("/tmp/larql-bench-a.sock");
     let url_a = if use_uds {
-        let (http_url, unix_url) = runtime.block_on(spawn_server_with_uds(model_a, &uds_path_a));
-        println!();
-        println!("Shard A:  TCP {http_url}");
-        println!("          UDS {unix_url}  ← bench client routes through this");
-        unix_url
+        #[cfg(unix)]
+        {
+            let (http_url, unix_url) =
+                runtime.block_on(spawn_server_with_uds(model_a, &uds_path_a));
+            println!();
+            println!("Shard A:  TCP {http_url}");
+            println!("          UDS {unix_url}  ← bench client routes through this");
+            unix_url
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &uds_path_a;
+            eprintln!(
+                "--uds is unix-only; ignoring and serving TCP only \
+                 (same-host MoE optimisation is unavailable on this target)"
+            );
+            runtime.block_on(spawn_server(model_a))
+        }
     } else {
         let u = runtime.block_on(spawn_server(model_a));
         println!();
