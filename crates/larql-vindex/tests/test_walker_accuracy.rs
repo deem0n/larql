@@ -223,6 +223,13 @@ fn assert_structural_invariants(graph: &Graph, second_field: &str, expected_laye
     );
 }
 
+// The golden is byte-keyed on the BLAS implementation's f32 output:
+// canonicalised JSONL → sha256. Linux (OpenBLAS) and macOS (Accelerate)
+// happen to produce matching textual output; Windows OpenBLAS rounds the
+// last digit of some entries differently, so the hash drifts. The test
+// stays useful as a same-platform regression on Linux/macOS — skipping
+// it on Windows rather than weakening it to a "shape only" check.
+#[cfg(not(windows))]
 #[test]
 fn vector_extractor_ffn_down_byte_identical() {
     let dir = fixture("vex");

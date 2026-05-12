@@ -32,13 +32,24 @@ const TOP_K_RECORD_BYTES: usize = U32_BYTES + F32_BYTES;
 /// `down_meta.bin` that is currently mmap'd by another part of the index
 /// is not opened for write — Windows rejects `File::create` on a path
 /// whose backing file has a user-mapped section open (`os error 1224`).
+///
+/// The tmp name is per-call unique (pid + monotonic counter) so two
+/// concurrent writers in the same directory can't trample each other's
+/// tmp file before the rename — `cargo test`'s parallel test harness
+/// hits this whenever two tests' tempdirs happen to collide.
 pub fn write_binary(
     dir: &Path,
     down_meta: &[Option<Vec<Option<FeatureMeta>>>],
     top_k_count: usize,
 ) -> Result<usize, VindexError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(DOWN_META_BIN);
-    let tmp_path = dir.join(format!("{DOWN_META_BIN}.tmp"));
+    let tmp_path = dir.join(format!(
+        "{DOWN_META_BIN}.tmp.{}.{serial}",
+        std::process::id()
+    ));
     let file = std::fs::File::create(&tmp_path)?;
     let mut w = BufWriter::new(file);
     let mut total = 0usize;
