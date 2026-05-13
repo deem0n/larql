@@ -30,8 +30,16 @@ use larql_core::Graph;
 use larql_vindex::walker::{
     attention_walker::AttentionWalker,
     test_fixture::create_mock_model,
-    vector_extractor::{ExtractConfig, SilentExtractCallbacks, VectorExtractor},
     weight_walker::{SilentWalkCallbacks, WalkConfig, WeightWalker},
+};
+
+// Vector-extractor imports are only used by the byte-identical golden
+// test, which is gated off on Windows (BLAS f32 round-tripping drifts
+// the JSONL hash). Keep the imports under the same gate so a Windows
+// build doesn't flag them as unused.
+#[cfg(not(windows))]
+use larql_vindex::walker::vector_extractor::{
+    ExtractConfig, SilentExtractCallbacks, VectorExtractor,
 };
 
 fn fixture(slug: &str) -> std::path::PathBuf {
@@ -85,9 +93,11 @@ fn canonicalise_edges(graph: &Graph, layer_field: &str, feature_field: &str) -> 
 // Regenerated 2026-05-10: the canonicalisation strips the `_header`
 // record so the wall-clock `extraction_date` field doesn't make the
 // golden drift every day.
+#[cfg(not(windows))]
 const GOLDEN_VECTOR_EXTRACTOR_FFN_DOWN_LAYER0: &str =
     "8b5e221b150147ed40b0cfa67fdfc264e0628ab6cd6c59c2f9419e9350589b83";
 
+#[cfg(not(windows))]
 fn check_or_print(label: &str, actual: &str, golden: &str) {
     if std::env::var("LARQL_PRINT_GOLDEN").is_ok() {
         eprintln!("{label} = {actual:?}");
@@ -223,6 +233,13 @@ fn assert_structural_invariants(graph: &Graph, second_field: &str, expected_laye
     );
 }
 
+// The golden is byte-keyed on the BLAS implementation's f32 output:
+// canonicalised JSONL → sha256. Linux (OpenBLAS) and macOS (Accelerate)
+// happen to produce matching textual output; Windows OpenBLAS rounds the
+// last digit of some entries differently, so the hash drifts. The test
+// stays useful as a same-platform regression on Linux/macOS — skipping
+// it on Windows rather than weakening it to a "shape only" check.
+#[cfg(not(windows))]
 #[test]
 fn vector_extractor_ffn_down_byte_identical() {
     let dir = fixture("vex");
