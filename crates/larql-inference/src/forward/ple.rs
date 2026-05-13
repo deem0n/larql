@@ -33,15 +33,21 @@ pub fn precompute_per_layer_inputs(
     let seq_len = token_ids.len();
     let hidden = weights.hidden_size;
 
-    // Stream 1: model projection from main embeddings
-    let model_proj_key = match arch.per_layer_model_projection_key() {
-        Some(k) => k,
-        None => return Vec::new(),
-    };
-    let w_model_proj = match weights.tensors.get(&model_proj_key) {
-        Some(w) => w,
-        None => return Vec::new(),
-    };
+    // Stream 1: model projection from main embeddings.
+    // `arch.has_per_layer_embeddings()` is true here, so the key must
+    // exist and the loader must have populated it — both invariants are
+    // enforced at vindex-load time by `load_model_weights*` (see
+    // chrishayuk/larql#49). A panic here means the vindex was loaded
+    // through a path that skipped validation, which is a bug.
+    let model_proj_key = arch
+        .per_layer_model_projection_key()
+        .expect("PLE arch must expose per_layer_model_projection_key");
+    let w_model_proj = weights.tensors.get(&model_proj_key).unwrap_or_else(|| {
+        panic!(
+            "PLE tensor `{model_proj_key}` missing from weights — rebuild this vindex \
+             (chrishayuk/larql#49)"
+        )
+    });
     let projected = dot_proj(main_embeds, w_model_proj);
     let model_proj_scale = (hidden as f32).powf(-0.5);
 
@@ -120,27 +126,35 @@ pub(crate) fn apply_per_layer_embedding(
     per_layer_input: Option<&Array2<f32>>,
 ) -> Array2<f32> {
     let arch = &*weights.arch;
+    // `per_layer_input == None` is the only legitimate "skip PLE for
+    // this layer" path — it's how callers without precomputed PLE
+    // inputs opt out (e.g. unit tests, non-PLE archs that route
+    // through here defensively). The tensor-missing branches that
+    // used to live here have been collapsed into expects because the
+    // loader now refuses to load a PLE arch without them (#49).
     let per_layer_input = match per_layer_input {
         Some(p) => p,
         None => return h.clone(),
     };
 
-    let gate_key = match arch.per_layer_input_gate_key(layer) {
-        Some(k) => k,
-        None => return h.clone(),
-    };
-    let proj_key = match arch.per_layer_projection_key(layer) {
-        Some(k) => k,
-        None => return h.clone(),
-    };
-    let w_gate = match weights.tensors.get(&gate_key) {
-        Some(w) => w,
-        None => return h.clone(),
-    };
-    let w_proj = match weights.tensors.get(&proj_key) {
-        Some(w) => w,
-        None => return h.clone(),
-    };
+    let gate_key = arch
+        .per_layer_input_gate_key(layer)
+        .unwrap_or_else(|| panic!("PLE arch missing per_layer_input_gate_key for layer {layer}"));
+    let proj_key = arch
+        .per_layer_projection_key(layer)
+        .unwrap_or_else(|| panic!("PLE arch missing per_layer_projection_key for layer {layer}"));
+    let w_gate = weights.tensors.get(&gate_key).unwrap_or_else(|| {
+        panic!(
+            "PLE tensor `{gate_key}` missing from weights — rebuild this vindex \
+             (chrishayuk/larql#49)"
+        )
+    });
+    let w_proj = weights.tensors.get(&proj_key).unwrap_or_else(|| {
+        panic!(
+            "PLE tensor `{proj_key}` missing from weights — rebuild this vindex \
+             (chrishayuk/larql#49)"
+        )
+    });
 
     // gate = h @ w_gate.T → [seq, ple_dim]
     let mut gate = dot_proj(h, w_gate);
@@ -197,9 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn precompute_returns_empty_when_projection_weight_missing() {
-        // Even if arch claims PLE support, missing weight → empty return.
-        // TinyModel arch doesn't enable PLE so this exercises the same early exit.
+    fn precompute_returns_empty_on_non_ple_arch() {
+        // Re-asserts the `!arch.has_per_layer_embeddings()` early exit on a
+        // different input shape — TinyModel doesn't enable PLE so we never
+        // reach the tensor lookups. The old fallback ("PLE arch but tensor
+        // missing → silent empty") was removed; that case now panics at
+        // load time before the forward path ever runs (#49).
         let weights = make_test_weights();
         let embeds = Array2::zeros((1, weights.hidden_size));
         let result = precompute_per_layer_inputs(&weights, &embeds, &[0u32]);
@@ -218,14 +235,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_ple_missing_gate_weight_returns_h_unchanged() {
+    #[should_panic(expected = "PLE arch missing per_layer_input_gate_key")]
+    fn apply_ple_with_input_on_non_ple_arch_panics() {
+        // Previously the function silently returned h unchanged when the
+        // gate key was missing — that's the exact failure mode behind
+        // #49 (extract drops PLE → forward silently no-ops → garbage).
+        // The contract now: if a caller hands us a precomputed PLE input,
+        // the arch must actually be PLE-capable, otherwise it's a bug.
+        // `precompute_per_layer_inputs` enforces this naturally because
+        // it returns an empty Vec on non-PLE archs.
         let weights = make_test_weights();
         let h = input(1, weights.hidden_size);
-        // Provide a per_layer_input, but TinyModel has no per_layer gate tensors
         let dummy_input = Array2::zeros((1, 4));
-        let result = apply_per_layer_embedding(&weights, &h, 0, Some(&dummy_input));
-        // Gate key doesn't exist in TinyModel → returns h unchanged
-        assert_eq!(result, h, "missing gate weight should return h unchanged");
+        let _ = apply_per_layer_embedding(&weights, &h, 0, Some(&dummy_input));
     }
 
     #[test]
