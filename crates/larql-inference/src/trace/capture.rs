@@ -150,7 +150,13 @@ pub fn trace(
 mod tests {
     use super::*;
     use crate::ffn::FfnBackend;
-    use crate::forward::{forward_raw_logits, hidden_to_raw_logits, trace_forward_with_ffn};
+    use crate::forward::trace_forward_with_ffn;
+    // `forward_raw_logits` / `hidden_to_raw_logits` are only used by
+    // `trace_final_residual_matches_raw_forward_logits`, which is gated
+    // off on Windows. Keep the imports under the same gate so `clippy
+    // -D warnings` doesn't trip on unused imports.
+    #[cfg(not(windows))]
+    use crate::forward::{forward_raw_logits, hidden_to_raw_logits};
     use crate::test_utils::make_test_weights;
     use larql_models::ModelWeights;
     use ndarray::Array2;
